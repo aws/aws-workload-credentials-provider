@@ -8,6 +8,9 @@ homepage = "https://github.com/aws/aws-secretsmanager-agent/aws_secretsmanager_c
 repository = "https://github.com/aws/aws-secretsmanager-agent"
 readme = "README.md"
 
+[features]
+fips = ["rustls/fips"]
+
 [dependencies]
 aws-sdk-secretsmanager = "1"
 aws-smithy-runtime-api = "1"
@@ -19,7 +22,7 @@ thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
 linked-hash-map = "0.5.6"
 aws-config = "1"
-rustls = "0"
+rustls = "0.23"
 log = "0.4.29"
 
 [dev-dependencies]
