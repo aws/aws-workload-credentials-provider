@@ -8,6 +8,9 @@ homepage = "https://github.com/aws/aws-secretsmanager-agent"
 repository = "https://github.com/aws/aws-secretsmanager-agent"
 readme = "../README.md"
 
+[features]
+fips = ["aws_secretsmanager_caching/fips"]
+
 [dependencies]
 hyper = { version = "1", features = ["http1", "server"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros"] }
