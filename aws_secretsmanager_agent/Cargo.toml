@@ -25,12 +25,9 @@ serde_derive = "1"
 config = "0.14"
 
 aws-config = "1"
-aws-credential-types = "1"
-aws-runtime = "1"
 aws-sdk-secretsmanager = "1"
 aws-smithy-runtime-api = "1"
 aws-sdk-sts = "1"
-arc-swap = "1"
 log = "0.4.29"
 log4rs = { version = "1.2.0", features = ["gzip"] }
 url = "2"
@@ -43,4 +40,3 @@ aws-smithy-runtime = { version = "1", features = ["test-util"] }
 tokio = { version = "1", features = ["test-util", "rt-multi-thread", "net", "macros"] }
 http = "0.2.9"
 aws-smithy-types = "1"
-tempfile = "3"

@@ -29,9 +29,8 @@ use tests::init_client as asm_client;
 impl CacheManager {
     /// Create a new CacheManager. For simplicity I'm propagating the errors back up for now.
     pub async fn new(cfg: &Config) -> Result<Self, Box<dyn std::error::Error>> {
-        let (client, _sdk_config) = asm_client(cfg).await?; // sdk_config reserved for future use
         Ok(Self(SecretsManagerCachingClient::new(
-            client,
+            asm_client(cfg).await?,
             cfg.cache_size(),
             cfg.ttl(),
             cfg.ignore_transient_errors(),
@@ -234,8 +233,8 @@ pub mod tests {
     // Used to replace the real client with the stub client.
     pub async fn init_client(
         _cfg: &Config,
-    ) -> Result<(secretsmanager::Client, ()), Box<dyn std::error::Error>> {
-        Ok((CLIENT.with_borrow(|v| v.clone()), ()))
+    ) -> Result<secretsmanager::Client, Box<dyn std::error::Error>> {
+        Ok(CLIENT.with_borrow(|v| v.clone()))
     }
 
     // Private helper to look at the request and provide the correct reponse.

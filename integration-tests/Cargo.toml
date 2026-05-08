@@ -13,6 +13,4 @@ aws-config = "1"
 aws-sdk-secretsmanager = "1"
 url = "2"
 derive_builder = "0.20"
-tempfile = "3"
-aws-credential-types = "1"
 

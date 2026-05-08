@@ -7,6 +7,7 @@
 use aws_config;
 use aws_sdk_secretsmanager;
 use derive_builder::Builder;
+use std::env;
 use std::fmt;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -90,45 +91,11 @@ validate_credentials = true
 "#,
             port, ttl_seconds
         );
-        Self::spawn_agent(&config_content, port, &[]).await
-    }
 
-    #[allow(dead_code)]
-    pub async fn start_with_credentials_file(
-        port: u16,
-        credentials_file_path: Option<&str>,
-    ) -> AgentProcess {
-        Self::start_with_credentials_file_and_env(port, credentials_file_path, &[]).await
-    }
-
-    #[allow(dead_code)]
-    pub async fn start_with_credentials_file_and_env(
-        port: u16,
-        credentials_file_path: Option<&str>,
-        extra_env: &[(&str, &str)],
-    ) -> AgentProcess {
-        let creds_line = match credentials_file_path {
-            Some(path) => format!("credentials_file_path = \"{}\"", path),
-            None => String::new(),
-        };
-        let config_content = format!(
-            r#"
-http_port = {}
-log_level = "debug"
-{}
-"#,
-            port, creds_line
-        );
-        Self::spawn_agent(&config_content, port, extra_env).await
-    }
-
-    async fn spawn_agent(
-        config_content: &str,
-        port: u16,
-        extra_env: &[(&str, &str)],
-    ) -> AgentProcess {
         let config_path = format!("/tmp/test_config_{}.toml", port);
         std::fs::write(&config_path, config_content).expect("Failed to write test config");
+
+        env::set_var("AWS_TOKEN", "test-token-123");
 
         let possible_paths = [
             PathBuf::from("target")
@@ -152,20 +119,16 @@ log_level = "debug"
             .find(|path| path.exists())
             .expect("Agent binary not found");
 
-        let mut cmd = TokioCommand::new(agent_path);
-        cmd.arg("--config")
+        let mut child = TokioCommand::new(agent_path)
+            .arg("--config")
             .arg(&config_path)
-            .env("AWS_TOKEN", "test-token-123")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true);
+            .kill_on_drop(true)
+            .spawn()
+            .expect("Failed to start agent");
 
-        for (key, val) in extra_env {
-            cmd.env(key, val);
-        }
-
-        let mut child = cmd.spawn().expect("Failed to start agent");
-
+        // Read stdout until we see the "listening" message
         let stdout = child.stdout.take().expect("Failed to get stdout");
         let mut reader = BufReader::new(stdout).lines();
 
@@ -175,8 +138,12 @@ log_level = "debug"
                     panic!("Agent failed to start - no listening message found");
                 }
             }
-            Ok(None) => panic!("Stream ended without finding listening message"),
-            Err(e) => panic!("Failed to read agent output: {}", e),
+            Ok(None) => {
+                panic!("Stream ended without finding listening message");
+            }
+            Err(e) => {
+                panic!("Failed to read agent output: {}", e);
+            }
         }
 
         AgentProcess {

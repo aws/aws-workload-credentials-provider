@@ -8,7 +8,6 @@ use config::File;
 use serde_derive::Deserialize;
 use std::num::NonZeroUsize;
 use std::ops::Range;
-use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -46,7 +45,6 @@ struct ConfigFile {
     region: Option<String>,
     ignore_transient_errors: bool,
     validate_credentials: bool,
-    credentials_file_path: Option<PathBuf>,
 }
 
 /// The log levels supported by the daemon.
@@ -114,9 +112,6 @@ pub struct Config {
 
     /// Whether the agent should validate AWS credentials at startup
     validate_credentials: bool,
-
-    /// Optional path to a credentials file for file-based credential loading.
-    credentials_file_path: Option<PathBuf>,
 }
 
 /// The default configuration options.
@@ -161,8 +156,7 @@ impl Config {
             .set_default("max_conn", DEFAULT_MAX_CONNECTIONS)?
             .set_default("region", DEFAULT_REGION)?
             .set_default("ignore_transient_errors", DEFAULT_IGNORE_TRANSIENT_ERRORS)?
-            .set_default("validate_credentials", DEFAULT_STS_CHECK)?
-            .set_default("credentials_file_path", None::<String>)?;
+            .set_default("validate_credentials", DEFAULT_STS_CHECK)?;
 
         // Merge the config overrides onto the default configurations, if provided.
         config = match file_path {
@@ -284,15 +278,6 @@ impl Config {
         self.validate_credentials
     }
 
-    /// Optional path to a credentials file for file-based credential loading.
-    ///
-    /// # Returns
-    ///
-    /// * `Option<&PathBuf>` - The path to the credentials file, or None.
-    pub fn credentials_file_path(&self) -> Option<&PathBuf> {
-        self.credentials_file_path.as_ref()
-    }
-
     /// Private helper that fills in the Config instance from the specified
     /// config overrides (or defaults).
     ///
@@ -343,7 +328,6 @@ impl Config {
             region: config_file.region,
             ignore_transient_errors: config_file.ignore_transient_errors,
             validate_credentials: config_file.validate_credentials,
-            credentials_file_path: config_file.credentials_file_path,
         };
 
         // Additional validations.
@@ -429,7 +413,6 @@ mod tests {
             region: None,
             ignore_transient_errors: DEFAULT_IGNORE_TRANSIENT_ERRORS,
             validate_credentials: DEFAULT_STS_CHECK,
-            credentials_file_path: None,
         }
     }
 
@@ -457,7 +440,6 @@ mod tests {
         assert_eq!(config.clone().region(), None);
         assert!(config.ignore_transient_errors());
         assert!(config.validate_credentials());
-        assert_eq!(config.credentials_file_path(), None);
     }
 
     /// Tests the config overrides are applied correctly from the provided config file.
@@ -484,10 +466,6 @@ mod tests {
         assert_eq!(config.clone().region(), Some(&"us-west-2".to_string()));
         assert!(!config.ignore_transient_errors());
         assert!(!config.validate_credentials());
-        assert_eq!(
-            config.credentials_file_path(),
-            Some(&PathBuf::from("/tmp/test_credentials"))
-        );
     }
 
     /// Tests that an Err is returned when an invalid value is provided in one of the configurations.
