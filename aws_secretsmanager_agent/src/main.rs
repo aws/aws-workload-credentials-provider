@@ -915,4 +915,50 @@ mod tests {
             assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
         }
     }
+
+    // Verify a query-style request with roleArn succeeds.
+    #[tokio::test]
+    async fn role_arn_query_success() {
+        let role = "arn:aws:iam::123456789012:role/TestRole";
+        let (status, body) = run_request(&format!(
+            "/secretsmanager/get?secretId=MyTest&roleArn={role}"
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        validate_response("MyTest", body);
+    }
+
+    // Verify a path-style request with roleArn succeeds.
+    #[tokio::test]
+    async fn role_arn_path_success() {
+        let role = "arn:aws:iam::123456789012:role/TestRole";
+        let (status, body) = run_request(&format!("/v1/MyTest?roleArn={role}")).await;
+        assert_eq!(status, StatusCode::OK);
+        validate_response("MyTest", body);
+    }
+
+    // Verify an invalid roleArn returns 400.
+    #[tokio::test]
+    async fn role_arn_invalid() {
+        let (status, body) =
+            run_request("/secretsmanager/get?secretId=MyTest&roleArn=not-a-valid-arn").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body,
+            "invalid roleArn format, expected arn:<partition>:iam::<account>:role/<name>"
+        );
+    }
+
+    // Verify roleArn works alongside other parameters.
+    #[tokio::test]
+    async fn role_arn_with_all_params() {
+        let role = "arn:aws:iam::123456789012:role/TestRole";
+        let ver = "11111";
+        let (status, body) = run_request(
+            &format!("/secretsmanager/get?secretId=MyTest&versionId={ver}&versionStage=AWSPENDING&refreshNow=true&roleArn={role}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        validate_response_extra("MyTest", ver, vec!["AWSPENDING"], body);
+    }
 }

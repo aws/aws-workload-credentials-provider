@@ -1,0 +1,4 @@
+# Test config with a low max_roles limit
+http_port = "0"
+max_conn = 1
+max_roles = 2

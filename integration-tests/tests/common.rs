@@ -46,6 +46,8 @@ pub struct AgentQuery {
     pub version_stage: Option<String>,
     #[builder(default)]
     pub refresh_now: Option<bool>,
+    #[builder(default)]
+    pub role_arn: Option<String>,
 }
 
 impl AgentQuery {
@@ -65,6 +67,10 @@ impl AgentQuery {
 
             if let Some(refresh_now) = self.refresh_now {
                 query_pairs.append_pair("refreshNow", &refresh_now.to_string());
+            }
+
+            if let Some(role_arn) = &self.role_arn {
+                query_pairs.append_pair("roleArn", role_arn);
             }
         }
         url.query().unwrap_or("").to_string()
