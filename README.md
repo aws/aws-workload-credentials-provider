@@ -31,7 +31,7 @@ To download the source code, see [https://github\.com/aws/aws\-secretsmanager\-a
       - [\[ curl \]](#-curl--1)
       - [\[ Python \]](#-python--1)
   - [Configure the Secrets Manager Agent](#configure-the-secrets-manager-agent)
-  - [File-based credentials](#file-based-credentials)
+  - [Optional features](#optional-features)
   - [Logging](#logging)
   - [Security considerations](#security-considerations)
   - [Running Integration Tests Locally](#running-integration-tests-locally)
@@ -51,6 +51,10 @@ To build the Secrets Manager Agent binary natively, you need the standard develo
 **NOTE:** To ensure a stable experience, use a specific git tag when building from source code. You can find a list of version tags [here](https://github.com/aws/aws-secretsmanager-agent/tags). Tags are in the pattern `/v\d+\.\d+\.\d+/` and follow [SemVer 2.0.0](https://semver.org/spec/v2.0.0.html).
 
 Example: `git clone --branch <git tag> https://github.com/aws/aws-secretsmanager-agent.git`
+
+**NOTE:** Building the agent with the `fips` feature enabled on macOS currently requires the following workaround:
+
+- Create an environment variable called `SDKROOT` which is set to the result of running `xcrun --show-sdk-path`
 
 #### [ RPM\-based systems ]
 
@@ -469,60 +473,11 @@ The following list shows the options you can configure for the Secrets Manager A
 + **ssrf\_env\_variables** – A list of environment variable names the Secrets Manager Agent checks in sequential order for the SSRF token\. The environment variable can contain the token or a reference to the token file as in: `AWS_TOKEN=file:///var/run/awssmatoken`\. The default is "AWS\_TOKEN, AWS\_SESSION\_TOKEN, AWS\_CONTAINER\_AUTHORIZATION\_TOKEN\".
 + **path\_prefix** – The URI prefix used to determine if the request is a path based request\. The default is "/v1/"\.
 + **max\_conn** – The maximum number of connections from HTTP clients that the Secrets Manager Agent allows, in the range 1 to 1000\. The default is 800\.
-+ **credentials\_file\_path** – The path to a file containing AWS credentials in the standard AWS credentials file format. When set, the agent reads credentials from this file instead of using the default SDK credential provider chain. The agent automatically reloads credentials when the file changes, making it compatible with credential rotation systems that deliver refreshed credentials to the filesystem. This parameter is optional.
+## Optional features<a name="secrets-manager-agent-features"></a>
 
-## File-based credentials
+The Secrets Manager Agent can be built with optional features by passing the `--features` flag to `cargo build`. The available features are:
 
-By default, the Secrets Manager Agent uses the [AWS SDK default credential provider chain](https://docs.aws.amazon.com/sdk-for-rust/latest/dg/credproviders.html) to authenticate with Secrets Manager. This works well on Amazon EC2 (via IMDS), Lambda, and ECS/EKS (via container credentials).
-
-For environments where credentials are delivered to the filesystem — such as on-premises hosts using [IAM Roles Anywhere](https://docs.aws.amazon.com/rolesanywhere/latest/userguide/introduction.html) or other credential management systems — you can configure the agent to read credentials from a file.
-
-### Credentials file format
-
-The credentials file must use the standard AWS credentials file format:
-
-```
-[default]
-aws_access_key_id = AKIAIOSFODNN7EXAMPLE
-aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
-aws_session_token = IQoJb3JpZ2luX2Vj...
-```
-
-### Configuration
-
-Set the `credentials_file_path` parameter in your configuration file:
-
-```toml
-region = "us-east-1"
-credentials_file_path = "/path/to/credentials"
-```
-
-### Credential refresh behavior
-
-The agent automatically detects and re-reads updated credentials from the file:
-
-+ The agent checks the credentials file for changes every 5 minutes.
-+ When the file's modification time changes, the agent reloads the credentials.
-+ If the file is missing or malformed during a reload, the agent continues using the previously cached credentials and retries on the next cycle.
-+ Credentials are served to the AWS SDK with a 10-minute expiry window, ensuring the SDK periodically requests fresh credentials from the provider.
-
-### Startup behavior
-
-The agent is designed to start successfully regardless of the credentials file state:
-
-+ If the file exists and contains valid credentials, the agent loads them immediately.
-+ If the file is missing, empty, or malformed, the agent starts without credentials and the background reload task will pick up valid credentials when they appear.
-+ When file-based credentials are configured, the agent skips the STS credential validation check at startup, since the credentials file may not yet exist. The `validate_credentials` setting continues to apply for non-file-based credential sources.
-+ Calls to Secrets Manager will fail until valid credentials are available. The agent process itself remains running and will begin serving requests once credentials appear in the file.
-
-### Security
-
-On Unix systems, the agent logs a warning if the credentials file has permissions more permissive than owner-only (`0600`). Consider restricting file permissions:
-
-```sh
-chmod 600 /path/to/credentials
-```
-
+* `fips`: restricts the cipher suites used by the agent to only FIPS-approved ciphers
 
 ## Logging<a name="secrets-manager-agent-log"></a>
 
@@ -596,4 +551,3 @@ The integration tests are organized into the following modules:
 - **`security.rs`** - Tests security features including SSRF token validation and X-Forwarded-For header rejection
 - **`version_management.rs`** - Tests secret version transitions and rotation scenarios
 - **`configuration.rs`** - Tests configuration parameters including health checks and path-based requests
-- **`file_credentials.rs`** - Tests file-based credential loading including valid/invalid/missing credentials, self-healing (credentials appearing after startup), and credential rotation
