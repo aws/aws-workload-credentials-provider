@@ -13,7 +13,7 @@ use tokio::time::sleep;
 #[tokio::test]
 async fn test_refresh_now_on_updated_secret_succeeds() {
     let secrets = TestSecrets::setup_basic().await;
-    let secret_name: String = secrets.secret_name(SecretType::Basic);
+    let secret_name: String = secrets.secret_name(&SecretType::Basic);
 
     let agent = AgentProcess::start().await;
 
@@ -77,7 +77,7 @@ async fn test_refresh_now_on_updated_secret_succeeds() {
 #[tokio::test]
 async fn test_cache_expiration_and_refresh() {
     let secrets = TestSecrets::setup_basic().await;
-    let secret_name = secrets.secret_name(SecretType::Basic);
+    let secret_name = secrets.secret_name(&SecretType::Basic);
 
     // Start agent with short TTL for faster testing
     const TTL_SECONDS: u64 = 5;
@@ -141,7 +141,7 @@ async fn test_cache_expiration_and_refresh() {
 #[tokio::test]
 async fn test_ttl_zero_disables_caching() {
     let secrets = TestSecrets::setup_basic().await;
-    let secret_name = secrets.secret_name(SecretType::Basic);
+    let secret_name = secrets.secret_name(&SecretType::Basic);
 
     // Start agent with TTL=0 to disable caching
     const TTL_SECONDS: u64 = 0;

@@ -1,0 +1,5 @@
+[prefetch]
+max_jitter_seconds = 5
+
+[[prefetch.secrets]]
+secret_id = "MyTest"

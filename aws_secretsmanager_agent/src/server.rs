@@ -57,6 +57,11 @@ impl Server {
         })
     }
 
+    /// Returns a clone of the Arc<CacheManager> for use by the prefetch task.
+    pub fn cache_manager(&self) -> Arc<CacheManager> {
+        self.cache_mgr.clone()
+    }
+
     /// Accept the next request on the listener and process it in a separate thread.
     ///
     /// # Returns

@@ -11,18 +11,18 @@ use common::*;
 #[tokio::test]
 async fn test_version_stage_transitions() {
     let secrets = TestSecrets::setup_versioned().await;
-    let secret_name = secrets.secret_name(SecretType::Versioned);
+    let secret_name = secrets.secret_name(&SecretType::Versioned);
 
     let agent = AgentProcess::start().await;
 
     // Wait for AWSPENDING version to be available
     let _ = secrets
-        .wait_for_pending_version(SecretType::Versioned)
+        .wait_for_pending_version(&SecretType::Versioned)
         .await;
 
     // Get the version IDs for both stages
     let (current_version_id, pending_version_id) =
-        secrets.get_version_ids(SecretType::Versioned).await;
+        secrets.get_version_ids(&SecretType::Versioned).await;
 
     // Test AWSPENDING stage before promotion
     let pending_query = AgentQueryBuilder::default()

@@ -15,50 +15,12 @@ mod common;
 
 use common::*;
 
-const TARGET_ROLE_NAME: &str = "secrets-manager-agent";
-const NO_ACCESS_ROLE_NAME: &str = "secrets-manager-agent-no-access";
-
-struct RoleChainingHelper {
-    client: aws_sdk_sts::Client,
-    account_id: String,
-}
-
-impl RoleChainingHelper {
-    async fn new() -> Self {
-        let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
-        let client = aws_sdk_sts::Client::new(&config);
-        let account_id = client
-            .get_caller_identity()
-            .send()
-            .await
-            .expect("Failed to call GetCallerIdentity")
-            .account()
-            .expect("No account ID in response")
-            .to_string();
-        Self { client, account_id }
-    }
-
-    /// Pre-flight check: verify the role can be assumed, panic with a clear message if not.
-    /// Returns the full role ARN on success.
-    async fn get_role_arn(&self, role_name: &str) -> String {
-        let role_arn = format!("arn:aws:iam::{}:role/{role_name}", self.account_id);
-        self.client
-            .assume_role()
-            .role_arn(&role_arn)
-            .role_session_name("role-chaining-integration-tests")
-            .send()
-            .await
-            .unwrap_or_else(|e| panic!("Failed to assume role '{role_name}': {e}"));
-        role_arn
-    }
-}
-
 #[tokio::test]
 async fn test_role_chaining_basic_retrieval() {
     let helper = RoleChainingHelper::new().await;
     let role_arn = helper.get_role_arn(TARGET_ROLE_NAME).await;
     let secrets = TestSecrets::setup_basic().await;
-    let secret_name = secrets.secret_name(SecretType::Basic);
+    let secret_name = secrets.secret_name(&SecretType::Basic);
 
     let agent = AgentProcess::start().await;
 
@@ -116,7 +78,7 @@ async fn test_role_chaining_with_refresh_now() {
     let helper = RoleChainingHelper::new().await;
     let role_arn = helper.get_role_arn(TARGET_ROLE_NAME).await;
     let secrets = TestSecrets::setup_basic().await;
-    let secret_name = secrets.secret_name(SecretType::Basic);
+    let secret_name = secrets.secret_name(&SecretType::Basic);
 
     let agent = AgentProcess::start().await;
 
@@ -180,7 +142,7 @@ async fn test_role_chaining_no_access_role_denied() {
     let target_role_arn = helper.get_role_arn(TARGET_ROLE_NAME).await;
 
     let secrets = TestSecrets::setup_basic().await;
-    let secret_name = secrets.secret_name(SecretType::Basic);
+    let secret_name = secrets.secret_name(&SecretType::Basic);
 
     let agent = AgentProcess::start().await;
 
@@ -218,7 +180,7 @@ async fn test_role_chaining_separate_caches_per_role() {
     let role_arn = helper.get_role_arn(TARGET_ROLE_NAME).await;
 
     let secrets = TestSecrets::setup_basic().await;
-    let secret_name = secrets.secret_name(SecretType::Basic);
+    let secret_name = secrets.secret_name(&SecretType::Basic);
 
     let agent = AgentProcess::start().await;
 

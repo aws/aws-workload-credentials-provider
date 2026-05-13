@@ -1,0 +1,28 @@
+# Full config with all original parameters plus prefetch
+log_level = "debug"
+http_port = "65535"
+ttl_seconds = "600"
+cache_size = "500"
+ssrf_headers = ["X-Aws-Parameters-Secrets-Token"]
+ssrf_env_variables = ["MY_TOKEN"]
+path_prefix = "/custom/"
+max_conn = "100"
+max_roles = "10"
+region = "us-east-1"
+ignore_transient_errors = false
+validate_credentials = false
+
+[prefetch]
+cache_buffer_ratio = 0.6
+
+filter_tags = [
+  { key = "Environment" },
+  { key = "Team", role_arn = "arn:aws:iam::987654321098:role/TagRole" },
+]
+
+[[prefetch.secrets]]
+secret_id = "arn:aws:secretsmanager:us-west-2:123456789012:secret:MySecret-AbCdEf"
+
+[[prefetch.secrets]]
+secret_id = "arn:aws:secretsmanager:us-east-1:987654321098:secret:CrossAccount-AbCdEf"
+role_arn = "arn:aws:iam::987654321098:role/SecretAccessRole"

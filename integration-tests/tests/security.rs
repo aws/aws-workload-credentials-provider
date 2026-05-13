@@ -11,7 +11,7 @@ use common::*;
 #[tokio::test]
 async fn test_ssrf_token_validation() {
     let secrets = TestSecrets::setup_basic().await;
-    let secret_name = secrets.secret_name(SecretType::Basic);
+    let secret_name = secrets.secret_name(&SecretType::Basic);
 
     let agent = AgentProcess::start().await;
 
@@ -55,7 +55,7 @@ async fn test_ssrf_token_validation() {
 #[tokio::test]
 async fn test_x_forwarded_for_rejection() {
     let secrets = TestSecrets::setup_basic().await;
-    let secret_name = secrets.secret_name(SecretType::Basic);
+    let secret_name = secrets.secret_name(&SecretType::Basic);
 
     let agent = AgentProcess::start().await;
 

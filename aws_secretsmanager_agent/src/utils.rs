@@ -17,7 +17,8 @@ use tests::var_test as var;
 ///
 /// Callers need to pass in the error code (e.g.  InternalFailure,
 /// InvalidParameterException, ect.) and the error message. This function will
-/// then format a response body in JSON 1.1 format.
+/// then format a response body in JSON 1.1 format. All values are properly
+/// JSON-escaped via serde_json to prevent injection attacks.
 ///
 /// # Arguments
 ///
@@ -42,7 +43,11 @@ pub fn err_response(err_code: &str, msg: &str) -> String {
     if msg.is_empty() || err_code == "InternalFailure" {
         return String::from("{\"__type\":\"InternalFailure\"}");
     }
-    format!("{{\"__type\":\"{err_code}\", \"message\":\"{msg}\"}}")
+    serde_json::json!({
+        "__type": err_code,
+        "message": msg
+    })
+    .to_string()
 }
 
 /// Helper function to get the SSRF token value.
