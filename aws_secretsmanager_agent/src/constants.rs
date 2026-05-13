@@ -12,6 +12,7 @@ pub const EMPTY_ENV_LIST_MSG: &str =
     "The list of SSRF environment variables in the configuration file can't be empty.";
 pub const BAD_PREFIX_MSG: &str =
     "The path prefix specified in the configuration file must begin with /.";
+pub const BAD_MAX_ROLES_MSG: &str = "The maximum number of roles specified in the configuration file isn't valid. The maximum number of roles must be in the range 1 to 20.";
 
 /// Other constants that are used across the code base.
 
@@ -21,6 +22,8 @@ pub const APPNAME: &str = "aws-secrets-manager-agent";
 pub const VERSION: Option<&'static str> = option_env!("CARGO_PKG_VERSION");
 // The maximum for incoming connections need to be relatively high, since during periods of high latency, we can easily have many outstanding connections on a very busy box.
 pub const DEFAULT_MAX_CONNECTIONS: &str = "800";
+// The default maximum number of assumed roles
+pub const DEFAULT_MAX_ROLES: &str = "20";
 // The max request time
 pub const MAX_REQ_TIME_SEC: u64 = 61;
 // The max buffer size

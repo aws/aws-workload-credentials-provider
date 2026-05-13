@@ -31,6 +31,7 @@ aws-sdk-sts = "1"
 log = "0.4.29"
 log4rs = { version = "1.2.0", features = ["gzip"] }
 url = "2"
+regex = "1"
 aws_secretsmanager_caching = { version = "2.0.0", path = "../aws_secretsmanager_caching" }
 
 # For unit tests

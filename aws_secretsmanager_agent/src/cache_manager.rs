@@ -6,15 +6,26 @@ use aws_sdk_secretsmanager::operation::get_secret_value::GetSecretValueError;
 use aws_secretsmanager_caching::SecretsManagerCachingClient;
 use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
 use aws_smithy_runtime_api::client::result::SdkError;
-use log::error;
+use log::{error, info};
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
 use crate::config::Config;
 
 /// Wrapper around the caching library
 ///
-/// Used to cache and retrieve secrets.
+/// Routes requests to the appropriate caching client based on role ARN.
+/// The default client uses the agent's own credentials. Role clients
+/// use AssumeRole credentials and are created lazily on first request.
 #[derive(Debug)]
-pub struct CacheManager(SecretsManagerCachingClient);
+pub struct CacheManager {
+    default_client: Arc<SecretsManagerCachingClient>,
+    role_clients: RwLock<HashMap<String, Arc<SecretsManagerCachingClient>>>,
+    config: Config,
+    #[cfg(not(test))]
+    base_sdk_config: aws_config::SdkConfig,
+}
 
 // Use either the real Secrets Manager client or the stub for testing
 #[doc(hidden)]
@@ -23,28 +34,40 @@ use crate::utils::validate_and_create_asm_client as asm_client;
 #[cfg(test)]
 use tests::init_client as asm_client;
 
+#[cfg(not(test))]
+use crate::utils::create_role_asm_client;
+
 /// Wrapper around the caching library
 ///
 /// Used to cache and retrieve secrets.
 impl CacheManager {
-    /// Create a new CacheManager. For simplicity I'm propagating the errors back up for now.
+    /// Create a new CacheManager.
     pub async fn new(cfg: &Config) -> Result<Self, Box<dyn std::error::Error>> {
-        Ok(Self(SecretsManagerCachingClient::new(
+        let default_client = Arc::new(SecretsManagerCachingClient::new(
             asm_client(cfg).await?,
             cfg.cache_size(),
             cfg.ttl(),
             cfg.ignore_transient_errors(),
-        )?))
+        )?);
+
+        Ok(Self {
+            default_client,
+            role_clients: RwLock::new(HashMap::new()),
+            config: cfg.clone(),
+            #[cfg(not(test))]
+            base_sdk_config: aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await,
+        })
     }
 
-    /// Fetch a secret from the cache.
+    /// Fetch a secret from the cache, routing to the appropriate client based on role ARN.
     ///
     /// # Arguments
     ///
-    /// * `name` - The name of the secret to fetch.
+    /// * `secret_id` - The name of the secret to fetch.
     /// * `version` - The version of the secret to fetch.
     /// * `label` - The label of the secret to fetch.
     /// * `refresh_now` - Whether to serve from the cache or fetch from ASM.
+    /// * `role_arn` - Optional IAM role ARN for cross-account access via AssumeRole.
     ///
     /// # Returns
     ///
@@ -54,6 +77,8 @@ impl CacheManager {
     /// # Errors
     ///
     /// * `SerializationError` - The error returned from the serde_json::to_string method.
+    /// * `HttpError(400, ...)` - Max roles exceeded.
+    /// * `HttpError(403, ...)` - For credential or access denied errors (e.g. failed AssumeRole).
     ///
     /// # Example
     ///
@@ -67,10 +92,12 @@ impl CacheManager {
         version: Option<&str>,
         label: Option<&str>,
         refresh_now: bool,
+        role_arn: Option<&str>,
     ) -> Result<String, HttpError> {
+        let client = self.get_client(role_arn).await?;
+
         // Read the secret from the cache or fetch it over the network.
-        let found = match self
-            .0
+        let found = match client
             .get_secret_value(secret_id, version, label, refresh_now)
             .await
         {
@@ -97,6 +124,158 @@ impl CacheManager {
                 Err(int_err())?
             }
         }
+    }
+
+    /// Checks whether the number of cached role clients has reached the configured max_roles limit.
+    ///
+    /// Called under both read and write locks to prevent concurrent requests from
+    /// exceeding the limit.
+    ///
+    /// # Arguments
+    ///
+    /// * `current` - The current number of cached role clients.
+    /// * `role_arn` - The IAM role ARN being requested
+    ///
+    /// # Errors
+    ///
+    /// * `HttpError(400, ...)` - If the `max_roles` limit has been reached.
+    fn check_max_roles(&self, current: usize, role_arn: &str) -> Result<(), HttpError> {
+        if current >= self.config.max_roles() {
+            error!(
+                "Max roles limit ({}) reached, rejecting role assumption request for {}",
+                self.config.max_roles(),
+                role_arn
+            );
+            return Err(HttpError(
+                400,
+                err_response(
+                    "MaxRolesExceeded",
+                    &format!(
+                        "The maximum number of assumed roles ({}) has been reached. Unable to assume the following role to create a client: {}",
+                        self.config.max_roles(),
+                        role_arn
+                    ),
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Get the appropriate caching client for the request.
+    ///
+    /// Returns the default client when no role ARN is provided. For role-based
+    /// requests, looks up an existing client or lazily creates one using
+    /// AssumeRole credentials. Uses double-check locking to avoid duplicate
+    /// client creation under concurrent requests.
+    ///
+    /// # Arguments
+    ///
+    /// * `role_arn` - Optional IAM role ARN. `None` returns the default client.
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(Arc<SecretsManagerCachingClient>)` - The caching client for the request.
+    ///
+    /// # Errors
+    ///
+    /// * `HttpError(400, ...)` - If the `max_roles` limit has been reached.
+    /// * `HttpError(403, ...)` - If role client creation fails (e.g. STS AssumeRole denied).
+    async fn get_client(
+        &self,
+        role_arn: Option<&str>,
+    ) -> Result<Arc<SecretsManagerCachingClient>, HttpError> {
+        let arn = match role_arn {
+            None => return Ok(self.default_client.clone()),
+            Some(arn) => arn,
+        };
+        // Check if client already exists
+        {
+            let clients = self.role_clients.read().await;
+            if let Some(client) = clients.get(arn) {
+                return Ok(client.clone());
+            }
+            self.check_max_roles(clients.len(), arn)?;
+        }
+
+        // Create the role client
+        let role_client = self.create_role_client(arn).await.map_err(|e| {
+            error!("Failed to create role client for {}: {:?}", arn, e);
+            HttpError(
+                403,
+                err_response(
+                    "AccessDeniedException",
+                    &format!("Failed to create caching client from role: {arn}"),
+                ),
+            )
+        })?;
+
+        // Write lock: insert after double-checking the map and checking max_roles validation
+        let (client, count) = {
+            let mut clients = self.role_clients.write().await;
+            if let Some(client) = clients.get(arn) {
+                return Ok(client.clone());
+            }
+            self.check_max_roles(clients.len(), arn)?;
+
+            let client = Arc::new(role_client);
+            clients.insert(arn.to_string(), client.clone());
+            (client, clients.len())
+        };
+
+        info!(
+            "Created new role client ({}/{})",
+            count,
+            self.config.max_roles()
+        );
+
+        Ok(client)
+    }
+
+    /// Create a new SecretsManagerCachingClient for the given role ARN.
+    ///
+    /// Builds an SDK client with AssumeRole credentials using the stored base
+    /// SDK config, then wraps it in a caching client with the agent's configured
+    /// cache size, TTL, and transient error settings.
+    ///
+    /// # Arguments
+    ///
+    /// * `role_arn` - The IAM role ARN to assume.
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(SecretsManagerCachingClient)` - A caching client with AssumeRole credentials.
+    ///
+    /// # Errors
+    ///
+    /// * `Box<dyn std::error::Error>` - If the AssumeRoleProvider or caching client creation fails.
+    #[cfg(not(test))]
+    async fn create_role_client(
+        &self,
+        role_arn: &str,
+    ) -> Result<SecretsManagerCachingClient, Box<dyn std::error::Error>> {
+        let asm_client =
+            create_role_asm_client(&self.config, &self.base_sdk_config, role_arn).await?;
+
+        Ok(SecretsManagerCachingClient::new(
+            asm_client,
+            self.config.cache_size(),
+            self.config.ttl(),
+            self.config.ignore_transient_errors(),
+        )?)
+    }
+
+    /// Test stub for creating role clients — uses the same fake client as default.
+    #[cfg(test)]
+    async fn create_role_client(
+        &self,
+        _role_arn: &str,
+    ) -> Result<SecretsManagerCachingClient, Box<dyn std::error::Error>> {
+        Ok(SecretsManagerCachingClient::new(
+            asm_client(&self.config).await?,
+            self.config.cache_size(),
+            self.config.ttl(),
+            self.config.ignore_transient_errors(),
+        )?)
     }
 }
 
@@ -137,6 +316,19 @@ where
         }
         SdkError::DispatchFailure(derr) if derr.is_io() => {
             return Ok(("ConnectionError".into(), "Read Error".into(), 502));
+        }
+        // The AWS SDK wraps credential-refresh failures (e.g. a
+        // revoked AssumeRole trust relationship) as DispatchFailure with
+        // kind=Other. There is no typed error variant or metadata accessor on
+        // DispatchFailure for credential errors — the inner STS error is buried
+        // inside Box<dyn Error> layers (ConnectorError -> ProviderError ->
+        // ServiceError -> Unhandled). For now, using string matching.
+        SdkError::DispatchFailure(derr) if derr.is_other() => {
+            let msg = format!("{:?}", derr);
+            if msg.contains("AccessDenied") {
+                return Ok(("AccessDeniedException".into(), msg, 403));
+            }
+            return Err(int_err());
         }
         SdkError::ResponseError(_) => {
             return Ok(("ConnectionError".into(), "Response Error".into(), 502));
@@ -343,5 +535,157 @@ pub mod tests {
                 .http_client(NeverClient::new())
                 .build(),
         )
+    }
+
+    // Helper to create a CacheManager with a specific config file.
+    async fn cache_manager_with_config(config_path: &str) -> CacheManager {
+        let cfg = Config::new(Some(config_path)).expect("config failed");
+        CacheManager::new(&cfg).await.expect("cache manager failed")
+    }
+
+    // Verify fetch without role_arn uses the default client (backward compat).
+    #[tokio::test]
+    async fn test_fetch_without_role_arn() {
+        let cm =
+            cache_manager_with_config("tests/resources/configs/config_file_anyport.toml").await;
+        let result = cm.fetch("MySecret", None, None, false, None).await;
+        assert!(result.is_ok());
+        let body: Value = serde_json::from_str(&result.unwrap()).unwrap();
+        assert_eq!(body["SecretString"], DEFAULT_SECRET_STRING);
+
+        // Verify no role clients were created
+        let clients = cm.role_clients.read().await;
+        assert_eq!(clients.len(), 0);
+    }
+
+    // Verify the role client is cached and reused on subsequent requests.
+    #[tokio::test]
+    async fn test_role_client_cached() {
+        let cm =
+            cache_manager_with_config("tests/resources/configs/config_file_anyport.toml").await;
+        let role = "arn:aws:iam::123456789012:role/CachedRole";
+
+        let r1 = cm.fetch("MySecret", None, None, false, Some(role)).await;
+        assert!(r1.is_ok());
+        let r2 = cm.fetch("MySecret", None, None, false, Some(role)).await;
+        assert!(r2.is_ok());
+
+        // Verify only one client was created
+        let clients = cm.role_clients.read().await;
+        assert_eq!(clients.len(), 1);
+    }
+
+    // Verify max_roles limit is enforced.
+    #[tokio::test]
+    async fn test_max_roles_limit_enforced() {
+        let cm =
+            cache_manager_with_config("tests/resources/configs/config_file_max_roles_2.toml").await;
+
+        // Fill up to the limit (max_roles = 2)
+        let r1 = cm
+            .fetch(
+                "MySecret",
+                None,
+                None,
+                false,
+                Some("arn:aws:iam::111111111111:role/Role1"),
+            )
+            .await;
+        assert!(r1.is_ok());
+
+        let r2 = cm
+            .fetch(
+                "MySecret",
+                None,
+                None,
+                false,
+                Some("arn:aws:iam::222222222222:role/Role2"),
+            )
+            .await;
+        assert!(r2.is_ok());
+
+        // Verify 2 clients were created
+        {
+            let clients = cm.role_clients.read().await;
+            assert_eq!(clients.len(), 2);
+        }
+
+        // Third role should be rejected
+        let r3 = cm
+            .fetch(
+                "MySecret",
+                None,
+                None,
+                false,
+                Some("arn:aws:iam::333333333333:role/Role3"),
+            )
+            .await;
+        assert!(r3.is_err());
+        let err = r3.unwrap_err();
+        assert_eq!(err.0, 400);
+        assert!(err.1.contains("MaxRolesExceeded"));
+
+        // server continues to serve after max role limit
+        let r2 = cm
+            .fetch(
+                "MySecret",
+                None,
+                None,
+                false,
+                Some("arn:aws:iam::222222222222:role/Role2"),
+            )
+            .await;
+        assert!(r2.is_ok());
+    }
+
+    // Verify concurrent requests for the same role don't create duplicate clients.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_same_role_no_duplicates() {
+        let cm = Arc::new(
+            cache_manager_with_config("tests/resources/configs/config_file_anyport.toml").await,
+        );
+        let role = "arn:aws:iam::123456789012:role/ConcurrentRole";
+
+        let mut handles = vec![];
+        for _ in 0..5 {
+            let cm = cm.clone();
+            let role = role.to_string();
+            handles.push(tokio::spawn(async move {
+                cm.fetch("MySecret", None, None, false, Some(&role)).await
+            }));
+        }
+
+        for h in handles {
+            assert!(h.await.unwrap().is_ok());
+        }
+
+        // Only one client should exist despite 5 concurrent requests along 4 threads
+        let clients = cm.role_clients.read().await;
+        assert_eq!(clients.len(), 1);
+    }
+
+    // Verify multiple distinct roles each get their own cached client.
+    #[tokio::test]
+    async fn test_multiple_role_clients_stored() {
+        let cm =
+            cache_manager_with_config("tests/resources/configs/config_file_anyport.toml").await;
+
+        let roles = [
+            "arn:aws:iam::111111111111:role/RoleA",
+            "arn:aws:iam::222222222222:role/RoleB",
+            "arn:aws:iam::333333333333:role/RoleC",
+        ];
+
+        for role in &roles {
+            cm.fetch("MySecret", None, None, false, Some(role))
+                .await
+                .unwrap();
+        }
+
+        let clients = cm.role_clients.read().await;
+        assert_eq!(clients.len(), roles.len());
+        for role in &roles {
+            assert!(clients.contains_key(*role), "missing client for {role}");
+        }
     }
 }
