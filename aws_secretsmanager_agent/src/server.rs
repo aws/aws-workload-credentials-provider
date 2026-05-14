@@ -152,6 +152,7 @@ impl Server {
                         qry.version_id.as_deref(),
                         qry.version_stage.as_deref(),
                         qry.refresh_now,
+                        qry.role_arn.as_deref(),
                     )
                     .await?)
             }
@@ -166,6 +167,7 @@ impl Server {
                         qry.version_id.as_deref(),
                         qry.version_stage.as_deref(),
                         qry.refresh_now,
+                        qry.role_arn.as_deref(),
                     )
                     .await?)
             }

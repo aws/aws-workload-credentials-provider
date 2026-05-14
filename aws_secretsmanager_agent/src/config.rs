@@ -1,6 +1,6 @@
 use crate::constants::EMPTY_ENV_LIST_MSG;
-use crate::constants::{BAD_MAX_CONN_MSG, BAD_PREFIX_MSG, EMPTY_SSRF_LIST_MSG};
-use crate::constants::{DEFAULT_MAX_CONNECTIONS, GENERIC_CONFIG_ERR_MSG};
+use crate::constants::{BAD_MAX_CONN_MSG, BAD_MAX_ROLES_MSG, BAD_PREFIX_MSG, EMPTY_SSRF_LIST_MSG};
+use crate::constants::{DEFAULT_MAX_CONNECTIONS, DEFAULT_MAX_ROLES, GENERIC_CONFIG_ERR_MSG};
 use crate::constants::{INVALID_CACHE_SIZE_ERR_MSG, INVALID_HTTP_PORT_ERR_MSG};
 use crate::constants::{INVALID_LOG_LEVEL_ERR_MSG, INVALID_TTL_SECONDS_ERR_MSG};
 use config::Config as ConfigLib;
@@ -42,6 +42,7 @@ struct ConfigFile {
     ssrf_env_variables: Vec<String>,
     path_prefix: String,
     max_conn: String,
+    max_roles: String,
     region: Option<String>,
     ignore_transient_errors: bool,
     validate_credentials: bool,
@@ -104,6 +105,9 @@ pub struct Config {
     /// The maximum number of simultaneous connections.
     max_conn: usize,
 
+    /// The maximum number of assumed roles for cross-account access.
+    max_roles: usize,
+
     /// The AWS Region that will be used to send the Secrets Manager request to.
     region: Option<String>,
 
@@ -154,6 +158,7 @@ impl Config {
             )?
             .set_default("path_prefix", DEFAULT_PATH_PREFIX)?
             .set_default("max_conn", DEFAULT_MAX_CONNECTIONS)?
+            .set_default("max_roles", DEFAULT_MAX_ROLES)?
             .set_default("region", DEFAULT_REGION)?
             .set_default("ignore_transient_errors", DEFAULT_IGNORE_TRANSIENT_ERRORS)?
             .set_default("validate_credentials", DEFAULT_STS_CHECK)?;
@@ -249,6 +254,15 @@ impl Config {
         self.max_conn
     }
 
+    /// The maximum number of assumed roles for cross-account access (20 max).
+    ///
+    /// # Returns
+    ///
+    /// * `max_roles` - The maximum allowed assumed roles. Defaults to 20.
+    pub fn max_roles(&self) -> usize {
+        self.max_roles
+    }
+
     /// The AWS Region that will be used to send the Secrets Manager request to.
     /// The default region is automatically determined through SDK defaults.
     /// For a list of all of the Regions that you can specify, see https://docs.aws.amazon.com/general/latest/gr/asm.html
@@ -323,6 +337,12 @@ impl Config {
                 &config_file.max_conn,
                 BAD_MAX_CONN_MSG,
                 Some(1..1001),
+                None,
+            )?,
+            max_roles: parse_num::<usize>(
+                &config_file.max_roles,
+                BAD_MAX_ROLES_MSG,
+                Some(1..21),
                 None,
             )?,
             region: config_file.region,
@@ -410,6 +430,7 @@ mod tests {
             ssrf_env_variables: DEFAULT_SSRF_ENV_VARIABLES.map(String::from).to_vec(),
             path_prefix: String::from(DEFAULT_PATH_PREFIX),
             max_conn: String::from(DEFAULT_MAX_CONNECTIONS),
+            max_roles: String::from(DEFAULT_MAX_ROLES),
             region: None,
             ignore_transient_errors: DEFAULT_IGNORE_TRANSIENT_ERRORS,
             validate_credentials: DEFAULT_STS_CHECK,
@@ -437,6 +458,7 @@ mod tests {
         );
         assert_eq!(config.clone().path_prefix(), DEFAULT_PATH_PREFIX);
         assert_eq!(config.clone().max_conn(), 800);
+        assert_eq!(config.clone().max_roles(), 20);
         assert_eq!(config.clone().region(), None);
         assert!(config.ignore_transient_errors());
         assert!(config.validate_credentials());
@@ -550,6 +572,21 @@ mod tests {
             match Config::build(invalid_config) {
                 Ok(_) => panic!(),
                 Err(e) => assert_eq!(e.to_string(), BAD_MAX_CONN_MSG),
+            };
+        }
+    }
+
+    /// Tests that an invalid max roles value returns an Err
+    #[test]
+    fn test_validate_config_max_roles_invalid_values() {
+        for value in ["21", "-1", "0", "not a number"] {
+            let invalid_config = ConfigFile {
+                max_roles: String::from(value),
+                ..get_default_config_file()
+            };
+            match Config::build(invalid_config) {
+                Ok(_) => panic!(),
+                Err(e) => assert_eq!(e.to_string(), BAD_MAX_ROLES_MSG),
             };
         }
     }

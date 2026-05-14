@@ -13,7 +13,7 @@ use std::env::var; // Use the real std::env::var
 #[cfg(test)]
 use tests::var_test as var;
 
-/// Helper to format error response body in Coral JSON 1.1 format.
+/// Helper to format error response body in JSON 1.1 format.
 ///
 /// Callers need to pass in the error code (e.g.  InternalFailure,
 /// InvalidParameterException, ect.) and the error message. This function will
@@ -155,6 +155,68 @@ pub async fn validate_and_create_asm_client(
 #[doc(hidden)]
 #[derive(Debug)]
 pub struct AgentModifierInterceptor;
+
+/// Creates a Secrets Manager client that uses AssumeRole credentials for cross-account access.
+///
+/// Builds an `AssumeRoleProvider` that handles automatic STS credential refresh,
+/// then configures a Secrets Manager SDK client with those credentials. The
+/// `AgentModifierInterceptor` is attached for CloudTrail user-agent tracking.
+///
+/// # Arguments
+///
+/// * `config` - The agent configuration, used for optional region override.
+/// * `base_config` - The base AWS SDK config providing default credentials (for the
+///   AssumeRole call itself), HTTP client, retry config, and region.
+/// * `role_arn` - The ARN of the IAM role to assume (e.g. `arn:aws:iam::123456789012:role/MyRole`).
+///
+/// # Returns
+///
+/// * `Ok(SecretsManagerClient)` - A Secrets Manager client configured with AssumeRole credentials.
+///
+/// # Errors
+///
+/// * `Box<dyn std::error::Error>` - If the `AssumeRoleProvider` fails to build or the
+///   SDK client configuration is invalid.
+#[doc(hidden)]
+#[cfg(not(test))]
+pub async fn create_role_asm_client(
+    config: &Config,
+    base_config: &aws_config::SdkConfig,
+    role_arn: &str,
+) -> Result<SecretsManagerClient, Box<dyn std::error::Error>> {
+    use aws_config::Region;
+
+    let provider = aws_config::sts::AssumeRoleProvider::builder(role_arn)
+        .configure(base_config)
+        .session_name("secrets-manager-agent")
+        .build()
+        .await;
+
+    // Eagerly validate the assumed role credentials with a GetCallerIdentity call.
+    // The AssumeRoleProvider is lazy — without this, STS errors would only surface
+    // on the first Secrets Manager request, returning a generic InternalFailure.
+    let shared_provider = aws_sdk_secretsmanager::config::SharedCredentialsProvider::new(provider);
+    let mut sts_builder = aws_sdk_sts::config::Builder::from(base_config)
+        .credentials_provider(shared_provider.clone());
+    if let Some(region) = config.region() {
+        sts_builder.set_region(Some(Region::new(region.clone())));
+    }
+
+    let sts_client = aws_sdk_sts::Client::from_conf(sts_builder.build());
+
+    // if failure, let error propagate to cache manager
+    sts_client.get_caller_identity().send().await?;
+
+    let mut asm_builder = aws_sdk_secretsmanager::config::Builder::from(base_config)
+        .credentials_provider(shared_provider)
+        .interceptor(AgentModifierInterceptor);
+
+    if let Some(region) = config.region() {
+        asm_builder.set_region(Some(Region::new(region.clone())));
+    }
+
+    Ok(SecretsManagerClient::from_conf(asm_builder.build()))
+}
 
 /// SDK interceptor to append the agent name and version to the User-Agent header for CloudTrail records.
 ///
