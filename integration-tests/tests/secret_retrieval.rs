@@ -11,7 +11,7 @@ use common::*;
 #[tokio::test]
 async fn test_secret_retrieval_by_name() {
     let secrets = TestSecrets::setup_basic().await;
-    let secret_name = secrets.secret_name(SecretType::Basic);
+    let secret_name = secrets.secret_name(&SecretType::Basic);
 
     let agent = AgentProcess::start().await;
 
@@ -30,7 +30,7 @@ async fn test_secret_retrieval_by_name() {
 #[tokio::test]
 async fn test_secret_retrieval_by_arn() {
     let secrets = TestSecrets::setup_basic().await;
-    let secret_name = secrets.secret_name(SecretType::Basic);
+    let secret_name = secrets.secret_name(&SecretType::Basic);
 
     // Get the ARN using AWS SDK
     let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
@@ -58,7 +58,7 @@ async fn test_secret_retrieval_by_arn() {
 #[tokio::test]
 async fn test_binary_secret_retrieval() {
     let secrets = TestSecrets::setup_binary().await;
-    let secret_name = secrets.secret_name(SecretType::Binary);
+    let secret_name = secrets.secret_name(&SecretType::Binary);
 
     let agent = AgentProcess::start().await;
 
@@ -77,11 +77,11 @@ async fn test_binary_secret_retrieval() {
 #[tokio::test]
 async fn test_version_stage_retrieval() {
     let secrets = TestSecrets::setup_versioned().await;
-    let secret_name = secrets.secret_name(SecretType::Versioned);
+    let secret_name = secrets.secret_name(&SecretType::Versioned);
 
     // Wait for AWSPENDING version to be available
     let _ = secrets
-        .wait_for_pending_version(SecretType::Versioned)
+        .wait_for_pending_version(&SecretType::Versioned)
         .await;
 
     let agent = AgentProcess::start().await;
@@ -128,16 +128,16 @@ async fn test_version_stage_retrieval() {
 #[tokio::test]
 async fn test_version_id_retrieval() {
     let secrets = TestSecrets::setup_versioned().await;
-    let secret_name = secrets.secret_name(SecretType::Versioned);
+    let secret_name = secrets.secret_name(&SecretType::Versioned);
 
     // Wait for AWSPENDING version to be available
     let _ = secrets
-        .wait_for_pending_version(SecretType::Versioned)
+        .wait_for_pending_version(&SecretType::Versioned)
         .await;
 
     // Get the version IDs for both stages
     let (current_version_id, pending_version_id) =
-        secrets.get_version_ids(SecretType::Versioned).await;
+        secrets.get_version_ids(&SecretType::Versioned).await;
 
     let agent = AgentProcess::start().await;
 
@@ -177,7 +177,7 @@ async fn test_version_id_retrieval() {
 #[tokio::test]
 async fn test_large_secret_retrieval() {
     let secrets = TestSecrets::setup_large().await;
-    let secret_name = secrets.secret_name(SecretType::Large);
+    let secret_name = secrets.secret_name(&SecretType::Large);
 
     let agent = AgentProcess::start().await;
 

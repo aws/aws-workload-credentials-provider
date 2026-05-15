@@ -180,7 +180,7 @@ impl CacheManager {
     ///
     /// * `HttpError(400, ...)` - If the `max_roles` limit has been reached.
     /// * `HttpError(403, ...)` - If role client creation fails (e.g. STS AssumeRole denied).
-    async fn get_client(
+    pub(crate) async fn get_client(
         &self,
         role_arn: Option<&str>,
     ) -> Result<Arc<SecretsManagerCachingClient>, HttpError> {
@@ -437,8 +437,68 @@ pub mod tests {
             .unwrap()
             .contains(APPNAME)); // validate user-agent
 
+        let target = parts.headers["x-amz-target"].to_str().unwrap();
         let req_map: serde_json::Map<String, Value> =
             serde_json::from_slice(body.bytes().unwrap()).unwrap();
+
+        // Handle BatchGetSecretValue requests
+        if target == "secretsmanager.BatchGetSecretValue" {
+            let secret_ids = req_map
+                .get("SecretIdList")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
+                .unwrap_or_default();
+            let has_filters = req_map.get("Filters").is_some();
+
+            if secret_ids.iter().any(|s| s.starts_with("BATCHAPIERROR")) {
+                return (
+                    400,
+                    r#"{"__type":"InvalidParameterException","message":"invalid"}"#.to_string(),
+                );
+            }
+
+            if secret_ids.iter().any(|s| s.starts_with("NOTFOUND")) {
+                let valid = secret_ids
+                    .iter()
+                    .find(|s| !s.starts_with("NOTFOUND"))
+                    .unwrap_or(&"Valid");
+                let err = secret_ids
+                    .iter()
+                    .find(|s| s.starts_with("NOTFOUND"))
+                    .unwrap_or(&"NOTFOUND");
+                return (
+                    200,
+                    format!(
+                        r#"{{"SecretValues":[{{"ARN":"{}","Name":"{}","VersionId":"{}","SecretString":"{}","VersionStages":["{}"],"CreatedDate":1569534789.046}}],"Errors":[{{"SecretId":"{}","ErrorCode":"ResourceNotFoundException","Message":"not found"}}]}}"#,
+                        FAKE_ARN.replace("{{name}}", valid),
+                        valid,
+                        DEFAULT_VERSION,
+                        DEFAULT_SECRET_STRING,
+                        DEFAULT_LABEL,
+                        err
+                    ),
+                );
+            }
+
+            // For filter-based requests or secret ID list requests, return a single secret
+            let name = if has_filters {
+                "TaggedSecret"
+            } else {
+                secret_ids.first().unwrap_or(&"MyTest")
+            };
+            return (
+                200,
+                format!(
+                    r#"{{"SecretValues":[{{"ARN":"{}","Name":"{}","VersionId":"{}","SecretString":"{}","VersionStages":["{}"],"CreatedDate":1569534789.046}}],"Errors":[]}}"#,
+                    FAKE_ARN.replace("{{name}}", name),
+                    name,
+                    DEFAULT_VERSION,
+                    DEFAULT_SECRET_STRING,
+                    DEFAULT_LABEL
+                ),
+            );
+        }
+
         let version = req_map
             .get("VersionId")
             .map_or(DEFAULT_VERSION, |x| x.as_str().unwrap());
@@ -456,7 +516,7 @@ pub mod tests {
             _ => DEFAULT_SECRET_STRING.to_string(),
         };
 
-        let (code, template) = match parts.headers["x-amz-target"].to_str().unwrap() {
+        let (code, template) = match target {
             "secretsmanager.GetSecretValue" if name.starts_with("KMSACCESSDENIED") => {
                 (400, KMS_ACCESS_DENIED_BODY)
             }

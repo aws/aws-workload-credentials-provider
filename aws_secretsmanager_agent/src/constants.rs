@@ -13,6 +13,8 @@ pub const EMPTY_ENV_LIST_MSG: &str =
 pub const BAD_PREFIX_MSG: &str =
     "The path prefix specified in the configuration file must begin with /.";
 pub const BAD_MAX_ROLES_MSG: &str = "The maximum number of roles specified in the configuration file isn't valid. The maximum number of roles must be in the range 1 to 20.";
+pub const INVALID_CACHE_BUFFER_RATIO_MSG: &str = "The cache_buffer_ratio specified in the prefetch configuration isn't valid. The cache_buffer_ratio must be between 0.1 and 1.0.";
+pub const INVALID_MAX_JITTER_MSG: &str = "The max_jitter_seconds specified in the prefetch configuration isn't valid. The max_jitter_seconds must be in the range 0 to 10.";
 
 /// Other constants that are used across the code base.
 

@@ -10,6 +10,7 @@ readme = "README.md"
 
 [features]
 fips = ["rustls/fips"]
+test-util = []
 
 [dependencies]
 aws-sdk-secretsmanager = "1"

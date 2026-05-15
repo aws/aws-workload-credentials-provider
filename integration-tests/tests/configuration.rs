@@ -35,7 +35,7 @@ async fn test_ping_endpoint_health_check() {
 #[tokio::test]
 async fn test_path_based_requests() {
     let secrets = TestSecrets::setup_basic().await;
-    let secret_name = secrets.secret_name(SecretType::Basic);
+    let secret_name = secrets.secret_name(&SecretType::Basic);
 
     let agent = AgentProcess::start().await;
 

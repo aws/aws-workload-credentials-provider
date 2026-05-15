@@ -1,0 +1,8 @@
+[prefetch]
+cache_buffer_ratio = 0.5
+filter_tags = [
+  { key = "Environment" },
+]
+
+[[prefetch.secrets]]
+secret_id = "arn:aws:secretsmanager:us-west-2:123456789012:secret:MySecret-AbCdEf"

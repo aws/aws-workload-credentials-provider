@@ -12,6 +12,7 @@ use server::Server;
 mod config;
 mod constants;
 mod logging;
+mod prefetch;
 mod utils;
 
 use config::Config;
@@ -95,6 +96,12 @@ async fn run<S: FnMut(&SocketAddr), E: FnMut() -> bool>(
     let (cfg, listener) = init(args).await;
     let addr = listener.local_addr()?;
     let svr = Server::new(listener, &cfg).await?;
+
+    // Start prefetch background task if enabled
+    if cfg.prefetch().is_enabled() {
+        info!("Pre-fetch enabled, starting background task");
+        prefetch::start_prefetch_task(svr.cache_manager(), cfg.clone());
+    }
 
     report(&addr); // Report the port used.
 
