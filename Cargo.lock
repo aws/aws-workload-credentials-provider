@@ -613,7 +613,7 @@ dependencies = [
  "http 0.2.12",
  "linked-hash-map",
  "log",
- "rand 0.9.4",
+ "rand 0.10.1",
  "rustls 0.23.40",
  "serde",
  "serde_json",
