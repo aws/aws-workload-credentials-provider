@@ -1,6 +1,6 @@
 [package]
 name = "aws_secretsmanager_caching"
-version = "2.0.0"
+version = "2.1.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "The AWS Secrets Manager Rust caching client enables in-process caching of secrets for Rust applications."
