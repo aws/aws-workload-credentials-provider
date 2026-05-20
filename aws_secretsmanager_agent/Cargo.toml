@@ -22,7 +22,7 @@ pretty_env_logger = "0.5"
 serde = "1"
 serde_json = "1"
 serde_derive = "1"
-config = "0.14"
+config = "0.15"
 
 aws-config = "1"
 aws-sdk-secretsmanager = "1"
