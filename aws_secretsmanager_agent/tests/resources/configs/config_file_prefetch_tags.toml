@@ -1,0 +1,5 @@
+[prefetch]
+filter_tags = [
+  { key = "Environment" },
+  { key = "Team", role_arn = "arn:aws:iam::987654321098:role/SecretAccessRole" },
+]

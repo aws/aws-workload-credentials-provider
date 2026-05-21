@@ -30,13 +30,16 @@ To download the source code, see [https://github\.com/aws/aws\-secretsmanager\-a
     - [Example - Secrets Manager Agent GET request with refreshNow parameter](#example---secrets-manager-agent-get-request-with-refreshnow-parameter)
       - [\[ curl \]](#-curl--1)
       - [\[ Python \]](#-python--1)
+  - [Role chaining (cross-account access)](#role-chaining-cross-account-access)
+  - [Pre-fetching](#pre-fetching)
   - [Configure the Secrets Manager Agent](#configure-the-secrets-manager-agent)
-  - [File-based credentials](#file-based-credentials)
+  - [Optional features](#optional-features)
   - [Logging](#logging)
   - [Security considerations](#security-considerations)
   - [Running Integration Tests Locally](#running-integration-tests-locally)
     - [Prerequisites](#prerequisites)
     - [Required AWS Permissions](#required-aws-permissions)
+    - [Required IAM Roles (for role chaining tests)](#required-iam-roles-for-role-chaining-tests)
     - [Running Tests](#running-tests)
       - [Option 1: Using the test script](#option-1-using-the-test-script)
       - [Option 2: Manual execution](#option-2-manual-execution)
@@ -51,6 +54,10 @@ To build the Secrets Manager Agent binary natively, you need the standard develo
 **NOTE:** To ensure a stable experience, use a specific git tag when building from source code. You can find a list of version tags [here](https://github.com/aws/aws-secretsmanager-agent/tags). Tags are in the pattern `/v\d+\.\d+\.\d+/` and follow [SemVer 2.0.0](https://semver.org/spec/v2.0.0.html).
 
 Example: `git clone --branch <git tag> https://github.com/aws/aws-secretsmanager-agent.git`
+
+**NOTE:** Building the agent with the `fips` feature enabled on macOS currently requires the following workaround:
+
+- Create an environment variable called `SDKROOT` which is set to the result of running `xcrun --show-sdk-path`
 
 #### [ RPM\-based systems ]
 
@@ -298,7 +305,7 @@ The following instructions show how to get a secret named *MyTest* by using the 
 
 ## Step 3: Retrieve secrets with the Secrets Manager Agent<a name="secrets-manager-agent-call"></a>
 
-To use the agent, you call the local Secrets Manager Agent endpoint and include the name or ARN of the secret as a query parameter\. By default, the Secrets Manager Agent retrieves the `AWSCURRENT` version of the secret\. To retrieve a different version, you can set `versionStage` or `versionId`\.
+To use the agent, you call the local Secrets Manager Agent endpoint and include the name or ARN of the secret as a query parameter\. By default, the Secrets Manager Agent retrieves the `AWSCURRENT` version of the secret\. To retrieve a different version, you can set `versionStage` or `versionId`\. To retrieve a secret using a different IAM role, you can set `roleArn`\. For more information, see [Role chaining \(cross\-account access\)](#role-chaining-cross-account-access)\.
 
 To help protect the Secrets Manager Agent, you must include a SSRF token header as part of each request: `X-Aws-Parameters-Secrets-Token`\. The Secrets Manager Agent denies requests that don't have this header or that have an invalid SSRF token\. You can customize the SSRF header name in the [Configuration file](#secrets-manager-agent-config)\.
 
@@ -332,7 +339,6 @@ The following Python example shows how to get a secret from the Secrets Manager 
 
 ```python
 import requests
-import json
 
 # Function that fetches the secret from Secrets Manager Agent for the provided secret id. 
 def get_secret():
@@ -421,7 +427,6 @@ The following Python example shows how to get a secret from the Secrets Manager 
 
 ```python
 import requests
-import json
 
 # Function that fetches the secret from Secrets Manager Agent for the provided secret id. 
 def get_secret():
@@ -454,6 +459,156 @@ def get_secret():
 ```
 ------
 
+## Role chaining \(cross\-account access\)<a name="role-chaining-cross-account-access"></a>
+
+The Secrets Manager Agent supports retrieving secrets using IAM role assumption \(role chaining\)\. This allows you to access secrets in other AWS accounts or with different IAM permissions without running separate agent instances\.
+
+To retrieve a secret using a different IAM role, include the `roleArn` query parameter in your request\. The Secrets Manager Agent uses STS `AssumeRole` to obtain temporary credentials for the specified role and then retrieves the secret with those credentials\.
+
+The Secrets Manager Agent creates and caches a separate caching client for each unique role ARN\. Role clients are created lazily on first request and reused for subsequent requests with the same role ARN\. Each role client maintains its own independent cache, so the same secret fetched with different roles will have separate cache entries\.
+
+**Required permissions: **
++ `sts:AssumeRole` on the target role ARN
++ The target role must have `secretsmanager:GetSecretValue` and `secretsmanager:DescribeSecret` permissions
+
+**Error responses: **
++ `400` – If the `roleArn` format is invalid or the maximum number of assumed roles has been reached\.
++ `403` – If the STS `AssumeRole` call fails \(for example, the trust policy does not allow the agent's identity to assume the role\)\.
+
+You can configure the maximum number of simultaneous assumed roles with the `max_roles` option in the [Configuration file](#secrets-manager-agent-config)\. The default is 20\.
+
+**Note:** Assumed roles are not evicted from the agent's role cache\. Once the maximum number of roles has been reached, requests with new role ARNs will be rejected with a `400` error until the agent is restarted\.
+
+------
+#### [ curl ]
+
+The following curl example shows how to retrieve a secret using a different IAM role\.
+
+```sh
+curl -v -H \
+    "X-Aws-Parameters-Secrets-Token: $(</var/run/awssmatoken)" \
+    'http://localhost:2773/secretsmanager/get?secretId=<YOUR_SECRET_ID>&roleArn=arn:aws:iam::<ACCOUNT_ID>:role/<ROLE_NAME>'; \
+    echo
+```
+
+------
+#### [ Python ]
+
+The following Python example shows how to retrieve a secret using a different IAM role\.
+
+```python
+import requests
+
+def get_secret_cross_account():
+    role_arn = "arn:aws:iam::<ACCOUNT_ID>:role/<ROLE_NAME>"
+    url = f"http://localhost:2773/secretsmanager/get?secretId=<YOUR_SECRET_ID>&roleArn={role_arn}"
+
+    with open('/var/run/awssmatoken') as fp:
+        token = fp.read()
+
+    headers = {
+        "X-Aws-Parameters-Secrets-Token": token.strip()
+    }
+
+    try:
+        response = requests.get(url, headers=headers)
+
+        if response.status_code == 200:
+            return response.text
+        else:
+            raise Exception(f"Status code {response.status_code} - {response.text}")
+
+    except Exception as e:
+        raise Exception(f"Error: {e}")
+```
+
+------
+
+## Pre\-fetching<a name="pre-fetching"></a>
+
+The Secrets Manager Agent supports pre\-fetching secrets into the cache at startup\. This allows your application to read secrets from the cache immediately without waiting for the first request to trigger a cache miss and network call\.
+
+To enable pre\-fetching, add a `[prefetch]` section to your [Configuration file](#secrets-manager-agent-config)\. You can specify secrets to pre\-fetch in two ways:
+
++ **Explicit secrets** – List specific secret IDs or ARNs using `[[prefetch.secrets]]` entries\.
++ **Tag\-based discovery** – Discover secrets by tag key using `[[prefetch.filter_tags]]` entries\. The agent calls `BatchGetSecretValue` with tag key filters to find and cache all secrets that have the specified tag key, regardless of the tag's value\.
+
+You can use both methods together\. Each entry optionally accepts a `role_arn` field for cross\-account pre\-fetching via [role chaining](#role-chaining-cross-account-access)\.
+
+**Required permissions: **
++ `secretsmanager:BatchGetSecretValue` – Required for all pre\-fetching operations\.
++ `secretsmanager:ListSecrets` – Required when using tag\-based discovery \(`filter_tags`\)\.
+
+**Pre\-fetch configuration options: **
++ **cache\_buffer\_ratio** – The maximum fraction of the cache to fill per caching client during pre\-fetch, in the range 0\.1 to 1\.0\. The default is 0\.8\.
++ **max\_jitter\_seconds** – The maximum random delay in seconds before starting the pre\-fetch task, in the range 0 to 10\. The default is 0 \(no jitter\)\. Use this to prevent fleet\-wide synchronized API calls\.
+
+### Example \- Pre\-fetch with explicit secrets
+
+```toml
+[[prefetch.secrets]]
+secret_id = "arn:aws:secretsmanager:us-west-2:123456789012:secret:MySecret-AbCdEf"
+
+[[prefetch.secrets]]
+secret_id = "cross-account-secret"
+role_arn = "arn:aws:iam::987654321098:role/SecretAccessRole"
+```
+
+### Example \- Pre\-fetch with explicit secrets \(inline syntax\)
+
+```toml
+[prefetch]
+max_jitter_seconds = 5
+cache_buffer_ratio = 0.9
+secrets = [
+  { secret_id = "arn:aws:secretsmanager:us-west-2:123456789012:secret:MySecret-AbCdEf" },
+  { secret_id = "cross-account-secret", role_arn = "arn:aws:iam::987654321098:role/SecretAccessRole" },
+]
+filter_tags = [
+  { key = "Environment" },
+  { key = "Team", role_arn = "arn:aws:iam::987654321098:role/SecretAccessRole" },
+]
+```
+
+### Example \- Pre\-fetch with tag\-based discovery
+
+```toml
+[[prefetch.filter_tags]]
+key = "Environment"
+
+[[prefetch.filter_tags]]
+key = "Team"
+role_arn = "arn:aws:iam::987654321098:role/SecretAccessRole"
+```
+
+### Example \- Full configuration with pre\-fetching
+
+```toml
+log_level = "info"
+http_port = 2773
+ttl_seconds = 300
+region = "us-east-1"
+max_roles = 5
+
+[prefetch]
+cache_buffer_ratio = 0.6
+max_jitter_seconds = 5
+
+[[prefetch.secrets]]
+secret_id = "arn:aws:secretsmanager:us-west-2:123456789012:secret:MySecret-AbCdEf"
+
+[[prefetch.secrets]]
+secret_id = "arn:aws:secretsmanager:us-east-1:987654321098:secret:CrossAccount-AbCdEf"
+role_arn = "arn:aws:iam::987654321098:role/SecretAccessRole"
+
+[[prefetch.filter_tags]]
+key = "Environment"
+
+[[prefetch.filter_tags]]
+key = "Team"
+role_arn = "arn:aws:iam::987654321098:role/TagRole"
+```
+
 ## Configure the Secrets Manager Agent<a name="secrets-manager-agent-config"></a>
 
 To change the configuration of the Secrets Manager Agent, create a [TOML](https://toml.io/en/) config file, and then call `./aws_secretsmanager_agent --config config.toml`\.
@@ -469,60 +624,14 @@ The following list shows the options you can configure for the Secrets Manager A
 + **ssrf\_env\_variables** – A list of environment variable names the Secrets Manager Agent checks in sequential order for the SSRF token\. The environment variable can contain the token or a reference to the token file as in: `AWS_TOKEN=file:///var/run/awssmatoken`\. The default is "AWS\_TOKEN, AWS\_SESSION\_TOKEN, AWS\_CONTAINER\_AUTHORIZATION\_TOKEN\".
 + **path\_prefix** – The URI prefix used to determine if the request is a path based request\. The default is "/v1/"\.
 + **max\_conn** – The maximum number of connections from HTTP clients that the Secrets Manager Agent allows, in the range 1 to 1000\. The default is 800\.
-+ **credentials\_file\_path** – The path to a file containing AWS credentials in the standard AWS credentials file format. When set, the agent reads credentials from this file instead of using the default SDK credential provider chain. The agent automatically reloads credentials when the file changes, making it compatible with credential rotation systems that deliver refreshed credentials to the filesystem. This parameter is optional.
++ **max\_roles** – The maximum number of IAM roles the Secrets Manager Agent can assume simultaneously for cross\-account access, in the range 1 to 20\. The default is 20\. For more information, see [Role chaining \(cross\-account access\)](#role-chaining-cross-account-access)\.
 
-## File-based credentials
 
-By default, the Secrets Manager Agent uses the [AWS SDK default credential provider chain](https://docs.aws.amazon.com/sdk-for-rust/latest/dg/credproviders.html) to authenticate with Secrets Manager. This works well on Amazon EC2 (via IMDS), Lambda, and ECS/EKS (via container credentials).
+## Optional features<a name="secrets-manager-agent-features"></a>
 
-For environments where credentials are delivered to the filesystem — such as on-premises hosts using [IAM Roles Anywhere](https://docs.aws.amazon.com/rolesanywhere/latest/userguide/introduction.html) or other credential management systems — you can configure the agent to read credentials from a file.
+The Secrets Manager Agent can be built with optional features by passing the `--features` flag to `cargo build`. The available features are:
 
-### Credentials file format
-
-The credentials file must use the standard AWS credentials file format:
-
-```
-[default]
-aws_access_key_id = AKIAIOSFODNN7EXAMPLE
-aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
-aws_session_token = IQoJb3JpZ2luX2Vj...
-```
-
-### Configuration
-
-Set the `credentials_file_path` parameter in your configuration file:
-
-```toml
-region = "us-east-1"
-credentials_file_path = "/path/to/credentials"
-```
-
-### Credential refresh behavior
-
-The agent automatically detects and re-reads updated credentials from the file:
-
-+ The agent checks the credentials file for changes every 5 minutes.
-+ When the file's modification time changes, the agent reloads the credentials.
-+ If the file is missing or malformed during a reload, the agent continues using the previously cached credentials and retries on the next cycle.
-+ Credentials are served to the AWS SDK with a 10-minute expiry window, ensuring the SDK periodically requests fresh credentials from the provider.
-
-### Startup behavior
-
-The agent is designed to start successfully regardless of the credentials file state:
-
-+ If the file exists and contains valid credentials, the agent loads them immediately.
-+ If the file is missing, empty, or malformed, the agent starts without credentials and the background reload task will pick up valid credentials when they appear.
-+ When file-based credentials are configured, the agent skips the STS credential validation check at startup, since the credentials file may not yet exist. The `validate_credentials` setting continues to apply for non-file-based credential sources.
-+ Calls to Secrets Manager will fail until valid credentials are available. The agent process itself remains running and will begin serving requests once credentials appear in the file.
-
-### Security
-
-On Unix systems, the agent logs a warning if the credentials file has permissions more permissive than owner-only (`0600`). Consider restricting file permissions:
-
-```sh
-chmod 600 /path/to/credentials
-```
-
+* `fips`: restricts the cipher suites used by the agent to only FIPS-approved ciphers
 
 ## Logging<a name="secrets-manager-agent-log"></a>
 
@@ -560,6 +669,19 @@ Your AWS credentials must have the following permissions:
 - `secretsmanager:UpdateSecretVersionStage`
 - `secretsmanager:PutSecretValue`
 - `secretsmanager:DeleteSecret`
+- `secretsmanager:BatchGetSecretValue`
+- `secretsmanager:ListSecrets`
+- `sts:AssumeRole`
+
+### Required IAM Roles (for role chaining tests)
+
+The role chaining integration tests require two IAM roles in the same account:
+
+1. **`secrets-manager-agent`** — Must be assumable by the test runner's identity and have `secretsmanager:GetSecretValue` and `secretsmanager:DescribeSecret` permissions.
+
+2. **`secrets-manager-agent-no-access`** — Must be assumable by the test runner's identity but have *no* Secrets Manager permissions. Used to verify access-denied behavior.
+
+Both roles must have a trust policy that allows the identity running the tests to call `sts:AssumeRole`. The account ID is discovered automatically via `sts:GetCallerIdentity`.
 
 ### Running Tests
 
@@ -596,4 +718,5 @@ The integration tests are organized into the following modules:
 - **`security.rs`** - Tests security features including SSRF token validation and X-Forwarded-For header rejection
 - **`version_management.rs`** - Tests secret version transitions and rotation scenarios
 - **`configuration.rs`** - Tests configuration parameters including health checks and path-based requests
-- **`file_credentials.rs`** - Tests file-based credential loading including valid/invalid/missing credentials, self-healing (credentials appearing after startup), and credential rotation
+- **`role_chaining.rs`** - Tests cross\-account secret retrieval via IAM role assumption, including invalid role ARN handling, access denied scenarios, refreshNow with role chaining, and separate per\-role cache isolation
+- **`prefetch.rs`** - Tests pre\-fetching secrets into the cache at startup, including explicit secrets, tag\-based discovery, inline TOML syntax, cross\-account pre\-fetching via role chaining, and resilience to nonexistent secrets

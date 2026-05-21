@@ -6,8 +6,6 @@ use aws_sdk_secretsmanager::config::{ConfigBag, Intercept, RuntimeComponents};
 use aws_sdk_secretsmanager::Client as SecretsManagerClient;
 use std::env::VarError;
 use std::fs;
-#[cfg(not(test))]
-use std::path::PathBuf;
 use std::time::Duration;
 
 #[cfg(not(test))]
@@ -15,11 +13,12 @@ use std::env::var; // Use the real std::env::var
 #[cfg(test)]
 use tests::var_test as var;
 
-/// Helper to format error response body in Coral JSON 1.1 format.
+/// Helper to format error response body in JSON 1.1 format.
 ///
 /// Callers need to pass in the error code (e.g.  InternalFailure,
 /// InvalidParameterException, ect.) and the error message. This function will
-/// then format a response body in JSON 1.1 format.
+/// then format a response body in JSON 1.1 format. All values are properly
+/// JSON-escaped via serde_json to prevent injection attacks.
 ///
 /// # Arguments
 ///
@@ -44,7 +43,11 @@ pub fn err_response(err_code: &str, msg: &str) -> String {
     if msg.is_empty() || err_code == "InternalFailure" {
         return String::from("{\"__type\":\"InternalFailure\"}");
     }
-    format!("{{\"__type\":\"{err_code}\", \"message\":\"{msg}\"}}")
+    serde_json::json!({
+        "__type": err_code,
+        "message": msg
+    })
+    .to_string()
 }
 
 /// Helper function to get the SSRF token value.
@@ -116,54 +119,26 @@ pub fn time_out_test() -> Duration {
 ///
 /// # Returns
 ///
-/// * `Ok((SecretsManagerClient, SdkConfig))` - An AWS Secrets Manager client and the SDK config
-///   (with file-based credentials wired in, if applicable). The SDK config can be reused by
-///   other components that need the same credential source (e.g., AssumeRole for cross-account access).
+/// * `Ok(SecretsManagerClient)` - An AWS Secrets Manager client if the credentials are valid.
 /// * `Err(Box<dyn std::error::Error>)` if there is an error creating the Secrets Manager client
 ///   or validating the AWS credentials.
 #[doc(hidden)]
 #[cfg(not(test))]
 pub async fn validate_and_create_asm_client(
     config: &Config,
-) -> Result<(SecretsManagerClient, aws_config::SdkConfig), Box<dyn std::error::Error>> {
-    use crate::credentials_file_provider::FileBasedCredentialsProvider;
+) -> Result<SecretsManagerClient, Box<dyn std::error::Error>> {
     use aws_config::{BehaviorVersion, Region};
     use aws_secretsmanager_caching::error::is_transient_error;
-
-    let mut sdk_config = aws_config::load_defaults(BehaviorVersion::latest()).await;
-
-    // Use file-based credentials if configured.
-    let has_file_provider = if let Some(path) = discover_credentials_file(config) {
-        log::info!("Using file-based credentials from: {}", path.display());
-        let provider = FileBasedCredentialsProvider::new(&path).await;
-        sdk_config = sdk_config
-            .into_builder()
-            .credentials_provider(
-                aws_credential_types::provider::SharedCredentialsProvider::new(provider),
-            )
-            .build();
-        true
-    } else {
-        log::info!("No credentials file found, using default SDK credential chain");
-        false
-    };
-
-    let mut asm_builder = aws_sdk_secretsmanager::config::Builder::from(&sdk_config)
+    let default_config = &aws_config::load_defaults(BehaviorVersion::latest()).await;
+    let mut asm_builder = aws_sdk_secretsmanager::config::Builder::from(default_config)
         .interceptor(AgentModifierInterceptor);
-
-    #[cfg(debug_assertions)]
-    if std::env::var("SMA_DISABLE_IDENTITY_CACHE").is_ok() {
-        log::info!("Identity caching disabled via SMA_DISABLE_IDENTITY_CACHE");
-        asm_builder =
-            asm_builder.identity_cache(aws_sdk_secretsmanager::config::IdentityCache::no_cache());
-    }
 
     if let Some(region) = config.region() {
         asm_builder.set_region(Some(Region::new(region.clone())));
     }
 
-    if config.validate_credentials() && !has_file_provider {
-        let mut sts_builder = aws_sdk_sts::config::Builder::from(&sdk_config);
+    if config.validate_credentials() {
+        let mut sts_builder = aws_sdk_sts::config::Builder::from(default_config);
         if let Some(region) = config.region() {
             sts_builder.set_region(Some(Region::new(region.clone())));
         }
@@ -174,42 +149,79 @@ pub async fn validate_and_create_asm_client(
             Err(e) if config.ignore_transient_errors() && is_transient_error(&e) => (),
             Err(e) => Err(e)?,
         };
-    } else if has_file_provider {
-        log::info!("Skipping STS credential validation for file-based credentials");
     }
 
-    Ok((
-        aws_sdk_secretsmanager::Client::from_conf(asm_builder.build()),
-        sdk_config,
+    Ok(aws_sdk_secretsmanager::Client::from_conf(
+        asm_builder.build(),
     ))
-}
-
-/// Discover a credentials file from explicit config.
-///
-/// Returns the configured credentials file path, if set.
-/// If the configured path does not exist yet, it is still returned — the provider
-/// will start with an empty cache and the background reload will pick up the file
-/// when it appears.
-#[cfg(not(test))]
-fn discover_credentials_file(config: &Config) -> Option<PathBuf> {
-    if let Some(path) = config.credentials_file_path() {
-        if !path.is_file() {
-            log::warn!(
-                "Configured credentials_file_path does not exist yet: {}. \
-                 The agent will watch for it to appear.",
-                path.display()
-            );
-        }
-        return Some(path.clone());
-    }
-
-    None
 }
 
 /// SDK interceptor to append the agent name and version to the User-Agent header for CloudTrail records.
 #[doc(hidden)]
 #[derive(Debug)]
 pub struct AgentModifierInterceptor;
+
+/// Creates a Secrets Manager client that uses AssumeRole credentials for cross-account access.
+///
+/// Builds an `AssumeRoleProvider` that handles automatic STS credential refresh,
+/// then configures a Secrets Manager SDK client with those credentials. The
+/// `AgentModifierInterceptor` is attached for CloudTrail user-agent tracking.
+///
+/// # Arguments
+///
+/// * `config` - The agent configuration, used for optional region override.
+/// * `base_config` - The base AWS SDK config providing default credentials (for the
+///   AssumeRole call itself), HTTP client, retry config, and region.
+/// * `role_arn` - The ARN of the IAM role to assume (e.g. `arn:aws:iam::123456789012:role/MyRole`).
+///
+/// # Returns
+///
+/// * `Ok(SecretsManagerClient)` - A Secrets Manager client configured with AssumeRole credentials.
+///
+/// # Errors
+///
+/// * `Box<dyn std::error::Error>` - If the `AssumeRoleProvider` fails to build or the
+///   SDK client configuration is invalid.
+#[doc(hidden)]
+#[cfg(not(test))]
+pub async fn create_role_asm_client(
+    config: &Config,
+    base_config: &aws_config::SdkConfig,
+    role_arn: &str,
+) -> Result<SecretsManagerClient, Box<dyn std::error::Error>> {
+    use aws_config::Region;
+
+    let provider = aws_config::sts::AssumeRoleProvider::builder(role_arn)
+        .configure(base_config)
+        .session_name("secrets-manager-agent")
+        .build()
+        .await;
+
+    // Eagerly validate the assumed role credentials with a GetCallerIdentity call.
+    // The AssumeRoleProvider is lazy — without this, STS errors would only surface
+    // on the first Secrets Manager request, returning a generic InternalFailure.
+    let shared_provider = aws_sdk_secretsmanager::config::SharedCredentialsProvider::new(provider);
+    let mut sts_builder = aws_sdk_sts::config::Builder::from(base_config)
+        .credentials_provider(shared_provider.clone());
+    if let Some(region) = config.region() {
+        sts_builder.set_region(Some(Region::new(region.clone())));
+    }
+
+    let sts_client = aws_sdk_sts::Client::from_conf(sts_builder.build());
+
+    // if failure, let error propagate to cache manager
+    sts_client.get_caller_identity().send().await?;
+
+    let mut asm_builder = aws_sdk_secretsmanager::config::Builder::from(base_config)
+        .credentials_provider(shared_provider)
+        .interceptor(AgentModifierInterceptor);
+
+    if let Some(region) = config.region() {
+        asm_builder.set_region(Some(Region::new(region.clone())));
+    }
+
+    Ok(SecretsManagerClient::from_conf(asm_builder.build()))
+}
 
 /// SDK interceptor to append the agent name and version to the User-Agent header for CloudTrail records.
 ///

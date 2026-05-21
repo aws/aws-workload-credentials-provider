@@ -6,7 +6,9 @@
 
 use aws_config;
 use aws_sdk_secretsmanager;
+use aws_sdk_sts;
 use derive_builder::Builder;
+use std::env;
 use std::fmt;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -15,13 +17,14 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command as TokioCommand;
 use url::Url;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub enum SecretType {
     Basic,
     Binary,
     Versioned,
     Large,
+    Tagged { tag_key: String },
 }
 
 impl fmt::Display for SecretType {
@@ -31,6 +34,7 @@ impl fmt::Display for SecretType {
             SecretType::Binary => write!(f, "binary"),
             SecretType::Versioned => write!(f, "versioned"),
             SecretType::Large => write!(f, "large"),
+            SecretType::Tagged { .. } => write!(f, "tagged"),
         }
     }
 }
@@ -45,6 +49,8 @@ pub struct AgentQuery {
     pub version_stage: Option<String>,
     #[builder(default)]
     pub refresh_now: Option<bool>,
+    #[builder(default)]
+    pub role_arn: Option<String>,
 }
 
 impl AgentQuery {
@@ -64,6 +70,10 @@ impl AgentQuery {
 
             if let Some(refresh_now) = self.refresh_now {
                 query_pairs.append_pair("refreshNow", &refresh_now.to_string());
+            }
+
+            if let Some(role_arn) = &self.role_arn {
+                query_pairs.append_pair("roleArn", role_arn);
             }
         }
         url.query().unwrap_or("").to_string()
@@ -90,45 +100,16 @@ validate_credentials = true
 "#,
             port, ttl_seconds
         );
-        Self::spawn_agent(&config_content, port, &[]).await
+
+        Self::start_with_config_content(port, &config_content).await
     }
 
-    #[allow(dead_code)]
-    pub async fn start_with_credentials_file(
-        port: u16,
-        credentials_file_path: Option<&str>,
-    ) -> AgentProcess {
-        Self::start_with_credentials_file_and_env(port, credentials_file_path, &[]).await
-    }
-
-    #[allow(dead_code)]
-    pub async fn start_with_credentials_file_and_env(
-        port: u16,
-        credentials_file_path: Option<&str>,
-        extra_env: &[(&str, &str)],
-    ) -> AgentProcess {
-        let creds_line = match credentials_file_path {
-            Some(path) => format!("credentials_file_path = \"{}\"", path),
-            None => String::new(),
-        };
-        let config_content = format!(
-            r#"
-http_port = {}
-log_level = "debug"
-{}
-"#,
-            port, creds_line
-        );
-        Self::spawn_agent(&config_content, port, extra_env).await
-    }
-
-    async fn spawn_agent(
-        config_content: &str,
-        port: u16,
-        extra_env: &[(&str, &str)],
-    ) -> AgentProcess {
+    /// Start the agent with a fully custom config string.
+    pub async fn start_with_config_content(port: u16, config_content: &str) -> AgentProcess {
         let config_path = format!("/tmp/test_config_{}.toml", port);
         std::fs::write(&config_path, config_content).expect("Failed to write test config");
+
+        env::set_var("AWS_TOKEN", "test-token-123");
 
         let possible_paths = [
             PathBuf::from("target")
@@ -152,20 +133,16 @@ log_level = "debug"
             .find(|path| path.exists())
             .expect("Agent binary not found");
 
-        let mut cmd = TokioCommand::new(agent_path);
-        cmd.arg("--config")
+        let mut child = TokioCommand::new(agent_path)
+            .arg("--config")
             .arg(&config_path)
-            .env("AWS_TOKEN", "test-token-123")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true);
+            .kill_on_drop(true)
+            .spawn()
+            .expect("Failed to start agent");
 
-        for (key, val) in extra_env {
-            cmd.env(key, val);
-        }
-
-        let mut child = cmd.spawn().expect("Failed to start agent");
-
+        // Read stdout until we see the "listening" message
         let stdout = child.stdout.take().expect("Failed to get stdout");
         let mut reader = BufReader::new(stdout).lines();
 
@@ -175,8 +152,12 @@ log_level = "debug"
                     panic!("Agent failed to start - no listening message found");
                 }
             }
-            Ok(None) => panic!("Stream ended without finding listening message"),
-            Err(e) => panic!("Failed to read agent output: {}", e),
+            Ok(None) => {
+                panic!("Stream ended without finding listening message");
+            }
+            Err(e) => {
+                panic!("Failed to read agent output: {}", e);
+            }
         }
 
         AgentProcess {
@@ -357,13 +338,21 @@ pub struct TestSecrets {
 }
 
 impl TestSecrets {
-    pub fn secret_name(&self, secret_type: SecretType) -> String {
+    pub fn secret_name(&self, secret_type: &SecretType) -> String {
         format!("{}-{}", self.prefix, secret_type)
     }
 
     #[allow(dead_code)]
     pub async fn setup_basic() -> Self {
         Self::setup_with_types(vec![SecretType::Basic]).await
+    }
+
+    #[allow(dead_code)]
+    pub async fn setup_tagged(tag_key: &str) -> Self {
+        Self::setup_with_types(vec![SecretType::Tagged {
+            tag_key: tag_key.to_string(),
+        }])
+        .await
     }
 
     #[allow(dead_code)]
@@ -400,7 +389,7 @@ impl TestSecrets {
         for secret_type in types {
             match secret_type {
                 SecretType::Basic => {
-                    let secret_name = temp_secrets.secret_name(SecretType::Basic);
+                    let secret_name = temp_secrets.secret_name(&SecretType::Basic);
                     client
                         .create_secret()
                         .name(&secret_name)
@@ -411,7 +400,7 @@ impl TestSecrets {
                         .expect("Failed to create test secret");
                 }
                 SecretType::Binary => {
-                    let binary_secret_name = temp_secrets.secret_name(SecretType::Binary);
+                    let binary_secret_name = temp_secrets.secret_name(&SecretType::Binary);
                     let binary_data = b"\x00\x01\x02\x03\xFF\xFE\xFD";
                     client
                         .create_secret()
@@ -423,7 +412,7 @@ impl TestSecrets {
                         .expect("Failed to create binary test secret");
                 }
                 SecretType::Versioned => {
-                    let versioned_secret_name = temp_secrets.secret_name(SecretType::Versioned);
+                    let versioned_secret_name = temp_secrets.secret_name(&SecretType::Versioned);
                     client
                         .create_secret()
                         .name(&versioned_secret_name)
@@ -444,7 +433,7 @@ impl TestSecrets {
                         .expect("Failed to create AWSPENDING version");
                 }
                 SecretType::Large => {
-                    let large_secret_name = temp_secrets.secret_name(SecretType::Large);
+                    let large_secret_name = temp_secrets.secret_name(&SecretType::Large);
                     let large_data = "x".repeat(60000); // ~60KB of data
                     let large_secret_json = format!(r#"{{"data":"{}","size":"60KB"}}"#, large_data);
                     client
@@ -456,6 +445,25 @@ impl TestSecrets {
                         .await
                         .expect("Failed to create large test secret");
                 }
+                SecretType::Tagged { tag_key } => {
+                    let tagged_secret_name = temp_secrets.secret_name(&SecretType::Tagged {
+                        tag_key: tag_key.clone(),
+                    });
+                    client
+                        .create_secret()
+                        .name(&tagged_secret_name)
+                        .description("Tagged test secret for prefetch integration tests")
+                        .secret_string(r#"{"username":"testuser","password":"testpass123"}"#)
+                        .tags(
+                            aws_sdk_secretsmanager::types::Tag::builder()
+                                .key(&tag_key)
+                                .value("integration-testing")
+                                .build(),
+                        )
+                        .send()
+                        .await
+                        .expect("Failed to create tagged test secret");
+                }
             }
         }
 
@@ -463,9 +471,38 @@ impl TestSecrets {
     }
 
     #[allow(dead_code)]
+    pub async fn wait_for_tag(
+        &self,
+        secret_type: &SecretType,
+        expected_tag_key: &str,
+    ) -> Result<(), tokio::time::error::Elapsed> {
+        let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+        let client = aws_sdk_secretsmanager::Client::new(&config);
+        let secret_name = self.secret_name(secret_type);
+
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                let response = client
+                    .describe_secret()
+                    .secret_id(&secret_name)
+                    .send()
+                    .await
+                    .expect("Failed to describe secret");
+
+                let tags = response.tags();
+                if tags.iter().any(|t| t.key() == Some(expected_tag_key)) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        })
+        .await
+    }
+
+    #[allow(dead_code)]
     pub async fn wait_for_pending_version(
         &self,
-        secret_type: SecretType,
+        secret_type: &SecretType,
     ) -> Result<(), tokio::time::error::Elapsed> {
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
@@ -480,7 +517,7 @@ impl TestSecrets {
     }
 
     #[allow(dead_code)]
-    pub async fn get_version_ids(&self, secret_type: SecretType) -> (String, String) {
+    pub async fn get_version_ids(&self, secret_type: &SecretType) -> (String, String) {
         let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
         let client = aws_sdk_secretsmanager::Client::new(&config);
         let secret_name = self.secret_name(secret_type);
@@ -527,5 +564,57 @@ impl Drop for TestSecrets {
                     .await;
             }
         });
+    }
+}
+
+// ---- Role assumption helpers ----
+
+/// Well-known role names for integration tests.
+pub const TARGET_ROLE_NAME: &str = "secrets-manager-agent";
+#[allow(dead_code)]
+pub const NO_ACCESS_ROLE_NAME: &str = "secrets-manager-agent-no-access";
+
+/// Helper for role-chaining integration tests.
+/// Discovers the account ID and provides role ARN construction with pre-flight validation.
+pub struct RoleChainingHelper {
+    pub client: aws_sdk_sts::Client,
+    pub account_id: String,
+}
+
+impl RoleChainingHelper {
+    #[allow(dead_code)]
+    pub async fn new() -> Self {
+        let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+        let client = aws_sdk_sts::Client::new(&config);
+        let account_id = client
+            .get_caller_identity()
+            .send()
+            .await
+            .expect("Failed to call GetCallerIdentity")
+            .account()
+            .expect("No account ID in response")
+            .to_string();
+        Self { client, account_id }
+    }
+
+    /// Pre-flight check: verify the role can be assumed, panic with a clear message if not.
+    /// Returns the full role ARN on success.
+    #[allow(dead_code)]
+    pub async fn get_role_arn(&self, role_name: &str) -> String {
+        let role_arn = format!("arn:aws:iam::{}:role/{role_name}", self.account_id);
+        self.client
+            .assume_role()
+            .role_arn(&role_arn)
+            .role_session_name("role-chaining-integration-tests")
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("Failed to assume role {role_name}: {e}"));
+        role_arn
+    }
+
+    /// Build a role ARN without pre-flight validation.
+    #[allow(dead_code)]
+    pub fn build_role_arn(&self, role_name: &str) -> String {
+        format!("arn:aws:iam::{}:role/{role_name}", self.account_id)
     }
 }

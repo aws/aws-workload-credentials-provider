@@ -1,6 +1,7 @@
 use crate::constants::EMPTY_ENV_LIST_MSG;
-use crate::constants::{BAD_MAX_CONN_MSG, BAD_PREFIX_MSG, EMPTY_SSRF_LIST_MSG};
-use crate::constants::{DEFAULT_MAX_CONNECTIONS, GENERIC_CONFIG_ERR_MSG};
+use crate::constants::{BAD_MAX_CONN_MSG, BAD_MAX_ROLES_MSG, BAD_PREFIX_MSG, EMPTY_SSRF_LIST_MSG};
+use crate::constants::{DEFAULT_MAX_CONNECTIONS, DEFAULT_MAX_ROLES, GENERIC_CONFIG_ERR_MSG};
+use crate::constants::{INVALID_CACHE_BUFFER_RATIO_MSG, INVALID_MAX_JITTER_MSG};
 use crate::constants::{INVALID_CACHE_SIZE_ERR_MSG, INVALID_HTTP_PORT_ERR_MSG};
 use crate::constants::{INVALID_LOG_LEVEL_ERR_MSG, INVALID_TTL_SECONDS_ERR_MSG};
 use config::Config as ConfigLib;
@@ -8,7 +9,6 @@ use config::File;
 use serde_derive::Deserialize;
 use std::num::NonZeroUsize;
 use std::ops::Range;
-use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -28,6 +28,67 @@ const DEFAULT_IGNORE_TRANSIENT_ERRORS: bool = true;
 const DEFAULT_STS_CHECK: bool = true;
 
 const DEFAULT_REGION: Option<String> = None;
+const DEFAULT_CACHE_BUFFER_RATIO: f32 = 0.8;
+
+/// A single secret to pre-fetch.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct SecretPrefetchConfig {
+    pub secret_id: String,
+    pub role_arn: Option<String>,
+}
+
+/// A single tag filter entry for tag-based pre-fetching.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct TagFilter {
+    pub key: String,
+    pub role_arn: Option<String>,
+}
+
+/// Top-level prefetch configuration.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct PrefetchConfig {
+    /// Maximum fraction of cache to fill per caching client (0.1 - 1.0).
+    #[serde(default = "default_cache_buffer_ratio")]
+    pub cache_buffer_ratio: f32,
+
+    /// Maximum random jitter in seconds before starting prefetch (0 - 10).
+    /// Helps prevent fleet-wide synchronized API calls. Default is 0 (no jitter).
+    #[serde(default)]
+    pub max_jitter_seconds: u64,
+
+    /// Tag-based filtering: each entry is a { key, role_arn? } tuple.
+    #[serde(default)]
+    pub filter_tags: Vec<TagFilter>,
+
+    /// Explicit secrets to pre-fetch.
+    #[serde(default)]
+    pub secrets: Vec<SecretPrefetchConfig>,
+}
+
+fn default_cache_buffer_ratio() -> f32 {
+    DEFAULT_CACHE_BUFFER_RATIO
+}
+
+impl Default for PrefetchConfig {
+    fn default() -> Self {
+        PrefetchConfig {
+            cache_buffer_ratio: DEFAULT_CACHE_BUFFER_RATIO,
+            max_jitter_seconds: 0,
+            filter_tags: Vec::new(),
+            secrets: Vec::new(),
+        }
+    }
+}
+
+impl PrefetchConfig {
+    /// Returns true if there are any secrets or tag filters configured.
+    pub fn is_enabled(&self) -> bool {
+        !self.filter_tags.is_empty() || !self.secrets.is_empty()
+    }
+}
 
 /// Private struct used to deserialize configurations from the file.
 #[doc(hidden)]
@@ -43,10 +104,12 @@ struct ConfigFile {
     ssrf_env_variables: Vec<String>,
     path_prefix: String,
     max_conn: String,
+    max_roles: String,
     region: Option<String>,
     ignore_transient_errors: bool,
     validate_credentials: bool,
-    credentials_file_path: Option<PathBuf>,
+    #[serde(default)]
+    prefetch: Option<PrefetchConfig>,
 }
 
 /// The log levels supported by the daemon.
@@ -106,6 +169,9 @@ pub struct Config {
     /// The maximum number of simultaneous connections.
     max_conn: usize,
 
+    /// The maximum number of assumed roles for cross-account access.
+    max_roles: usize,
+
     /// The AWS Region that will be used to send the Secrets Manager request to.
     region: Option<String>,
 
@@ -115,8 +181,8 @@ pub struct Config {
     /// Whether the agent should validate AWS credentials at startup
     validate_credentials: bool,
 
-    /// Optional path to a credentials file for file-based credential loading.
-    credentials_file_path: Option<PathBuf>,
+    /// Pre-fetch configuration for warming the cache at startup
+    prefetch: PrefetchConfig,
 }
 
 /// The default configuration options.
@@ -159,10 +225,10 @@ impl Config {
             )?
             .set_default("path_prefix", DEFAULT_PATH_PREFIX)?
             .set_default("max_conn", DEFAULT_MAX_CONNECTIONS)?
+            .set_default("max_roles", DEFAULT_MAX_ROLES)?
             .set_default("region", DEFAULT_REGION)?
             .set_default("ignore_transient_errors", DEFAULT_IGNORE_TRANSIENT_ERRORS)?
-            .set_default("validate_credentials", DEFAULT_STS_CHECK)?
-            .set_default("credentials_file_path", None::<String>)?;
+            .set_default("validate_credentials", DEFAULT_STS_CHECK)?;
 
         // Merge the config overrides onto the default configurations, if provided.
         config = match file_path {
@@ -255,6 +321,15 @@ impl Config {
         self.max_conn
     }
 
+    /// The maximum number of assumed roles for cross-account access (20 max).
+    ///
+    /// # Returns
+    ///
+    /// * `max_roles` - The maximum allowed assumed roles. Defaults to 20.
+    pub fn max_roles(&self) -> usize {
+        self.max_roles
+    }
+
     /// The AWS Region that will be used to send the Secrets Manager request to.
     /// The default region is automatically determined through SDK defaults.
     /// For a list of all of the Regions that you can specify, see https://docs.aws.amazon.com/general/latest/gr/asm.html
@@ -284,13 +359,13 @@ impl Config {
         self.validate_credentials
     }
 
-    /// Optional path to a credentials file for file-based credential loading.
+    /// The pre-fetch configuration for warming the cache at startup.
     ///
     /// # Returns
     ///
-    /// * `Option<&PathBuf>` - The path to the credentials file, or None.
-    pub fn credentials_file_path(&self) -> Option<&PathBuf> {
-        self.credentials_file_path.as_ref()
+    /// * `PrefetchConfig` - The prefetch configuration. Defaults to disabled (empty).
+    pub fn prefetch(&self) -> &PrefetchConfig {
+        &self.prefetch
     }
 
     /// Private helper that fills in the Config instance from the specified
@@ -306,6 +381,14 @@ impl Config {
     /// * `Err(Error)` - An error message with the configuration error.
     #[doc(hidden)]
     fn build(config_file: ConfigFile) -> Result<Config, Box<dyn std::error::Error>> {
+        let prefetch = config_file.prefetch.unwrap_or_default();
+        if !(0.1..=1.0).contains(&prefetch.cache_buffer_ratio) {
+            Err(INVALID_CACHE_BUFFER_RATIO_MSG)?;
+        }
+        if prefetch.max_jitter_seconds > 10 {
+            Err(INVALID_MAX_JITTER_MSG)?;
+        }
+
         let config = Config {
             // Configurations that are allowed to be overridden.
             log_level: LogLevel::from_str(config_file.log_level.as_str())?,
@@ -340,10 +423,16 @@ impl Config {
                 Some(1..1001),
                 None,
             )?,
+            max_roles: parse_num::<usize>(
+                &config_file.max_roles,
+                BAD_MAX_ROLES_MSG,
+                Some(1..21),
+                None,
+            )?,
             region: config_file.region,
             ignore_transient_errors: config_file.ignore_transient_errors,
             validate_credentials: config_file.validate_credentials,
-            credentials_file_path: config_file.credentials_file_path,
+            prefetch,
         };
 
         // Additional validations.
@@ -426,10 +515,11 @@ mod tests {
             ssrf_env_variables: DEFAULT_SSRF_ENV_VARIABLES.map(String::from).to_vec(),
             path_prefix: String::from(DEFAULT_PATH_PREFIX),
             max_conn: String::from(DEFAULT_MAX_CONNECTIONS),
+            max_roles: String::from(DEFAULT_MAX_ROLES),
             region: None,
             ignore_transient_errors: DEFAULT_IGNORE_TRANSIENT_ERRORS,
             validate_credentials: DEFAULT_STS_CHECK,
-            credentials_file_path: None,
+            prefetch: None,
         }
     }
 
@@ -454,10 +544,12 @@ mod tests {
         );
         assert_eq!(config.clone().path_prefix(), DEFAULT_PATH_PREFIX);
         assert_eq!(config.clone().max_conn(), 800);
+        assert_eq!(config.clone().max_roles(), 20);
         assert_eq!(config.clone().region(), None);
         assert!(config.ignore_transient_errors());
         assert!(config.validate_credentials());
-        assert_eq!(config.credentials_file_path(), None);
+        assert!(!config.prefetch().is_enabled());
+        assert_eq!(config.prefetch().cache_buffer_ratio, 0.8);
     }
 
     /// Tests the config overrides are applied correctly from the provided config file.
@@ -484,10 +576,6 @@ mod tests {
         assert_eq!(config.clone().region(), Some(&"us-west-2".to_string()));
         assert!(!config.ignore_transient_errors());
         assert!(!config.validate_credentials());
-        assert_eq!(
-            config.credentials_file_path(),
-            Some(&PathBuf::from("/tmp/test_credentials"))
-        );
     }
 
     /// Tests that an Err is returned when an invalid value is provided in one of the configurations.
@@ -572,6 +660,21 @@ mod tests {
             match Config::build(invalid_config) {
                 Ok(_) => panic!(),
                 Err(e) => assert_eq!(e.to_string(), BAD_MAX_CONN_MSG),
+            };
+        }
+    }
+
+    /// Tests that an invalid max roles value returns an Err
+    #[test]
+    fn test_validate_config_max_roles_invalid_values() {
+        for value in ["21", "-1", "0", "not a number"] {
+            let invalid_config = ConfigFile {
+                max_roles: String::from(value),
+                ..get_default_config_file()
+            };
+            match Config::build(invalid_config) {
+                Ok(_) => panic!(),
+                Err(e) => assert_eq!(e.to_string(), BAD_MAX_ROLES_MSG),
             };
         }
     }
@@ -679,5 +782,298 @@ mod tests {
             "tests/resources/configs/config_file_with_invalid_contents.toml",
         ))
         .unwrap();
+    }
+
+    /// Tests TOML parsing of a valid prefetch config with explicit secrets.
+    #[test]
+    fn test_prefetch_toml_with_secrets() {
+        let config = Config::new(Some(
+            "tests/resources/configs/config_file_prefetch_secrets.toml",
+        ))
+        .unwrap();
+        assert!(config.prefetch().is_enabled());
+        assert_eq!(config.prefetch().secrets.len(), 2);
+        assert_eq!(
+            config.prefetch().secrets[0].secret_id,
+            "arn:aws:secretsmanager:us-west-2:123456789012:secret:MySecret-AbCdEf"
+        );
+        assert!(config.prefetch().secrets[0].role_arn.is_none());
+        assert_eq!(
+            config.prefetch().secrets[1].role_arn.as_deref(),
+            Some("arn:aws:iam::987654321098:role/SecretAccessRole")
+        );
+    }
+
+    /// Tests TOML parsing of a valid prefetch config with tag filters.
+    #[test]
+    fn test_prefetch_toml_with_tags() {
+        let config = Config::new(Some(
+            "tests/resources/configs/config_file_prefetch_tags.toml",
+        ))
+        .unwrap();
+        assert!(config.prefetch().is_enabled());
+        assert_eq!(config.prefetch().filter_tags.len(), 2);
+        assert_eq!(config.prefetch().filter_tags[0].key, "Environment");
+        assert!(config.prefetch().filter_tags[0].role_arn.is_none());
+        assert_eq!(config.prefetch().filter_tags[1].key, "Team");
+        assert_eq!(
+            config.prefetch().filter_tags[1].role_arn.as_deref(),
+            Some("arn:aws:iam::987654321098:role/SecretAccessRole")
+        );
+    }
+
+    /// Tests TOML parsing of a valid prefetch config with both secrets and tags.
+    #[test]
+    fn test_prefetch_toml_with_both() {
+        let config = Config::new(Some(
+            "tests/resources/configs/config_file_prefetch_both.toml",
+        ))
+        .unwrap();
+        assert!(config.prefetch().is_enabled());
+        assert_eq!(config.prefetch().secrets.len(), 1);
+        assert_eq!(config.prefetch().filter_tags.len(), 1);
+        assert_eq!(config.prefetch().cache_buffer_ratio, 0.5);
+    }
+
+    /// Tests that an empty prefetch section results in disabled prefetch.
+    #[test]
+    fn test_prefetch_toml_empty_section() {
+        let config = Config::new(Some(
+            "tests/resources/configs/config_file_prefetch_empty.toml",
+        ))
+        .unwrap();
+        assert!(!config.prefetch().is_enabled());
+        assert_eq!(config.prefetch().cache_buffer_ratio, 0.8);
+    }
+
+    /// Tests that no prefetch section results in disabled prefetch.
+    #[test]
+    fn test_prefetch_not_present() {
+        let config = Config::new(Some("tests/resources/configs/config_file_empty.toml")).unwrap();
+        assert!(!config.prefetch().is_enabled());
+    }
+
+    /// Tests valid cache_buffer_ratio values.
+    #[test]
+    fn test_prefetch_cache_buffer_ratio_valid() {
+        for ratio in [0.1, 0.5, 0.8, 1.0] {
+            let config_file = ConfigFile {
+                prefetch: Some(PrefetchConfig {
+                    cache_buffer_ratio: ratio,
+                    ..PrefetchConfig::default()
+                }),
+                ..get_default_config_file()
+            };
+            let config = Config::build(config_file).unwrap();
+            assert_eq!(
+                config.prefetch().cache_buffer_ratio,
+                ratio,
+                "ratio {} should be valid",
+                ratio
+            );
+        }
+    }
+
+    /// Tests invalid cache_buffer_ratio values.
+    #[test]
+    fn test_prefetch_cache_buffer_ratio_invalid() {
+        for ratio in [0.0, 1.1, -0.5, 0.09, 1.01] {
+            let config_file = ConfigFile {
+                prefetch: Some(PrefetchConfig {
+                    cache_buffer_ratio: ratio,
+                    ..PrefetchConfig::default()
+                }),
+                ..get_default_config_file()
+            };
+            match Config::build(config_file) {
+                Ok(_) => panic!("ratio {} should be invalid", ratio),
+                Err(e) => assert_eq!(e.to_string(), INVALID_CACHE_BUFFER_RATIO_MSG),
+            };
+        }
+    }
+
+    /// Tests that invalid cache_buffer_ratio fails Config::build().
+    #[test]
+    fn test_prefetch_invalid_ratio_fails_build() {
+        let config_file = ConfigFile {
+            prefetch: Some(PrefetchConfig {
+                cache_buffer_ratio: 0.0,
+                secrets: vec![SecretPrefetchConfig {
+                    secret_id: "test".to_string(),
+                    role_arn: None,
+                }],
+                filter_tags: vec![],
+                ..PrefetchConfig::default()
+            }),
+            ..get_default_config_file()
+        };
+        match Config::build(config_file) {
+            Ok(_) => panic!("should fail with invalid ratio"),
+            Err(e) => assert_eq!(e.to_string(), INVALID_CACHE_BUFFER_RATIO_MSG),
+        };
+    }
+
+    /// Tests is_enabled returns true with secrets only.
+    #[test]
+    fn test_prefetch_is_enabled_with_secrets() {
+        let prefetch = PrefetchConfig {
+            secrets: vec![SecretPrefetchConfig {
+                secret_id: "test".to_string(),
+                role_arn: None,
+            }],
+            ..PrefetchConfig::default()
+        };
+        assert!(prefetch.is_enabled());
+    }
+
+    /// Tests is_enabled returns true with tags only.
+    #[test]
+    fn test_prefetch_is_enabled_with_tags() {
+        let prefetch = PrefetchConfig {
+            filter_tags: vec![TagFilter {
+                key: "Environment".to_string(),
+                role_arn: None,
+            }],
+            ..PrefetchConfig::default()
+        };
+        assert!(prefetch.is_enabled());
+    }
+
+    /// Tests is_enabled returns false when empty.
+    #[test]
+    fn test_prefetch_is_enabled_empty() {
+        let prefetch = PrefetchConfig::default();
+        assert!(!prefetch.is_enabled());
+    }
+
+    /// Tests that max_jitter_seconds defaults to 0.
+    #[test]
+    fn test_prefetch_max_jitter_default() {
+        let config = Config::new(Some(
+            "tests/resources/configs/config_file_prefetch_empty.toml",
+        ))
+        .unwrap();
+        assert_eq!(config.prefetch().max_jitter_seconds, 0);
+    }
+
+    /// Tests that max_jitter_seconds is parsed from TOML.
+    #[test]
+    fn test_prefetch_max_jitter_from_toml() {
+        let config = Config::new(Some(
+            "tests/resources/configs/config_file_prefetch_jitter.toml",
+        ))
+        .unwrap();
+        assert_eq!(config.prefetch().max_jitter_seconds, 5);
+    }
+
+    /// Tests that max_jitter_seconds boundary value 10 is valid.
+    #[test]
+    fn test_prefetch_max_jitter_valid_boundary() {
+        let config_file = ConfigFile {
+            prefetch: Some(PrefetchConfig {
+                max_jitter_seconds: 10,
+                ..PrefetchConfig::default()
+            }),
+            ..get_default_config_file()
+        };
+        let config = Config::build(config_file).unwrap();
+        assert_eq!(config.prefetch().max_jitter_seconds, 10);
+    }
+
+    /// Tests that max_jitter_seconds > 10 is rejected.
+    #[test]
+    fn test_prefetch_max_jitter_invalid() {
+        let config_file = ConfigFile {
+            prefetch: Some(PrefetchConfig {
+                max_jitter_seconds: 11,
+                ..PrefetchConfig::default()
+            }),
+            ..get_default_config_file()
+        };
+        match Config::build(config_file) {
+            Ok(_) => panic!("max_jitter_seconds 11 should be invalid"),
+            Err(e) => assert_eq!(e.to_string(), INVALID_MAX_JITTER_MSG),
+        };
+    }
+
+    /// Tests that inline array syntax for secrets works identically to array-of-tables.
+    #[test]
+    fn test_prefetch_inline_secrets_syntax() {
+        let config = Config::new(Some(
+            "tests/resources/configs/config_file_prefetch_inline.toml",
+        ))
+        .unwrap();
+        assert!(config.prefetch().is_enabled());
+        assert_eq!(config.prefetch().secrets.len(), 2);
+        assert_eq!(
+            config.prefetch().secrets[0].secret_id,
+            "arn:aws:secretsmanager:us-west-2:123456789012:secret:MySecret-AbCdEf"
+        );
+        assert!(config.prefetch().secrets[0].role_arn.is_none());
+        assert_eq!(
+            config.prefetch().secrets[1].secret_id,
+            "cross-account-secret"
+        );
+        assert_eq!(
+            config.prefetch().secrets[1].role_arn.as_deref(),
+            Some("arn:aws:iam::987654321098:role/SecretAccessRole")
+        );
+    }
+
+    /// Regression test: full config with all original parameters plus prefetch.
+    /// Ensures adding prefetch doesn't break parsing of existing fields.
+    #[test]
+    fn test_full_config_with_prefetch_no_regression() {
+        let config = Config::new(Some(
+            "tests/resources/configs/config_file_full_with_prefetch.toml",
+        ))
+        .unwrap();
+
+        // Original parameters
+        assert_eq!(config.log_level(), LogLevel::Debug);
+        assert_eq!(config.http_port(), 65535);
+        assert_eq!(config.ttl(), Duration::from_secs(600));
+        assert_eq!(config.cache_size(), NonZeroUsize::new(500).unwrap());
+        assert_eq!(
+            config.ssrf_headers(),
+            vec!["X-Aws-Parameters-Secrets-Token".to_string()]
+        );
+        assert_eq!(config.ssrf_env_variables(), vec!["MY_TOKEN".to_string()]);
+        assert_eq!(config.path_prefix(), "/custom/");
+        assert_eq!(config.max_conn(), 100);
+        assert_eq!(config.max_roles(), 10);
+        assert_eq!(config.region(), Some(&"us-east-1".to_string()));
+        assert!(!config.ignore_transient_errors());
+        assert!(!config.validate_credentials());
+
+        // Prefetch parameters
+        assert!(config.prefetch().is_enabled());
+        assert_eq!(config.prefetch().cache_buffer_ratio, 0.6);
+
+        // Prefetch secrets
+        assert_eq!(config.prefetch().secrets.len(), 2);
+        assert_eq!(
+            config.prefetch().secrets[0].secret_id,
+            "arn:aws:secretsmanager:us-west-2:123456789012:secret:MySecret-AbCdEf"
+        );
+        assert!(config.prefetch().secrets[0].role_arn.is_none());
+        assert_eq!(
+            config.prefetch().secrets[1].secret_id,
+            "arn:aws:secretsmanager:us-east-1:987654321098:secret:CrossAccount-AbCdEf"
+        );
+        assert_eq!(
+            config.prefetch().secrets[1].role_arn.as_deref(),
+            Some("arn:aws:iam::987654321098:role/SecretAccessRole")
+        );
+
+        // Prefetch tag filters
+        assert_eq!(config.prefetch().filter_tags.len(), 2);
+        assert_eq!(config.prefetch().filter_tags[0].key, "Environment");
+        assert!(config.prefetch().filter_tags[0].role_arn.is_none());
+        assert_eq!(config.prefetch().filter_tags[1].key, "Team");
+        assert_eq!(
+            config.prefetch().filter_tags[1].role_arn.as_deref(),
+            Some("arn:aws:iam::987654321098:role/TagRole")
+        );
     }
 }
