@@ -28,7 +28,7 @@ aws-config = "1"
 aws-sdk-secretsmanager = "1"
 aws-smithy-runtime-api = "1"
 aws-sdk-sts = "1"
-log = "0.4.29"
+log = "0.4.30"
 log4rs = { version = "1.2.0", features = ["gzip"] }
 url = "2"
 regex = "1"
