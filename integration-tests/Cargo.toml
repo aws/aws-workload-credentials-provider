@@ -7,7 +7,7 @@ publish = false
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "test-util", "process", "io-util"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+reqwest = "0.13"
 serde_json = "1"
 aws-config = "1"
 aws-sdk-secretsmanager = "1"
