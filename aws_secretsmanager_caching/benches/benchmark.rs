@@ -6,15 +6,10 @@ use aws_sdk_secretsmanager::operation::get_secret_value::GetSecretValueOutput;
 use aws_secretsmanager_caching::SecretsManagerCachingClient;
 use aws_smithy_mocks::{mock, mock_client, RuleMode};
 use criterion::{criterion_group, criterion_main, Criterion};
-use rand::distr::Alphabetic;
-use rand::Rng;
+use rand::distr::{Alphabetic, SampleString};
 
 fn random_string(len: usize) -> String {
-    rand::rng()
-        .sample_iter(&Alphabetic)
-        .take(len)
-        .map(char::from)
-        .collect()
+    Alphabetic.sample_string(&mut rand::rng(), len)
 }
 
 /// Benchmark cache hits by retrieving the same secret over and over.
