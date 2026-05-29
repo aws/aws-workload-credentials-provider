@@ -41,5 +41,5 @@ hyper = { version = "1", features = ["http1", "server", "client"] }
 aws-smithy-runtime = { version = "1", features = ["test-util"] }
 aws_secretsmanager_caching = { version = "2.1.0", path = "../aws_secretsmanager_caching", features = ["test-util"] }
 tokio = { version = "1", features = ["test-util", "rt-multi-thread", "net", "macros"] }
-http = "0.2.9"
+http = "1.4.0"
 aws-smithy-types = "1"
