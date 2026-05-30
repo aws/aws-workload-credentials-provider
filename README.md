@@ -200,48 +200,66 @@ You can run the Secrets Manager Agent as a sidecar container alongside your appl
    WORKDIR /app 
    
    # Copy the Secrets Manager Agent binary to the container
-   COPY secrets-manager-agent . 
+   COPY aws_secretsmanager_agent . 
    
    # Install any necessary dependencies
    RUN apt-get update && apt-get install -y ca-certificates 
    
    # Set the entry point to run the Secrets Manager Agent binary
-   ENTRYPOINT ["./secrets-manager-agent"]
+   ENTRYPOINT ["./aws_secretsmanager_agent"]
    ```
 
-1. Create a Dockerfile for your client application\.
+1. Create a Dockerfile for your client application\. The following example creates a simple container with curl for testing\.
+
+   ```dockerfile
+   # Use the latest Debian image as the base
+   FROM debian:latest
+   
+   WORKDIR /app
+   
+   # Install curl for testing
+   RUN apt-get update && apt-get install -y curl
+   
+   CMD ["tail", "-f", "/dev/null"]
+   ```
 
 1. Create a Docker Compose file to run both containers, being sure that they use the same network interface\. This is necessary because the Secrets Manager Agent does not accept requests from outside the localhost interface\. The following example shows a Docker Compose file where the `network_mode` key attaches the `secrets-manager-agent` container to the network namespace of the `client-application` container, which allows them to share the same network interface\.
 
     **Important**
 
-    You must load AWS credentials and the SSRF token for the application to be able to use the Secrets Manager Agent\. For EKS and ECS, see the following:  
+    You must load AWS credentials and the SSRF token for the application to be able to use the Secrets Manager Agent\. The example below shows how to configure these using environment variables\. For EKS and ECS, see the following:  
     * [Manage access](https://docs.aws.amazon.com/eks/latest/userguide/cluster-auth.html) in the *Amazon Elastic Kubernetes Service User Guide*
     * [Amazon ECS task IAM role](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task-iam-roles.html) in the *Amazon Elastic Container Service Developer Guide*
 
 
    ```yaml
-   version: '3'
    services:
        client-application:
-       container_name: client-application
-       build:
-           context: .
-           dockerfile: Dockerfile.client
-       command: tail -f /dev/null  # Keep the container running
-       
-   
+           container_name: client-application
+           build:
+               context: .
+               dockerfile: Dockerfile.client
+           command: tail -f /dev/null  # Keep the container running
+           environment:
+               - AWS_TOKEN=my-ssrf-token  # SSRF token must match between client and agent
+
        secrets-manager-agent:
-       container_name: secrets-manager-agent
-       build:
-           context: .
-           dockerfile: Dockerfile.agent
-       network_mode: "container:client-application"  # Attach to the client-application container's network
-       depends_on:
-           - client-application
+           container_name: secrets-manager-agent
+           build:
+               context: .
+               dockerfile: Dockerfile.agent
+           network_mode: "container:client-application"  # Attach to the client-application container's network
+           depends_on:
+               - client-application
+           environment:
+               - AWS_TOKEN=my-ssrf-token  # SSRF token must match between client and agent
+               - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+               - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+               - AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN}
+               - AWS_REGION=us-west-2
    ```
 
-1. Copy the `secrets-manager-agent` binary to the same directory that contains your Dockerfiles and Docker Compose file\.
+1. Copy the `aws_secretsmanager_agent` binary to the same directory that contains your Dockerfiles and Docker Compose file\.
 
 1. Build and run the containers based on the provided Dockerfiles by using the following [https://docs.docker.com/reference/cli/docker/compose/](https://docs.docker.com/reference/cli/docker/compose/) command\.
 
