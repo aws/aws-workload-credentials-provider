@@ -2,3 +2,8 @@
 resolver = "2"
 
 members = ["aws_secretsmanager_agent", "aws_secretsmanager_caching", "integration-tests"]
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = true
