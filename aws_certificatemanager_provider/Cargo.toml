@@ -1,0 +1,47 @@
+[package]
+name = "aws_certificatemanager_provider"
+version = "3.0.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "AWS ACM certificate management for the AWS Workload Credentials Provider."
+repository = "https://github.com/aws/aws-workload-credentials-provider"
+
+[features]
+fips = ["aws-lc-rs/fips"]
+
+[dependencies]
+aws-sdk-acm = "1"
+aws-config = "1"
+aws-credential-types = "1"
+aws-smithy-runtime-api = "1"
+aws-smithy-types = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "process", "time", "signal"] }
+aws-lc-rs = "1"
+zeroize = "1"
+thiserror = "2"
+base64ct = { version = "1", features = ["alloc"] }
+log = "0.4.29"
+tokio-util = "0.7.18"
+
+# We are required to use the sha1 feature to decrypt the password protected private keys.
+pkcs8 = { version = "0.10", features = ["encryption", "pem", "sha1-insecure"] }
+pkcs5 = "0.7"
+aws_workload_credentials_provider_common = { version = "3.0.0", path = "../aws_workload_credentials_provider_common" }
+
+[dev-dependencies]
+aws-smithy-mocks = "0.1"
+aws-smithy-runtime = { version = "1", features = ["test-util"] }
+aws-sdk-acm = { version = "1", features = ["test-util"] }
+http = "0.2"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "test-util"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+pkcs5 = "0.7"
+tempfile = "3"
+
+[target.'cfg(windows)'.dev-dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+] }

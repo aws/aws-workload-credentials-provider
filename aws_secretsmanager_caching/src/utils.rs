@@ -3,13 +3,13 @@ use aws_sdk_secretsmanager::config::{
 };
 use aws_smithy_types::config_bag::ConfigBag;
 
-/// SDK interceptor to append the agent name and version to the User-Agent header for CloudTrail records.
+/// SDK interceptor to append the provider name and version to the User-Agent header for CloudTrail records.
 #[derive(Debug)]
 pub(crate) struct CachingLibraryInterceptor;
 
-/// SDK interceptor to append the agent name and version to the User-Agent header for CloudTrail records.
+/// SDK interceptor to append the provider name and version to the User-Agent header for CloudTrail records.
 ///
-/// This interceptor adds the agent name and version to the User-Agent header
+/// This interceptor adds the provider name and version to the User-Agent header
 /// of outbound Secrets Manager SDK requests.
 impl Intercept for CachingLibraryInterceptor {
     fn name(&self) -> &'static str {

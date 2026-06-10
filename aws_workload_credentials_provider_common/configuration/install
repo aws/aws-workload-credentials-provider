@@ -1,0 +1,164 @@
+#!/bin/bash -e
+#
+# AWS Workload Credentials Provider Installer
+# Installs SM provider (HTTP interface) and ACM provider (certificate management).
+#
+
+PATH=/bin:/usr/bin:/sbin:/usr/sbin
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+source "${SCRIPT_DIR}/common.sh"
+
+#
+# Usage and argument parsing
+#
+
+usage() {
+    cat <<EOF
+Usage: $0 [OPTIONS]
+
+Options:
+    --config <file>      Bootstrap config will be copied to ${CONFIG_DIR}
+    --no-start           Install but don't start services
+    --no-privileges      Skip Linux capabilities on ACM service
+    --no-sudoers         Skip sudoers generation
+    -h, --help           Show this help message
+EOF
+    exit 0
+}
+
+SKIP_START=false
+SKIP_LINUX_CAPABILITIES=false
+SKIP_SUDOERS=false
+CONFIG_FILE=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --config) 
+            if [ -z "$2" ] || [[ "$2" == --* ]]; then
+                echo "Error: --config requires a file path" >&2; exit 1
+            fi
+            CONFIG_FILE="$2"; shift 2 ;;
+        --no-start) SKIP_START=true; shift ;;
+        --no-privileges) SKIP_LINUX_CAPABILITIES=true; shift ;;
+        --no-sudoers) SKIP_SUDOERS=true; shift ;;
+        -h|--help) usage ;;
+        *) echo "Unknown option: $1" >&2; exit 1 ;;
+    esac
+done
+
+if [ "$(id -u)" -ne 0 ]; then
+    echo "This script must be run as root" >&2
+    exit 1
+fi
+
+if [ -n "${CONFIG_FILE}" ] && [ ! -f "${CONFIG_FILE}" ]; then
+    echo "Cannot find config file: ${CONFIG_FILE}" >&2
+    exit 1
+fi
+
+#
+# Validation
+#
+
+cd "${SCRIPT_DIR}"
+
+if [ ! -f "${TOKEN_SCRIPT}" ]; then
+    echo "Cannot find ${TOKEN_SCRIPT}" >&2
+    exit 1
+fi
+
+if [ ! -f "${PROVIDER_SOURCE_DIR}/${PROVIDER_BIN}" ]; then
+    echo "Cannot find ${PROVIDER_SOURCE_DIR}/${PROVIDER_BIN}" >&2
+    exit 1
+fi
+
+#
+# User and group setup
+#
+
+groupadd -f "${PROVIDER_GROUP}"
+groupadd -f "${TOKEN_GROUP}"
+# useradd exits with code 9 if the user already exists — ignore that, but fail on any other error
+useradd -r -M -d "${PROVIDER_DIR}" -s /sbin/nologin -g "${PROVIDER_GROUP}" -G "${TOKEN_GROUP}" "${PROVIDER_USER}" || [ $? -eq 9 ]
+
+#
+# File installation
+#
+
+mkdir -p "${PROVIDER_DIR}"
+chmod 755 "${PROVIDER_DIR}"
+
+install -D -T -m 755 "${PROVIDER_SOURCE_DIR}/${PROVIDER_BIN}" "${PROVIDER_DIR}/bin/${PROVIDER_BIN}"
+install -D -T -m 755 "${TOKEN_SCRIPT}" "${PROVIDER_DIR}/bin/${TOKEN_SCRIPT}"
+chown "${PROVIDER_USER}" "${PROVIDER_DIR}"
+
+#
+# Service installation
+#
+
+install -T -m 644 "${TOKEN_SCRIPT}.service" "${SYSTEMD_FILES}/${TOKEN_SCRIPT}.service"
+echo "Installed ${TOKEN_SCRIPT}.service"
+
+install -T -m 644 "${SM_SERVICE}.service" "${SYSTEMD_FILES}/${SM_SERVICE}.service"
+echo "Installed ${SM_SERVICE}.service"
+
+if [ "${SKIP_LINUX_CAPABILITIES}" = true ]; then
+    install -T -m 644 "${ACM_SERVICE}-nocaps.service" "${SYSTEMD_FILES}/${ACM_SERVICE}.service"
+    echo "Installed ${ACM_SERVICE}.service (without capabilities)"
+else
+    install -T -m 644 "${ACM_SERVICE}.service" "${SYSTEMD_FILES}/${ACM_SERVICE}.service"
+    echo "Installed ${ACM_SERVICE}.service (with CAP_DAC_OVERRIDE)"
+fi
+
+#
+# Config bootstrap
+#
+
+mkdir -p "${CONFIG_DIR}"
+chmod 755 "${CONFIG_DIR}"
+
+if [ -n "${CONFIG_FILE}" ]; then
+    install -T -m 440 -o "root" -g "${PROVIDER_GROUP}" "${CONFIG_FILE}" "${CONFIG_DIR}/config.toml"
+    echo "Config installed from ${CONFIG_FILE}"
+elif [ -f "${CONFIG_DIR}/config.toml" ]; then
+    echo "Using existing config at ${CONFIG_DIR}/config.toml"
+fi
+
+#
+# Permissions setup
+#
+
+if [ "${SKIP_SUDOERS}" = false ]; then
+    "${PROVIDER_DIR}/bin/${PROVIDER_BIN}" setup-config-based-permissions
+
+    # Verify /etc/sudoers includes /etc/sudoers.d
+    if ! grep -qE '^@includedir\s+/etc/sudoers\.d|^#includedir\s+/etc/sudoers\.d' /etc/sudoers 2>/dev/null; then
+        echo "WARNING: /etc/sudoers does not include /etc/sudoers.d" >&2
+        echo "  The generated sudoers file at /etc/sudoers.d/${PROVIDER_BIN} will not take effect." >&2
+        echo "  Use 'visudo' to add an includedir directive for /etc/sudoers.d" >&2
+    fi
+else
+    "${PROVIDER_DIR}/bin/${PROVIDER_BIN}" setup-config-based-permissions --no-sudoers
+fi
+
+#
+# Enable and start services
+#
+
+systemctl daemon-reload
+
+systemctl enable "${TOKEN_SCRIPT}" > /dev/null
+systemctl enable "${SM_SERVICE}" > /dev/null
+systemctl enable "${ACM_SERVICE}" > /dev/null
+
+if [ "${SKIP_START}" = false ]; then
+    systemctl start "${TOKEN_SCRIPT}"
+    systemctl start "${SM_SERVICE}"
+    systemctl start "${ACM_SERVICE}"
+    echo "Started services"
+else
+    echo "Services enabled, start skipped (--no-start)"
+fi
+
+echo "Installation complete."

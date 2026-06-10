@@ -7,15 +7,15 @@
         {
             "type": "lldb",
             "request": "launch",
-            "name": "Debug executable 'aws_secretsmanager_agent'",
+            "name": "Debug executable 'aws_secretsmanager_provider'",
             "cargo": {
                 "args": [
                     "build",
-                    "--bin=aws_secretsmanager_agent",
-                    "--package=aws_secretsmanager_agent"
+                    "--bin=aws_secretsmanager_provider",
+                    "--package=aws_secretsmanager_provider"
                 ],
                 "filter": {
-                    "name": "aws_secretsmanager_agent",
+                    "name": "aws_secretsmanager_provider",
                     "kind": "bin"
                 }
             },
@@ -25,16 +25,16 @@
         {
             "type": "lldb",
             "request": "launch",
-            "name": "Debug unit tests in executable 'aws_secretsmanager_agent'",
+            "name": "Debug unit tests in executable 'aws_secretsmanager_provider'",
             "cargo": {
                 "args": [
                     "test",
                     "--no-run",
-                    "--bin=aws_secretsmanager_agent",
-                    "--package=aws_secretsmanager_agent"
+                    "--bin=aws_secretsmanager_provider",
+                    "--package=aws_secretsmanager_provider"
                 ],
                 "filter": {
-                    "name": "aws_secretsmanager_agent",
+                    "name": "aws_secretsmanager_provider",
                     "kind": "bin"
                 }
             },

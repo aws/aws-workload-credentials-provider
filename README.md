@@ -1,38 +1,60 @@
-# AWS Secrets Manager Agent
+# AWS Workload Credentials Provider
 
-The AWS Secrets Manager Agent is a client\-side HTTP service that you can use to standardize consumption of secrets from Secrets Manager across environments such as AWS Lambda, Amazon Elastic Container Service, Amazon Elastic Kubernetes Service, and Amazon Elastic Compute Cloud\. The Secrets Manager Agent can retrieve and cache secrets in memory so that your applications can consume secrets directly from the cache\. That means you can fetch the secrets your application needs from the localhost instead of making calls to Secrets Manager\. The Secrets Manager Agent can only make read requests to Secrets Manager \- it can't modify secrets\. 
+The AWS Workload Credentials Provider (formerly the AWS Secrets Manager Agent) is a client\-side solution that helps you standardize how you consume credentials from AWS services across your compute environments\. It includes the following capabilities:
 
-The Secrets Manager Agent uses the AWS credentials you provide in your environment to make calls to Secrets Manager\. The Secrets Manager Agent offers protection against Server Side Request Forgery \(SSRF\) to help improve secret security\. The Agent also uses the post-quantum ML-KEM key exchange as the highest-priority key exchange by default\. You can configure the Secrets Manager Agent by setting the maximum number of connections, the time to live \(TTL\), the localhost HTTP port, and the cache size\.
+- **Secrets Manager** — An HTTP interface for retrieving and caching secrets from AWS Secrets Manager\. Supported on AWS Lambda, Amazon ECS, Amazon EKS, and Amazon EC2\. Enabled by default\.
+- **Certificate Management** — Automatic export and refresh of certificates from AWS Certificate Manager to the local filesystem\. Supported on Amazon EC2 and on\-premise hosts\. Opt\-in via [configuration](#certificate-management-configuration)\.
 
-Because the Secrets Manager Agent uses an in\-memory cache, it resets when the Secrets Manager Agent restarts\. The Secrets Manager Agent periodically refreshes the cached secret value\. The refresh happens when you try to read a secret from the Secrets Manager Agent after the TTL has expired\. The default refresh frequency \(TTL\) is 300 seconds, and you can change it by using a [Configuration file](#secrets-manager-agent-config) which you pass to the Secrets Manager Agent using the `--config` command line argument\. The Secrets Manager Agent does not include cache invalidation\. For example, if a secret rotates before the cache entry expires, the Secrets Manager Agent might return a stale secret value\. 
+## Secrets Manager capability
 
-The Secrets Manager Agent returns secret values in the same format as the response of `GetSecretValue`\. Secret values are not encrypted in the cache\.
+The Workload Credentials Provider retrieves and caches secrets in memory so that your applications can consume secrets from localhost instead of making direct calls to Secrets Manager\. It can only read secrets \- it can't modify them\.
+
+The Workload Credentials Provider uses the AWS credentials you provide in your environment to make calls to Secrets Manager\. The Workload Credentials Provider offers protection against Server Side Request Forgery \(SSRF\) to help improve secret security\. It also uses the post-quantum ML-KEM key exchange as the highest-priority key exchange by default\. You can configure the Workload Credentials Provider by setting the maximum number of connections, the time to live \(TTL\), the localhost HTTP port, and the cache size\.
+
+Because the Workload Credentials Provider uses an in\-memory cache, it resets when the Workload Credentials Provider restarts\. The Workload Credentials Provider periodically refreshes the cached secret value\. The refresh happens when you try to read a secret from the Workload Credentials Provider after the TTL has expired\. The default refresh frequency \(TTL\) is 300 seconds, and you can change it by using a [Configuration file](#workload-credentials-provider-config) which you pass to the Workload Credentials Provider using the `sm start --config /path/to/config.toml` command line argument\. The Workload Credentials Provider does not include cache invalidation\. For example, if a secret rotates before the cache entry expires, the Workload Credentials Provider might return a stale secret value\. 
+
+The Workload Credentials Provider returns secret values in the same format as the response of `GetSecretValue`\. Secret values are not encrypted in the cache\.
+
+## Certificate Management capability
+
+The Workload Credentials Provider exports certificates from AWS Certificate Manager (ACM) and writes them as PEM files to the local filesystem\. It automatically checks for updated certificates every 24 hours and optionally runs a user\-configured command after each successful refresh (for example, to reload a web server)\. You can configure up to 50 certificates\. Each certificate is managed by an independent background task, providing fault isolation so that one certificate's failure does not affect others\.
+
+The Certificate Management capability supports Linux and Windows, and works with web servers such as NGINX and Apache\.
+
+The Workload Credentials Provider uses the AWS credentials you provide in your environment to assume the role you have configured for each certificate, and then calls ACM to export the certificate\. The install script sets up the necessary permissions for the provider process to write certificate files to customer\-specified directories and execute refresh commands\.
+
+You can provide a custom configuration by passing `--config /path/to/config.toml` on startup or on reload while the provider is running\. On Windows, use `-Config C:\path\to\config.toml` when invoking the PowerShell scripts and `--Config C:\path\to\config.toml` when executing the binary command\. The reload re\-applies permissions and restarts the ACM service\.
+
+For full configuration details, see [Configure the Workload Credentials Provider](#workload-credentials-provider-config)\.
 
 To download the source code, see [https://github\.com/aws/aws\-secretsmanager\-agent](https://github.com/aws/aws-secretsmanager-agent) on GitHub\.
 
 **Topics**
-- [AWS Secrets Manager Agent](#aws-secrets-manager-agent)
-  - [Step 1: Build the Secrets Manager Agent binary](#step-1-build-the-secrets-manager-agent-binary)
+- [AWS Workload Credentials Provider](#aws-workload-credentials-provider)
+  - [Secrets Manager capability](#secrets-manager-capability)
+  - [Certificate Management capability](#certificate-management-capability)
+  - [Step 1: Build the Workload Credentials Provider binary](#step-1-build-the-workload-credentials-provider-binary)
       - [\[ RPM-based systems \]](#-rpm-based-systems-)
       - [\[ Debian-based systems \]](#-debian-based-systems-)
       - [\[ Windows \]](#-windows-)
       - [\[ Cross-compile natively \]](#-cross-compile-natively-)
-      - [\[ Cross compile with Rust cross \]](#-cross-compile-with-rust-cross-)
-  - [Step 2: Install the Secrets Manager Agent](#step-2-install-the-secrets-manager-agent)
-      - [\[ Amazon EC2 \]](#-amazon-ec2-)
+  - [Step 2: Install the Workload Credentials Provider](#step-2-install-the-workload-credentials-provider)
+      - [\[ Amazon EC2 (Linux) \]](#-amazon-ec2-linux-)
+      - [\[ Windows EC2 \]](#-windows-ec2-)
       - [\[ Running as a Container Sidecar \]](#-running-as-a-container-sidecar-)
       - [\[ AWS Lambda \]](#-aws-lambda-)
-  - [Step 3: Retrieve secrets with the Secrets Manager Agent](#step-3-retrieve-secrets-with-the-secrets-manager-agent)
+  - [Step 3: Retrieve secrets with the Workload Credentials Provider](#step-3-retrieve-secrets-with-the-workload-credentials-provider)
       - [\[ curl \]](#-curl-)
       - [\[ Python \]](#-python-)
   - [`refreshNow` parameter behavior](#refreshnow-parameter-behavior)
   - [Using the refreshNow parameter](#using-the-refreshnow-parameter)
-    - [Example - Secrets Manager Agent GET request with refreshNow parameter](#example---secrets-manager-agent-get-request-with-refreshnow-parameter)
+    - [Example - GET request with refreshNow parameter](#example---get-request-with-refreshnow-parameter)
       - [\[ curl \]](#-curl--1)
       - [\[ Python \]](#-python--1)
   - [Role chaining (cross-account access)](#role-chaining-cross-account-access)
   - [Pre-fetching](#pre-fetching)
-  - [Configure the Secrets Manager Agent](#configure-the-secrets-manager-agent)
+  - [Step 4: Retrieve certificates with the Workload Credentials Provider](#step-4-retrieve-certificates-with-the-workload-credentials-provider)
+  - [Configure the Workload Credentials Provider](#configure-the-workload-credentials-provider)
   - [Optional features](#optional-features)
   - [Logging](#logging)
   - [Security considerations](#security-considerations)
@@ -45,9 +67,9 @@ To download the source code, see [https://github\.com/aws/aws\-secretsmanager\-a
       - [Option 2: Manual execution](#option-2-manual-execution)
     - [Test Organization](#test-organization)
 
-## Step 1: Build the Secrets Manager Agent binary<a name="secrets-manager-agent-build"></a>
+## Step 1: Build the Workload Credentials Provider binary<a name="workload-credentials-provider-build"></a>
 
-To build the Secrets Manager Agent binary natively, you need the standard development tools and the Rust tools\. Alternatively, you can cross\-compile for systems that support it, or you can use Rust cross to cross\-compile\.
+To build the Workload Credentials Provider binary natively, you need the standard development tools and the Rust tools\. Alternatively, you can cross\-compile for systems that support it, or you can use Rust cross to cross\-compile\.
 
 ------
 
@@ -55,7 +77,7 @@ To build the Secrets Manager Agent binary natively, you need the standard develo
 
 Example: `git clone --branch <git tag> https://github.com/aws/aws-secretsmanager-agent.git`
 
-**NOTE:** Building the agent with the `fips` feature enabled on macOS currently requires the following workaround:
+**NOTE:** Building the provider with the `fips` feature enabled on macOS currently requires the following workaround:
 
 - Create an environment variable called `SDKROOT` which is set to the result of running `xcrun --show-sdk-path`
 
@@ -74,13 +96,13 @@ Example: `git clone --branch <git tag> https://github.com/aws/aws-secretsmanager
    . "$HOME/.cargo/env"
    ```
 
-1. Build the agent using the cargo build command:
+1. Build the provider using the cargo build command:
 
    ```sh
    cargo build --release
    ```
 
-   You will find the executable under `target/release/aws_secretsmanager_agent`\.
+   You will find the executable under `target/release/aws-workload-credentials-provider`\.
 
 ------
 #### [ Debian\-based systems ]
@@ -98,99 +120,116 @@ Example: `git clone --branch <git tag> https://github.com/aws/aws-secretsmanager
    . "$HOME/.cargo/env"
    ```
 
-1. Build the agent using the cargo build command:
+1. Build the provider using the cargo build command:
 
    ```sh
    cargo build --release
    ```
 
-   You will find the executable under `target/release/aws_secretsmanager_agent`\.
+   You will find the executable under `target/release/aws-workload-credentials-provider`\.
 
 ------
 #### [ Windows ]
 
 To build on Windows, follow the instructions at [Set up your dev environment on Windows for Rust](https://learn.microsoft.com/en-us/windows/dev-environment/rust/setup) in the *Microsoft Windows documentation*\.
 
-1. Build the agent using the cargo build command:
+1. Build the provider using the cargo build command:
 
    ```sh
    cargo build --release
    ```
 
-   You will find the executable under `target/release/aws_secretsmanager_agent.exe`\.
+   You will find the executable under `target/release/aws-workload-credentials-provider.exe`\.
 
 ------
 #### [ Cross\-compile natively ]
 
-On distributions where the mingw\-w64 package is available such as Ubuntu, you can cross compile natively\.
+You can cross\-compile for Windows from Linux using `cargo-xwin`\.
 
 ```sh
-# Install the cross compile tool chain
-sudo add-apt-repository universe
-sudo apt install -y mingw-w64
-    
-# Install the rust build targets
-rustup target add x86_64-pc-windows-gnu
-    
-# Cross compile the agent for Windows
-cargo build --release --target x86_64-pc-windows-gnu
+# Install clang
+sudo yum install -y clang
+
+# Install cargo-xwin
+cargo install cargo-xwin
+
+# Install the Rust build target
+rustup target add x86_64-pc-windows-msvc
+
+# Cross compile for Windows
+cargo xwin build --release --target x86_64-pc-windows-msvc
 ```
 
-You will find the executable at `target/x86_64-pc-windows-gnu/release/aws_secretsmanager_agent.exe`\.
-
-------
-#### [ Cross compile with Rust cross ]
-
-If the cross compile tools are not available natively on the system, you can use the Rust cross project\. For more information, see [https://github\.com/cross\-rs/cross](https://github.com/cross-rs/cross)\.
-
-**Important**  
-We recommend 32GB disk space for the build environment\.
-
-```sh
-# Install and start docker
-sudo yum -y install docker
-sudo systemctl start docker
-sudo systemctl enable docker # Make docker start after reboot
-    
-# Give ourselves permission to run the docker images without sudo
-sudo usermod -aG docker $USER
-newgrp docker
-    
-# Install cross and cross compile the executable
-cargo install cross
-cross build --release --target x86_64-pc-windows-gnu
-```
+You will find the executable at `target/x86_64-pc-windows-msvc/release/aws-workload-credentials-provider.exe`\.
 
 ------
 
-## Step 2: Install the Secrets Manager Agent<a name="secrets-manager-agent-install"></a>
+## Step 2: Install the Workload Credentials Provider<a name="workload-credentials-provider-install"></a>
 
-Based on the type of compute, you have several options for installing the Secrets Manager Agent\.
+Based on the type of compute, you have several options for installing the Workload Credentials Provider\. The install script sets up both the Secrets Manager and Certificate Management capabilities\.
 
 ------
-#### [ Amazon EC2 ]
+#### [ Amazon EC2 (Linux) ]
 
-**To install the Secrets Manager Agent**
+**To install the Workload Credentials Provider**
 
-1. `cd aws_secretsmanager_agent/configuration`
+1. `cd aws_workload_credentials_provider_common/configuration`
 1. Run the `install` script provided in the repository\. 
 
-   The script generates a random SSRF token on startup and stores it in the file `/var/run/awssmatoken`\. The token is readable by the `awssmatokenreader` group that the install script creates\. 
+   ```sh
+   sudo ./install --config /path/to/config.toml
+   ```
 
-1. To allow your application to read the token file, you need to add the user account that your application runs under to the `awssmatokenreader` group\. For example, you can grant permissions for your application to read the token file with the following usermod command, where *<APP\_USER>* is the user ID under which your application runs\.
+   The script accepts the following options:
+   - `--config <file>` — (Optional) Bootstrap config to copy to the configuration directory
+   - `--no-start` — (Optional) Install but don't start services
+   - `--no-privileges` — (Optional) Skip Linux capabilities on ACM service
+   - `--no-sudoers` — (Optional) Skip sudoers generation
+
+   The script generates a random SSRF token on startup and stores it in the file `/var/run/awssmatoken`\. The token is readable by the `aws-workload-credentials-provider-token` group that the install script creates\. 
+
+1. To allow your application to read the token file, you need to add the user account that your application runs under to the `aws-workload-credentials-provider-token` group\. For example, you can grant permissions for your application to read the token file with the following usermod command, where *<APP\_USER>* is the user ID under which your application runs\.
 
    ```sh
-   sudo usermod -aG awssmatokenreader <APP_USER>
+   sudo usermod -aG aws-workload-credentials-provider-token <APP_USER>
    ```
+
+------
+#### [ Windows EC2 ]
+
+**To install the Workload Credentials Provider**
+
+1. `cd aws_workload_credentials_provider_common\configuration`
+1. Run the `install.ps1` script as Administrator\.
+
+   ```powershell
+   .\install.ps1 -Config C:\path\to\config.toml
+   ```
+
+   The script accepts the following parameters:
+   - `-Config <file>` — (Optional) Bootstrap config to use
+   - `-NoStart` — (Optional) Install but don't start services
+
+   The script generates a random SSRF token on startup and stores it in the file `C:\ProgramData\AWS\WorkloadCredentialsProvider\awssmatoken`\. The token is readable by the Secrets Manager service account (`NT SERVICE\AWSWorkloadCredentialsProvider-SecretsManager`) that the install script configures\.
+
+1. To allow your application to read the token file, you need to grant read access to the user account that your application runs under\. For example, you can grant permissions for your application to read the token file with the following icacls command, where *<APP\_USER>* is the user account under which your application runs\.
+
+   ```powershell
+   icacls "C:\ProgramData\AWS\WorkloadCredentialsProvider\awssmatoken" /grant "<APP_USER>:(R)"
+   ```
+
+   **Note:** When using the install script, the provider reads the SSRF token from file via `AWS_TOKEN=file://C:\ProgramData\AWS\WorkloadCredentialsProvider\awssmatoken` set on the service\. Your application must also read the token from this path and pass it in the `X-Aws-Parameters-Secrets-Token` header\. If you were previously setting `AWS_TOKEN` as an environment variable with a literal token value or a custom file path, update your application to read from the new token file path instead\.
 
 ------
 #### [ Running as a Container Sidecar ]
 
-You can run the Secrets Manager Agent as a sidecar container alongside your application by using Docker\. Then your application can retrieve secrets from the local HTTP server the Secrets Manager Agent provides\. For information about Docker, see the [Docker documentation](https://docs.docker.com)\. 
+You can run the Workload Credentials Provider as a sidecar container alongside your application by using Docker\. Then your application can retrieve secrets from the local HTTP server the Workload Credentials Provider provides\. For information about Docker, see the [Docker documentation](https://docs.docker.com)\. 
 
-**To create a sidecar container for the Secrets Manager Agent with Docker**
+**Note:** The Certificate Management capability is not supported in container environments\.
 
-1. Create a Dockerfile for the Secrets Manager Agent sidecar container\. The following example creates a Docker container with the Secrets Manager Agent binary\.
+**To create a sidecar container for the Workload Credentials Provider with Docker**
+
+1. Create a Dockerfile for the Workload Credentials Provider sidecar container\. The following example creates a Docker container with the Workload Credentials Provider binary\.
 
    ```dockerfile
    # Use the latest Debian image as the base
@@ -199,23 +238,23 @@ You can run the Secrets Manager Agent as a sidecar container alongside your appl
    # Set the working directory inside the container
    WORKDIR /app 
    
-   # Copy the Secrets Manager Agent binary to the container
-   COPY secrets-manager-agent . 
+   # Copy the Workload Credentials Provider binary to the container
+   COPY aws-workload-credentials-provider . 
    
    # Install any necessary dependencies
    RUN apt-get update && apt-get install -y ca-certificates 
    
-   # Set the entry point to run the Secrets Manager Agent binary
-   ENTRYPOINT ["./secrets-manager-agent"]
+   # Set the entry point to run the Workload Credentials Provider binary
+   ENTRYPOINT ["./aws-workload-credentials-provider", "sm", "start"]
    ```
 
 1. Create a Dockerfile for your client application\.
 
-1. Create a Docker Compose file to run both containers, being sure that they use the same network interface\. This is necessary because the Secrets Manager Agent does not accept requests from outside the localhost interface\. The following example shows a Docker Compose file where the `network_mode` key attaches the `secrets-manager-agent` container to the network namespace of the `client-application` container, which allows them to share the same network interface\.
+1. Create a Docker Compose file to run both containers, being sure that they use the same network interface\. This is necessary because the Workload Credentials Provider does not accept requests from outside the localhost interface\. The following example shows a Docker Compose file where the `network_mode` key attaches the `workload-credentials-provider` container to the network namespace of the `client-application` container, which allows them to share the same network interface\.
 
     **Important**
 
-    You must load AWS credentials and the SSRF token for the application to be able to use the Secrets Manager Agent\. For EKS and ECS, see the following:  
+    You must load AWS credentials and the SSRF token for the application to be able to use the Workload Credentials Provider\. For EKS and ECS, see the following:  
     * [Manage access](https://docs.aws.amazon.com/eks/latest/userguide/cluster-auth.html) in the *Amazon Elastic Kubernetes Service User Guide*
     * [Amazon ECS task IAM role](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task-iam-roles.html) in the *Amazon Elastic Container Service Developer Guide*
 
@@ -231,17 +270,17 @@ You can run the Secrets Manager Agent as a sidecar container alongside your appl
        command: tail -f /dev/null  # Keep the container running
        
    
-       secrets-manager-agent:
-       container_name: secrets-manager-agent
+       workload-credentials-provider:
+       container_name: workload-credentials-provider
        build:
            context: .
-           dockerfile: Dockerfile.agent
+           dockerfile: Dockerfile.provider
        network_mode: "container:client-application"  # Attach to the client-application container's network
        depends_on:
            - client-application
    ```
 
-1. Copy the `secrets-manager-agent` binary to the same directory that contains your Dockerfiles and Docker Compose file\.
+1. Copy the `aws-workload-credentials-provider` binary to the same directory that contains your Dockerfiles and Docker Compose file\.
 
 1. Build and run the containers based on the provided Dockerfiles by using the following [https://docs.docker.com/reference/cli/docker/compose/](https://docs.docker.com/reference/cli/docker/compose/) command\.
 
@@ -249,18 +288,20 @@ You can run the Secrets Manager Agent as a sidecar container alongside your appl
    docker-compose up --build
    ```
 
-1. In your client container, you can now use the Secrets Manager Agent to retrieve secrets\. For more information, see [Step 3: Retrieve secrets with the Secrets Manager Agent](#secrets-manager-agent-call)\.
+1. In your client container, you can now use the Workload Credentials Provider to retrieve secrets\. For more information, see [Step 3: Retrieve secrets with the Workload Credentials Provider](#workload-credentials-provider-call)\.
 
 ------
 #### [ AWS Lambda ]
 
-You can [package the Secrets Manager Agent as an AWS Lambda extension](https://docs.aws.amazon.com/lambda/latest/dg/packaging-layers.html)\. Then you can [add it to your Lambda function as a layer](https://docs.aws.amazon.com/lambda/latest/dg/adding-layers.html) and call the Secrets Manager Agent from your Lambda function to get secrets\. 
+You can [package the Workload Credentials Provider as an AWS Lambda extension](https://docs.aws.amazon.com/lambda/latest/dg/packaging-layers.html)\. Then you can [add it to your Lambda function as a layer](https://docs.aws.amazon.com/lambda/latest/dg/adding-layers.html) and call the Workload Credentials Provider from your Lambda function to get secrets\. 
 
-The following instructions show how to get a secret named *MyTest* by using the example script `secrets-manager-agent-extension.sh` in [https://github\.com/aws/aws\-secretsmanager\-agent](https://github.com/aws/aws-secretsmanager-agent) to install the Secrets Manager Agent as a Lambda extension\.
+**Note:** The Certificate Management capability is not supported on AWS Lambda\.
 
-**To create a Lambda extension that packages the Secrets Manager Agent**
+The following instructions show how to get a secret named *MyTest* by using the example script `secrets-manager-provider-extension.sh` in [https://github\.com/aws/aws\-secretsmanager\-agent](https://github.com/aws/aws-secretsmanager-agent) to install the Workload Credentials Provider as a Lambda extension\.
 
-1. Package the agent as a layer. From the root of the Secrets Manager Agent code package, run the following example commands\:
+**To create a Lambda extension that packages the Workload Credentials Provider**
+
+1. Package the provider as a layer. From the root of the Workload Credentials Provider code package, run the following example commands\:
 
    ```sh
    AWS_ACCOUNT_ID=<AWS_ACCOUNT_ID>
@@ -271,22 +312,22 @@ The following instructions show how to get a secret named *MyTest* by using the 
    
    # Copy the release binary into the `bin` folder
    mkdir -p ./bin
-   cp ./target/x86_64-unknown-linux-gnu/release/aws_secretsmanager_agent ./bin/secrets-manager-agent
+   cp ./target/x86_64-unknown-linux-gnu/release/aws-workload-credentials-provider ./bin/aws-workload-credentials-provider
    
-   # Copy the `secrets-manager-agent-extension.sh` example script into the `extensions` folder.
+   # Copy the `secrets-manager-provider-extension.sh` example script into the `extensions` folder.
    mkdir -p ./extensions
-   cp aws_secretsmanager_agent/examples/example-lambda-extension/secrets-manager-agent-extension.sh ./extensions
+   cp aws_secretsmanager_provider/examples/example-lambda-extension/secrets-manager-provider-extension.sh ./extensions
    
    # Zip the extension shell script and the binary 
-   zip secrets-manager-agent-extension.zip bin/* extensions/*
+   zip secrets-manager-provider-extension.zip bin/* extensions/*
    
    # Publish the layer version
    LAYER_VERSION_ARN=$(aws lambda publish-layer-version \
-       --layer-name secrets-manager-agent-extension \
-       --zip-file "fileb://secrets-manager-agent-extension.zip" | jq -r '.LayerVersionArn')
+       --layer-name secrets-manager-provider-extension \
+       --zip-file "fileb://secrets-manager-provider-extension.zip" | jq -r '.LayerVersionArn')
    ```
 
-2. The default configuration of the agent will automatically set the SSRF token to the value set in the pre-set `AWS_SESSION_TOKEN` or `AWS_CONTAINER_AUTHORIZATION_TOKEN` environment variables (the latter variable for Lambda functions with SnapStart enabled). Alternatively, you can define the `AWS_TOKEN` environment variable with an arbitrary value for your Lambda function instead as this variable takes precedence over the other two. If you choose to use the `AWS_TOKEN` environment variable, you must set that environment variable with a `lambda:UpdateFunctionConfiguration` call\.
+2. The default configuration of the provider will automatically set the SSRF token to the value set in the pre-set `AWS_SESSION_TOKEN` or `AWS_CONTAINER_AUTHORIZATION_TOKEN` environment variables (the latter variable for Lambda functions with SnapStart enabled). Alternatively, you can define the `AWS_TOKEN` environment variable with an arbitrary value for your Lambda function instead as this variable takes precedence over the other two. If you choose to use the `AWS_TOKEN` environment variable, you must set that environment variable with a `lambda:UpdateFunctionConfiguration` call\.
 
 
 3. Attach the layer version  to your Lambda function:
@@ -303,13 +344,15 @@ The following instructions show how to get a secret named *MyTest* by using the 
 
 ------
 
-## Step 3: Retrieve secrets with the Secrets Manager Agent<a name="secrets-manager-agent-call"></a>
+## Step 3: Retrieve secrets with the Workload Credentials Provider<a name="workload-credentials-provider-call"></a>
 
-To use the agent, you call the local Secrets Manager Agent endpoint and include the name or ARN of the secret as a query parameter\. By default, the Secrets Manager Agent retrieves the `AWSCURRENT` version of the secret\. To retrieve a different version, you can set `versionStage` or `versionId`\. To retrieve a secret using a different IAM role, you can set `roleArn`\. For more information, see [Role chaining \(cross\-account access\)](#role-chaining-cross-account-access)\.
+**The following sections describe how to use the Secrets Manager capability\.**
 
-To help protect the Secrets Manager Agent, you must include a SSRF token header as part of each request: `X-Aws-Parameters-Secrets-Token`\. The Secrets Manager Agent denies requests that don't have this header or that have an invalid SSRF token\. You can customize the SSRF header name in the [Configuration file](#secrets-manager-agent-config)\.
+To retrieve a secret, you call the local Workload Credentials Provider endpoint and include the name or ARN of the secret as a query parameter\. By default, the Workload Credentials Provider retrieves the `AWSCURRENT` version of the secret\. To retrieve a different version, you can set `versionStage` or `versionId`\. To retrieve a secret using a different IAM role, you can set `roleArn`\. For more information, see [Role chaining \(cross\-account access\)](#role-chaining-cross-account-access)\.
 
-The Secrets Manager Agent uses the AWS SDK for Rust, which uses the [https://docs.aws.amazon.com/sdk-for-rust/latest/dg/credentials.html](https://docs.aws.amazon.com/sdk-for-rust/latest/dg/credentials.html)\. The identity of these IAM credentials determines the permissions the Secrets Manager Agent has to retrieve secrets\. 
+To help protect the Workload Credentials Provider, you must include a SSRF token header as part of each request: `X-Aws-Parameters-Secrets-Token`\. The Workload Credentials Provider denies requests that don't have this header or that have an invalid SSRF token\. You can customize the SSRF header name in the [Configuration file](#workload-credentials-provider-config)\.
+
+The Workload Credentials Provider uses the AWS SDK for Rust, which uses the [https://docs.aws.amazon.com/sdk-for-rust/latest/dg/credentials.html](https://docs.aws.amazon.com/sdk-for-rust/latest/dg/credentials.html)\. The identity of these IAM credentials determines the permissions the Workload Credentials Provider has to retrieve secrets\. 
 
 **Required permissions: **
 + `secretsmanager:DescribeSecret`
@@ -318,12 +361,12 @@ The Secrets Manager Agent uses the AWS SDK for Rust, which uses the [https://doc
 For more information, see [Permissions reference](https://docs.aws.amazon.com/secretsmanager/latest/userguide/auth-and-access_iam-policies.html)\.
 
 **Important**  
-After the secret value is pulled into the Secrets Manager Agent, any user with access to the compute environment and SSRF token can access the secret from the Secrets Manager Agent cache\. For more information, see [Security considerations](#secrets-manager-agent-security)\.
+After the secret value is pulled into the Workload Credentials Provider, any user with access to the compute environment and SSRF token can access the secret from the Workload Credentials Provider cache\. For more information, see [Security considerations](#workload-credentials-provider-security)\.
 
 ------
 #### [ curl ]
 
-The following curl example shows how to get a secret from the Secrets Manager Agent\. The example relies on the SSRF being present in a file, which is where it is stored by the install script\.
+The following curl example shows how to get a secret from the Workload Credentials Provider\. The example relies on the SSRF being present in a file, which is where it is stored by the install script\.
 
 ```sh
 curl -v -H \
@@ -335,12 +378,12 @@ curl -v -H \
 ------
 #### [ Python ]
 
-The following Python example shows how to get a secret from the Secrets Manager Agent\. The example relies on the SSRF being present in a file, which is where it is stored by the install script\.
+The following Python example shows how to get a secret from the Workload Credentials Provider\. The example relies on the SSRF being present in a file, which is where it is stored by the install script\.
 
 ```python
 import requests
 
-# Function that fetches the secret from Secrets Manager Agent for the provided secret id. 
+# Function that fetches the secret from Workload Credentials Provider for the provided secret id. 
 def get_secret():
     # Construct the URL for the GET request
     url = f"http://localhost:2773/secretsmanager/get?secretId=<YOUR_SECRET_ID>"
@@ -373,11 +416,11 @@ def get_secret():
 
 **Force-refresh secrets with `RefreshNow`**
 
-Learn how to use the refreshNow parameter to force the Secrets Manager Agent (SMA) to refresh secret values.
+Learn how to use the refreshNow parameter to force the Workload Credentials Provider to refresh secret values.
 
-Secrets Manager Agent uses an in-memory cache to store secret values, which it refreshes periodically. By default, this refresh occurs when you request a secret after the Time to Live (TTL) has expired, typically every 300 seconds. However, this approach can sometimes result in stale secret values, especially if a secret rotates before the cache entry expires.
+Workload Credentials Provider uses an in-memory cache to store secret values, which it refreshes periodically. By default, this refresh occurs when you request a secret after the Time to Live (TTL) has expired, typically every 300 seconds. However, this approach can sometimes result in stale secret values, especially if a secret rotates before the cache entry expires.
 
-To address this limitation, Secrets Manager Agent supports a parameter called `refreshNow` in the URL. You can use this parameter to force an immediate refresh of a secret's value, bypassing the cache and ensuring you have the most up-to-date information.
+To address this limitation, Workload Credentials Provider supports a parameter called `refreshNow` in the URL. You can use this parameter to force an immediate refresh of a secret's value, bypassing the cache and ensuring you have the most up-to-date information.
 
 Default behavior (without `refreshNow`):
 - Uses cached values until TTL expires
@@ -395,24 +438,24 @@ By using the `refreshNow` parameter, you can ensure that you're always working w
 ## `refreshNow` parameter behavior
 
 `refreshNow` set to `true`:
-- If Secrets Manager Agent can't retrieve the secret from Secrets Manager, it returns an error and does not update the cache.
+- If Workload Credentials Provider can't retrieve the secret from Secrets Manager, it returns an error and does not update the cache.
 
 `refreshNow` set to `false` or not specified:
-- Secrets Manager Agent follows its default behavior:
-  - If the cached value is fresher than the TTL, Secrets Manager Agent returns the cached value.
-  - If the cached value is older than the TTL, Secrets Manager Agent makes a call to Secrets Manager.
+- Workload Credentials Provider follows its default behavior:
+  - If the cached value is fresher than the TTL, Workload Credentials Provider returns the cached value.
+  - If the cached value is older than the TTL, Workload Credentials Provider makes a call to Secrets Manager.
 
 ## Using the refreshNow parameter
 
-To use the `refreshNow` parameter, include it in the URL for the Secrets Manager Agent GET request.
+To use the `refreshNow` parameter, include it in the URL for the Workload Credentials Provider GET request.
 
-### Example - Secrets Manager Agent GET request with refreshNow parameter
+### Example - Workload Credentials Provider GET request with refreshNow parameter
 
-> **Important**: The default value of `refreshNow` is `false`. When set to `true`, it overrides the TTL specified in the Secrets Manager Agent configuration file and makes an API call to Secrets Manager.
+> **Important**: The default value of `refreshNow` is `false`. When set to `true`, it overrides the TTL specified in the Workload Credentials Provider configuration file and makes an API call to Secrets Manager.
 
 #### [ curl ]
 
-The following curl example shows how force Secrets Manager Agent to refresh the secret. The example relies on the SSRF being present in a file, which is where it is stored by the install script.
+The following curl example shows how force Workload Credentials Provider to refresh the secret. The example relies on the SSRF being present in a file, which is where it is stored by the install script.
 
 ```bash
 curl -v -H \
@@ -423,12 +466,12 @@ echo
 
 #### [ Python ]
 
-The following Python example shows how to get a secret from the Secrets Manager Agent. The example relies on the SSRF being present in a file, which is where it is stored by the install script.
+The following Python example shows how to get a secret from the Workload Credentials Provider. The example relies on the SSRF being present in a file, which is where it is stored by the install script.
 
 ```python
 import requests
 
-# Function that fetches the secret from Secrets Manager Agent for the provided secret id. 
+# Function that fetches the secret from Workload Credentials Provider for the provided secret id. 
 def get_secret():
     # Construct the URL for the GET request
     url = f"http://localhost:2773/secretsmanager/get?secretId=<YOUR_SECRET_ID>&refreshNow=true"
@@ -461,11 +504,11 @@ def get_secret():
 
 ## Role chaining \(cross\-account access\)<a name="role-chaining-cross-account-access"></a>
 
-The Secrets Manager Agent supports retrieving secrets using IAM role assumption \(role chaining\)\. This allows you to access secrets in other AWS accounts or with different IAM permissions without running separate agent instances\.
+The Workload Credentials Provider supports retrieving secrets using IAM role assumption \(role chaining\)\. This allows you to access secrets in other AWS accounts or with different IAM permissions without running separate provider instances\.
 
-To retrieve a secret using a different IAM role, include the `roleArn` query parameter in your request\. The Secrets Manager Agent uses STS `AssumeRole` to obtain temporary credentials for the specified role and then retrieves the secret with those credentials\.
+To retrieve a secret using a different IAM role, include the `roleArn` query parameter in your request\. The Workload Credentials Provider uses STS `AssumeRole` to obtain temporary credentials for the specified role and then retrieves the secret with those credentials\.
 
-The Secrets Manager Agent creates and caches a separate caching client for each unique role ARN\. Role clients are created lazily on first request and reused for subsequent requests with the same role ARN\. Each role client maintains its own independent cache, so the same secret fetched with different roles will have separate cache entries\.
+The Workload Credentials Provider creates and caches a separate caching client for each unique role ARN\. Role clients are created lazily on first request and reused for subsequent requests with the same role ARN\. Each role client maintains its own independent cache, so the same secret fetched with different roles will have separate cache entries\.
 
 **Required permissions: **
 + `sts:AssumeRole` on the target role ARN
@@ -473,11 +516,11 @@ The Secrets Manager Agent creates and caches a separate caching client for each 
 
 **Error responses: **
 + `400` – If the `roleArn` format is invalid or the maximum number of assumed roles has been reached\.
-+ `403` – If the STS `AssumeRole` call fails \(for example, the trust policy does not allow the agent's identity to assume the role\)\.
++ `403` – If the STS `AssumeRole` call fails \(for example, the trust policy does not allow the provider's identity to assume the role\)\.
 
-You can configure the maximum number of simultaneous assumed roles with the `max_roles` option in the [Configuration file](#secrets-manager-agent-config)\. The default is 20\.
+You can configure the maximum number of simultaneous assumed roles with the `max_roles` option in the [Configuration file](#workload-credentials-provider-config)\. The default is 20\.
 
-**Note:** Assumed roles are not evicted from the agent's role cache\. Once the maximum number of roles has been reached, requests with new role ARNs will be rejected with a `400` error until the agent is restarted\.
+**Note:** Assumed roles are not evicted from the provider's role cache\. Once the maximum number of roles has been reached, requests with new role ARNs will be rejected with a `400` error until the provider is restarted\.
 
 ------
 #### [ curl ]
@@ -526,12 +569,12 @@ def get_secret_cross_account():
 
 ## Pre\-fetching<a name="pre-fetching"></a>
 
-The Secrets Manager Agent supports pre\-fetching secrets into the cache at startup\. This allows your application to read secrets from the cache immediately without waiting for the first request to trigger a cache miss and network call\.
+The Workload Credentials Provider supports pre\-fetching secrets into the cache at startup\. This allows your application to read secrets from the cache immediately without waiting for the first request to trigger a cache miss and network call\.
 
-To enable pre\-fetching, add a `[prefetch]` section to your [Configuration file](#secrets-manager-agent-config)\. You can specify secrets to pre\-fetch in two ways:
+To enable pre\-fetching, add a `[capabilities.secrets_manager.prefetch]` section to your [Configuration file](#workload-credentials-provider-config)\. You can specify secrets to pre\-fetch in two ways:
 
-+ **Explicit secrets** – List specific secret IDs or ARNs using `[[prefetch.secrets]]` entries\.
-+ **Tag\-based discovery** – Discover secrets by tag key using `[[prefetch.filter_tags]]` entries\. The agent calls `BatchGetSecretValue` with tag key filters to find and cache all secrets that have the specified tag key, regardless of the tag's value\.
++ **Explicit secrets** – List specific secret IDs or ARNs using `[[capabilities.secrets_manager.prefetch.secrets]]` entries\.
++ **Tag\-based discovery** – Discover secrets by tag key using `[[capabilities.secrets_manager.prefetch.filter_tags]]` entries\. The provider calls `BatchGetSecretValue` with tag key filters to find and cache all secrets that have the specified tag key, regardless of the tag's value\.
 
 You can use both methods together\. Each entry optionally accepts a `role_arn` field for cross\-account pre\-fetching via [role chaining](#role-chaining-cross-account-access)\.
 
@@ -546,10 +589,10 @@ You can use both methods together\. Each entry optionally accepts a `role_arn` f
 ### Example \- Pre\-fetch with explicit secrets
 
 ```toml
-[[prefetch.secrets]]
+[[capabilities.secrets_manager.prefetch.secrets]]
 secret_id = "arn:aws:secretsmanager:us-west-2:123456789012:secret:MySecret-AbCdEf"
 
-[[prefetch.secrets]]
+[[capabilities.secrets_manager.prefetch.secrets]]
 secret_id = "cross-account-secret"
 role_arn = "arn:aws:iam::987654321098:role/SecretAccessRole"
 ```
@@ -557,7 +600,7 @@ role_arn = "arn:aws:iam::987654321098:role/SecretAccessRole"
 ### Example \- Pre\-fetch with explicit secrets \(inline syntax\)
 
 ```toml
-[prefetch]
+[capabilities.secrets_manager.prefetch]
 max_jitter_seconds = 5
 cache_buffer_ratio = 0.9
 secrets = [
@@ -573,10 +616,10 @@ filter_tags = [
 ### Example \- Pre\-fetch with tag\-based discovery
 
 ```toml
-[[prefetch.filter_tags]]
+[[capabilities.secrets_manager.prefetch.filter_tags]]
 key = "Environment"
 
-[[prefetch.filter_tags]]
+[[capabilities.secrets_manager.prefetch.filter_tags]]
 key = "Team"
 role_arn = "arn:aws:iam::987654321098:role/SecretAccessRole"
 ```
@@ -584,80 +627,227 @@ role_arn = "arn:aws:iam::987654321098:role/SecretAccessRole"
 ### Example \- Full configuration with pre\-fetching
 
 ```toml
+[logging]
 log_level = "info"
+
+[capabilities.secrets_manager]
 http_port = 2773
-ttl_seconds = 300
 region = "us-east-1"
 max_roles = 5
 
-[prefetch]
+[capabilities.secrets_manager.cache]
+ttl_seconds = 300
+
+[capabilities.secrets_manager.prefetch]
 cache_buffer_ratio = 0.6
 max_jitter_seconds = 5
 
-[[prefetch.secrets]]
+[[capabilities.secrets_manager.prefetch.secrets]]
 secret_id = "arn:aws:secretsmanager:us-west-2:123456789012:secret:MySecret-AbCdEf"
 
-[[prefetch.secrets]]
+[[capabilities.secrets_manager.prefetch.secrets]]
 secret_id = "arn:aws:secretsmanager:us-east-1:987654321098:secret:CrossAccount-AbCdEf"
 role_arn = "arn:aws:iam::987654321098:role/SecretAccessRole"
 
-[[prefetch.filter_tags]]
+[[capabilities.secrets_manager.prefetch.filter_tags]]
 key = "Environment"
 
-[[prefetch.filter_tags]]
+[[capabilities.secrets_manager.prefetch.filter_tags]]
 key = "Team"
 role_arn = "arn:aws:iam::987654321098:role/TagRole"
 ```
 
-## Configure the Secrets Manager Agent<a name="secrets-manager-agent-config"></a>
+## Step 4: Retrieve certificates with the Workload Credentials Provider<a name="workload-credentials-provider-acm"></a>
 
-To change the configuration of the Secrets Manager Agent, create a [TOML](https://toml.io/en/) config file, and then call `./aws_secretsmanager_agent --config config.toml`\.
+**The following sections describe how to use the Certificate Management capability\.**
 
-The following list shows the options you can configure for the Secrets Manager Agent\.
-+ **log\_level** – The level of detail reported in logs for the Secrets Manager Agent: DEBUG, INFO, WARN, ERROR, or NONE\. The default is INFO\.
-+ **log\_to\_file** - Whether to log to a file or stdout/stderr: `true` or `false`. The default is `true`.
+To enable the Certificate Management capability, add a `[capabilities.acm]` section to your configuration file with `enabled = true` and one or more certificate entries\. The provider will automatically export and refresh configured certificates every 24 hours\.
+
+**Required permissions:**
++ `sts:AssumeRole` — Required on the provider's environment credentials to assume the configured role for each certificate
++ `acm:ExportCertificate` — Required on the target role (`role_arn`) to export the certificate and private key from ACM
+
+**Important**  
+After certificates are written to the filesystem, any user with read access to the certificate and private key files can access them\. Use the `certificate_and_chain_permission` and `key_permission` configuration options to restrict file access\. Certificate paths, refresh commands, and file permissions are customer\-configured\. Validate your configuration before applying it to ensure paths are correct and refresh commands are trusted\. For more information, see [Security considerations](#workload-credentials-provider-security)\.
+
+For full configuration details, see [Configure the Workload Credentials Provider](#workload-credentials-provider-config)\.
+
+## Configure the Workload Credentials Provider<a name="workload-credentials-provider-config"></a>
+
+To start the Workload Credentials Provider with a custom configuration, create a [TOML](https://toml.io/en/) config file, and then run `./aws-workload-credentials-provider sm start --config /path/to/config.toml`\.
+
+The following sections describe the configuration options available for the Workload Credentials Provider\.
+
+**Note:** Previous flat configuration keys for Secrets Manager (e.g., `http_port = 2773` at the root level) are still supported for backward compatibility\. We recommend using the nested configuration format documented below\.
+
+### Common configuration
+
+These options apply to all capabilities\.
+
+```toml
+[logging]
+log_level = "INFO"
+log_to_file = true
+```
+
++ **log\_level** – The level of detail reported in logs: DEBUG, INFO, WARN, ERROR, or NONE\. The default is INFO\.
++ **log\_to\_file** – Whether to log to a file or stdout/stderr: `true` or `false`\. The default is `true`\.
+
+### Secrets Manager configuration
+
+These options go under `[capabilities.secrets_manager]`\.
+
+```toml
+[capabilities.secrets_manager]
+enabled = true
+http_port = 2773
+region = "us-east-1"
+path_prefix = "/v1/"
+max_conn = 800
+max_roles = 20
+
+[capabilities.secrets_manager.cache]
+ttl_seconds = 300
+cache_size = 1000
+
+[capabilities.secrets_manager.security]
+ssrf_headers = ["X-Aws-Parameters-Secrets-Token", "X-Vault-Token"]
+ssrf_env_variables = ["AWS_TOKEN", "AWS_SESSION_TOKEN", "AWS_CONTAINER_AUTHORIZATION_TOKEN"]
+
+[capabilities.secrets_manager.prefetch]
+cache_buffer_ratio = 0.8
+max_jitter_seconds = 5
+secrets = [
+  { secret_id = "arn:aws:secretsmanager:us-west-2:123456789012:secret:MySecret-AbCdEf" },
+]
+```
+
++ **enabled** – Whether the Secrets Manager capability is active: `true` or `false`\. The default is `true`\.
 + **http\_port** – The port for the local HTTP server, in the range 1024 to 65535\. The default is 2773\.
-+ **region** – The AWS Region to use for requests\. If no Region is specified, the Secrets Manager Agent determines the Region from the SDK\. For more information, see [Specify your credentials and default Region](https://docs.aws.amazon.com/sdk-for-rust/latest/dg/credentials.html) in the *AWS SDK for Rust Developer Guide*\.
-+ **ttl\_seconds** – The TTL in seconds for the cached items, in the range 0 to 3600\. The default is 300\. 0 indicates that there is no caching\.
-+ **cache\_size** – The maximum number of secrets that can be stored in the cache, in the range 1 to 1000\. The default is 1000\. 
-+ **ssrf\_headers** – A list of header names the Secrets Manager Agent checks for the SSRF token\. The default is "X\-Aws\-Parameters\-Secrets\-Token, X\-Vault\-Token"\. 
-+ **ssrf\_env\_variables** – A list of environment variable names the Secrets Manager Agent checks in sequential order for the SSRF token\. The environment variable can contain the token or a reference to the token file as in: `AWS_TOKEN=file:///var/run/awssmatoken`\. The default is "AWS\_TOKEN, AWS\_SESSION\_TOKEN, AWS\_CONTAINER\_AUTHORIZATION\_TOKEN\".
++ **region** – The AWS Region to use for requests\. If no Region is specified, the Workload Credentials Provider determines the Region from the SDK\. For more information, see [Specify your credentials and default Region](https://docs.aws.amazon.com/sdk-for-rust/latest/dg/credentials.html) in the *AWS SDK for Rust Developer Guide*\.
 + **path\_prefix** – The URI prefix used to determine if the request is a path based request\. The default is "/v1/"\.
-+ **max\_conn** – The maximum number of connections from HTTP clients that the Secrets Manager Agent allows, in the range 1 to 1000\. The default is 800\.
-+ **max\_roles** – The maximum number of IAM roles the Secrets Manager Agent can assume simultaneously for cross\-account access, in the range 1 to 20\. The default is 20\. For more information, see [Role chaining \(cross\-account access\)](#role-chaining-cross-account-access)\.
++ **max\_conn** – The maximum number of connections from HTTP clients that the Workload Credentials Provider allows, in the range 1 to 1000\. The default is 800\.
++ **max\_roles** – The maximum number of IAM roles the Workload Credentials Provider can assume simultaneously for cross\-account access, in the range 1 to 20\. The default is 20\. For more information, see [Role chaining \(cross\-account access\)](#role-chaining-cross-account-access)\.
++ **ttl\_seconds** – The TTL in seconds for the cached items, in the range 0 to 3600\. The default is 300\. 0 indicates that there is no caching\.
++ **cache\_size** – The maximum number of secrets that can be stored in the cache, in the range 1 to 1000\. The default is 1000\.
++ **ssrf\_headers** – A list of header names the Workload Credentials Provider checks for the SSRF token\. The default is "X\-Aws\-Parameters\-Secrets\-Token, X\-Vault\-Token"\.
++ **ssrf\_env\_variables** – A list of environment variable names the Workload Credentials Provider checks in sequential order for the SSRF token\. The environment variable can contain the token or a reference to the token file as in: `AWS_TOKEN=file:///var/run/awssmatoken`\. The default is "AWS\_TOKEN, AWS\_SESSION\_TOKEN, AWS\_CONTAINER\_AUTHORIZATION\_TOKEN"\.
+
+### Certificate Management configuration
+
+These options go under `[capabilities.acm]`\.
+
+#### Example \- Linux
+
+```toml
+[capabilities.acm]
+enabled = true
+
+[[capabilities.acm.certificates]]
+certificate_arn = "arn:aws:acm:us-west-2:123456789012:certificate/abc12345-1234-1234-1234-123456789012"
+certificate_path = "/etc/ssl/certs/my-cert.pem"
+private_key_path = "/etc/ssl/private/my-key.pem"
+chain_path = "/etc/ssl/certs/my-chain.pem"
+role_arn = "arn:aws:iam::123456789012:role/CertExportRole"
+refresh_command = "/usr/sbin/nginx -s reload"
+certificate_and_chain_permission = { mode = "0644" }
+key_permission = { mode = "0600" }
+```
+
+#### Example \- Fullchain mode
+
+When `chain_path` is omitted, the certificate chain is appended to the certificate file\.
+
+```toml
+[[capabilities.acm.certificates]]
+certificate_arn = "arn:aws:acm:us-west-2:123456789012:certificate/abc12345-1234-1234-1234-123456789012"
+certificate_path = "/etc/ssl/certs/my-fullchain.pem" # bundled cert and chain
+private_key_path = "/etc/ssl/private/my-key.pem"
+role_arn = "arn:aws:iam::123456789012:role/CertExportRole"
+```
+
+#### Example \- Windows
+
+```toml
+[capabilities.acm]
+enabled = true
+
+[[capabilities.acm.certificates]]
+certificate_arn = "arn:aws:acm:us-west-2:123456789012:certificate/abc12345-1234-1234-1234-123456789012"
+certificate_path = "C:\\ssl\\certs\\my-cert.pem"
+private_key_path = "C:\\ssl\\private\\my-key.pem"
+chain_path = "C:\\ssl\\certs\\my-chain.pem"
+role_arn = "arn:aws:iam::123456789012:role/CertExportRole"
+refresh_command = "C:\\nginx-1.31.1\\nginx.exe -s reload"
+certificate_and_chain_permission = { trustee_type = "User", trustee_name = "NT SERVICE\\MyWebServer", rights = "Read" }
+key_permission = { trustee_type = "User", trustee_name = "NT SERVICE\\MyWebServer", rights = "Read" }
+```
+
+**Note:** On Windows, certificate and key file permissions are inherited from parent directories\. Even when `certificate_and_chain_permission` or `key_permission` is specified, the configured permission is added on top of inherited permissions\. Ensure parent directories are appropriately locked down\.
+
++ **enabled** – Whether the Certificate Management capability is active: `true` or `false`\. The default is `false`\.
++ **certificate\_arn** – The ARN of the ACM certificate to export\.
++ **certificate\_path** – Absolute path where the certificate PEM file will be written\.
++ **private\_key\_path** – Absolute path where the private key PEM file will be written\.
++ **chain\_path** – (Optional) Absolute path where the certificate chain will be written\. If omitted, the chain is appended to the certificate file (fullchain mode)\.
++ **role\_arn** – IAM role to assume when exporting the certificate\.
++ **refresh\_command** – (Optional) Command to run after a successful certificate refresh\. On Windows, use the `scheduled-task:` prefix to trigger a pre\-registered scheduled task\.
++ **certificate\_and\_chain\_permission** – (Optional) File permissions for the certificate and chain files\. On Linux, specify as `{ mode = "<octal>" }` (e.g., `{ mode = "0644" }`)\. On Windows, specify as `{ trustee_type, trustee_name, rights }`\. Default: `0600` on Linux\. On Windows, creating user, Administrators, and SYSTEM, plus any permissions inherited from the parent directory\.
++ **key\_permission** – (Optional) File permissions for the private key file\. Same format and defaults as `certificate_and_chain_permission`\.
+
+### Configuration reload (Certificate Management)
+
+You can apply a new configuration to the Certificate Management capability without manually stopping and restarting the service\. The reload command validates the new configuration, re\-applies permissions, and restarts the ACM service\. It does not affect the Secrets Manager process or configuration\.
+
+```sh
+# Linux
+sudo ./aws-workload-credentials-provider acm reload --config /path/to/config.toml
+
+# Windows
+.\aws-workload-credentials-provider.exe acm reload --Config C:\path\to\config.toml
+```
 
 
-## Optional features<a name="secrets-manager-agent-features"></a>
+## Optional features<a name="workload-credentials-provider-features"></a>
 
-The Secrets Manager Agent can be built with optional features by passing the `--features` flag to `cargo build`. The available features are:
+The Workload Credentials Provider can be built with optional features by passing the `--features` flag to `cargo build`. The available features are:
 
-* `fips`: restricts the cipher suites used by the agent to only FIPS-approved ciphers
+* `fips`: restricts the cipher suites used by the provider to only FIPS-approved ciphers
 
-## Logging<a name="secrets-manager-agent-log"></a>
+## Logging<a name="workload-credentials-provider-log"></a>
 
-The Secrets Manager Agent logs errors locally to the file `logs/secrets_manager_agent.log` or to stdout/stderr depending on the `log_to_file` config variable\. When your application calls the Secrets Manager Agent to get a secret, those calls appear in the local log\. They do not appear in the CloudTrail logs\. 
+The Workload Credentials Provider logs locally to the following files, or to stdout/stderr depending on the `log_to_file` config variable:
++ **Secrets Manager:** `logs/secrets_manager_provider.log`
++ **Certificate Management:** `logs/acm_provider.log`
 
-The Secrets Manager Agent creates a new log file when the file reaches 10 MB, and it stores up to five log files total\. 
+When your application calls the Workload Credentials Provider to get a secret, those calls appear in the local log\. When the provider exports a certificate, writes it to disk, and runs a refresh command, those actions also appear in the local log\. They do not appear in the CloudTrail logs\.
 
-The log does not go to Secrets Manager, CloudTrail, or CloudWatch\. Requests to get secrets from the Secrets Manager Agent do not appear in those logs\. When the Secrets Manager Agent makes a call to Secrets Manager to get a secret, that call is recorded in CloudTrail with a user agent string containing `aws-secrets-manager-agent`\. 
+The Workload Credentials Provider creates a new log file when the file reaches 10 MB, and it stores up to five log files per capability\. 
 
-You can configure logging in the [Configuration file](#secrets-manager-agent-config)\. 
+The log does not go to Secrets Manager, ACM, CloudTrail, or CloudWatch\. When the Workload Credentials Provider makes a call to Secrets Manager or ACM, that call is recorded in CloudTrail with a user agent string containing `aws-workload-credentials-provider`\. 
 
-## Security considerations<a name="secrets-manager-agent-security"></a>
+You can configure logging in the [Configuration file](#workload-credentials-provider-config)\. 
 
-For an agent architecture, the domain of trust is where the agent endpoint and SSRF token are accessible, which is usually the entire host\. The domain of trust for the Secrets Manager Agent should match the domain where the Secrets Manager credentials are available in order to maintain the same security posture\. For example, on Amazon EC2 the domain of trust for the Secrets Manager Agent would be the same as the domain of the credentials when using roles for Amazon EC2\.
+## Security considerations<a name="workload-credentials-provider-security"></a>
 
-Security conscious applications that are not already using an agent solution with the Secrets Manager credentials locked down to the application should consider using the language\-specific AWS SDKs or caching solutions\. For more information, see [Get secrets](https://docs.aws.amazon.com/secretsmanager/latest/userguide/retrieving-secrets.html)\.
+For a local provider architecture, the domain of trust is where the provider endpoint, SSRF token, and credential outputs (such as certificate files) are accessible, which is usually the entire host\. The domain of trust for the Workload Credentials Provider should match the domain where the AWS credentials are available in order to maintain the same security posture\. For example, on Amazon EC2 the domain of trust for the Workload Credentials Provider would be the same as the domain of the credentials when using roles for Amazon EC2\.
+
+Security conscious applications that are not already using a similar solution with the Secrets Manager credentials locked down to the application should consider using the language\-specific AWS SDKs or caching solutions\. For more information, see [Get secrets](https://docs.aws.amazon.com/secretsmanager/latest/userguide/retrieving-secrets.html)\.
+
+For the Certificate Management capability, the provider runs as a dedicated system user with no login shell\. On Linux, it uses `CAP_DAC_OVERRIDE` to write certificate files without requiring root, and executes refresh commands via `sudo -n` with a generated sudoers entry that permits only the exact configured commands\. Private key files are written with `0600` permissions by default\. All configured paths must be absolute, and paths containing symlinks or traversal components are rejected\. The provider's base credentials only need `sts:AssumeRole`, while `acm:ExportCertificate` is scoped to a separate role\. For environments where elevated privileges are not acceptable, the install script supports `--no-privileges` and `--no-sudoers` modes\.
 
 ## Running Integration Tests Locally<a name="integration-tests-local"></a>
 
-The AWS Secrets Manager Agent includes a comprehensive integration test suite that validates functionality against real AWS Secrets Manager. These tests cover caching behavior, security features, configuration options, version management, and error handling scenarios.
+The AWS Workload Credentials Provider includes a comprehensive integration test suite that validates functionality against real AWS Secrets Manager. These tests cover caching behavior, security features, configuration options, version management, and error handling scenarios.
 
 ### Prerequisites
 
 - AWS credentials with permissions to create, read, update, and delete secrets in AWS Secrets Manager
 - Rust toolchain installed
 - Access to an AWS account for testing
+- (For ACM tests) An exportable ACM certificate and IAM role with export permissions\. Set the following environment variables:
+  - `ACM_TEST_CERTIFICATE_ARN` — ARN of the certificate to export
+  - `ACM_TEST_ROLE_ARN` — IAM role the provider assumes when exporting, requires `acm:ExportCertificate` permission
 
 ### Required AWS Permissions
 
@@ -698,7 +888,7 @@ Both roles must have a trust policy that allows the identity running the tests t
 
 1. Configure your AWS credentials with appropriate permissions
 
-2. Build the agent binary:
+2. Build the provider binary:
    ```sh
    cargo build
    ```
@@ -720,3 +910,4 @@ The integration tests are organized into the following modules:
 - **`configuration.rs`** - Tests configuration parameters including health checks and path-based requests
 - **`role_chaining.rs`** - Tests cross\-account secret retrieval via IAM role assumption, including invalid role ARN handling, access denied scenarios, refreshNow with role chaining, and separate per\-role cache isolation
 - **`prefetch.rs`** - Tests pre\-fetching secrets into the cache at startup, including explicit secrets, tag\-based discovery, inline TOML syntax, cross\-account pre\-fetching via role chaining, and resilience to nonexistent secrets
+- **`certificate_provider.rs`** - Tests the Certificate Management capability including certificate export, file writing, fullchain mode, refresh command execution, and file permission configuration
