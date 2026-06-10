@@ -4,7 +4,7 @@
 pub const PROVIDER_NAME: &str = "aws-workload-credentials-provider";
 
 /// System user the provider runs as.
-pub const PROVIDER_USER: &str = "aws-workload-credentials-provider";
+pub const PROVIDER_USER: &str = "aws-wcp";
 
 /// Primary group for provider-created files.
 pub const PROVIDER_GROUP: &str = "awscreds";

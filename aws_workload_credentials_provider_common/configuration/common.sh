@@ -5,8 +5,8 @@ CONFIG_DIR=/etc/aws-workload-credentials-provider
 SYSTEMD_FILES=/etc/systemd/system
 
 PROVIDER_GROUP=awscreds
-TOKEN_GROUP=aws-workload-credentials-provider-token
-PROVIDER_USER=aws-workload-credentials-provider
+TOKEN_GROUP=aws-wcp-token
+PROVIDER_USER=aws-wcp
 
 TOKEN_SCRIPT=aws-workload-credentials-provider-token
 SM_SERVICE=aws-workload-credentials-provider-sm
