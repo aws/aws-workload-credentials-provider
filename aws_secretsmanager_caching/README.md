@@ -25,6 +25,19 @@ cargo add tokio -F rt-multi-thread,net,macros
 cargo add aws_secretsmanager_caching
 ```
 
+By default, this crate enables the same AWS SDK features as the AWS SDK service client defaults.
+Applications that want to select the SDK HTTP client explicitly can disable default features and
+enable the required AWS SDK features:
+
+```toml
+aws_secretsmanager_caching = { version = "2", default-features = false, features = [
+    "default-https-client",
+    "rt-tokio",
+    "credentials-process",
+    "sso",
+] }
+```
+
 ```rust
 use aws_secretsmanager_caching::SecretsManagerCachingClient;
 use std::num::NonZeroUsize;
