@@ -20,17 +20,12 @@ use aws_sdk_secretsmanager::operation::batch_get_secret_value::BatchGetSecretVal
 use aws_sdk_secretsmanager::types::Filter;
 use aws_sdk_secretsmanager::Client as SecretsManagerClient;
 use error::is_transient_error;
-use secret_store::SecretStoreError;
-
 #[cfg(debug_assertions)]
 use log::{info, warn};
-
 use output::{BlobDef, GetSecretValueOutputDef};
-use secret_store::{MemoryStore, SecretStore};
-
+use secret_store::{MemoryStore, SecretStore, SecretStoreError};
 #[cfg(debug_assertions)]
 use std::sync::atomic::{AtomicU32, Ordering};
-
 use std::{error::Error, num::NonZeroUsize, time::Duration};
 use tokio::sync::RwLock;
 use utils::CachingLibraryInterceptor;
@@ -70,7 +65,7 @@ impl SecretsManagerCachingClient {
     /// use aws_secretsmanager_caching::SecretsManagerCachingClient;
     /// use std::num::NonZeroUsize;
     /// use std::time::Duration;
-
+    ///
     /// let asm_client = SecretsManagerClient::from_conf(
     /// Config::builder()
     ///     .behavior_version_latest()
@@ -143,15 +138,15 @@ impl SecretsManagerCachingClient {
     /// use std::num::NonZeroUsize;
     /// use std::time::Duration;
     /// use aws_config::{BehaviorVersion, Region};
-
+    ///
     /// let config = aws_config::load_defaults(BehaviorVersion::latest())
     /// .await
     /// .into_builder()
     /// .region(Region::from_static("us-west-2"))
     /// .build();
-
+    ///
     /// let asm_builder = aws_sdk_secretsmanager::config::Builder::from(&config);
-
+    ///
     /// let client = SecretsManagerCachingClient::from_builder(
     /// asm_builder,
     /// NonZeroUsize::new(1000).unwrap(),
@@ -207,9 +202,9 @@ impl SecretsManagerCachingClient {
                 );
             }
 
-            return Ok(self
+            return self
                 .refresh_secret_value(secret_id, version_id, version_stage, None)
-                .await?);
+                .await;
         }
 
         let read_lock = self.store.read().await;
@@ -512,7 +507,7 @@ impl SecretsManagerCachingClient {
     }
 
     #[cfg(debug_assertions)]
-    fn increment_counter(&self, counter: &AtomicU32) -> () {
+    fn increment_counter(&self, counter: &AtomicU32) {
         counter.fetch_add(1, Ordering::Relaxed);
     }
 

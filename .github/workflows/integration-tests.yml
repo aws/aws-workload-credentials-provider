@@ -64,10 +64,10 @@ jobs:
       uses: aws-actions/configure-aws-credentials@v6
       with:
         role-to-assume: ${{ secrets.ROLE_ARN }}
-        role-session-name: secrets-manager-agent-ci-${{ github.run_id }}
+        role-session-name: aws-workload-credentials-provider-ci-${{ github.run_id }}
         aws-region: us-west-2
     
-    - name: Build agent binary
+    - name: Build provider binary
       run: cargo build
     
     - name: Run integration tests

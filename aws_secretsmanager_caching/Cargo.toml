@@ -4,8 +4,8 @@ version = "2.1.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "The AWS Secrets Manager Rust caching client enables in-process caching of secrets for Rust applications."
-homepage = "https://github.com/aws/aws-secretsmanager-agent/aws_secretsmanager_caching"
-repository = "https://github.com/aws/aws-secretsmanager-agent"
+homepage = "https://github.com/aws/aws-workload-credentials-provider/aws_secretsmanager_caching"
+repository = "https://github.com/aws/aws-workload-credentials-provider"
 readme = "README.md"
 
 [features]
