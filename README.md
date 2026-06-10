@@ -27,7 +27,7 @@ You can provide a custom configuration by passing `--config /path/to/config.toml
 
 For full configuration details, see [Configure the Workload Credentials Provider](#workload-credentials-provider-config)\.
 
-To download the source code, see [https://github\.com/aws/aws\-secretsmanager\-agent](https://github.com/aws/aws-secretsmanager-agent) on GitHub\.
+To download the source code, see [https://github\.com/aws/aws\-workload\-credentials\-provider](https://github.com/aws/aws-workload-credentials-provider) on GitHub\.
 
 **Topics**
 - [AWS Workload Credentials Provider](#aws-workload-credentials-provider)
@@ -73,9 +73,9 @@ To build the Workload Credentials Provider binary natively, you need the standar
 
 ------
 
-**NOTE:** To ensure a stable experience, use a specific git tag when building from source code. You can find a list of version tags [here](https://github.com/aws/aws-secretsmanager-agent/tags). Tags are in the pattern `/v\d+\.\d+\.\d+/` and follow [SemVer 2.0.0](https://semver.org/spec/v2.0.0.html).
+**NOTE:** To ensure a stable experience, use a specific git tag when building from source code. You can find a list of version tags [here](https://github.com/aws/aws-workload-credentials-provider/tags). Tags are in the pattern `/v\d+\.\d+\.\d+/` and follow [SemVer 2.0.0](https://semver.org/spec/v2.0.0.html).
 
-Example: `git clone --branch <git tag> https://github.com/aws/aws-secretsmanager-agent.git`
+Example: `git clone --branch <git tag> https://github.com/aws/aws-workload-credentials-provider.git`
 
 **NOTE:** Building the provider with the `fips` feature enabled on macOS currently requires the following workaround:
 
@@ -186,12 +186,12 @@ Based on the type of compute, you have several options for installing the Worklo
    - `--no-privileges` — (Optional) Skip Linux capabilities on ACM service
    - `--no-sudoers` — (Optional) Skip sudoers generation
 
-   The script generates a random SSRF token on startup and stores it in the file `/var/run/awssmatoken`\. The token is readable by the `aws-workload-credentials-provider-token` group that the install script creates\. 
+   The script generates a random SSRF token on startup and stores it in the file `/var/run/awssmatoken`\. The token is readable by the `aws-wcp-token` group that the install script creates\. 
 
-1. To allow your application to read the token file, you need to add the user account that your application runs under to the `aws-workload-credentials-provider-token` group\. For example, you can grant permissions for your application to read the token file with the following usermod command, where *<APP\_USER>* is the user ID under which your application runs\.
+1. To allow your application to read the token file, you need to add the user account that your application runs under to the `aws-wcp-token` group\. For example, you can grant permissions for your application to read the token file with the following usermod command, where *<APP\_USER>* is the user ID under which your application runs\.
 
    ```sh
-   sudo usermod -aG aws-workload-credentials-provider-token <APP_USER>
+   sudo usermod -aG aws-wcp-token <APP_USER>
    ```
 
 ------
@@ -297,7 +297,7 @@ You can [package the Workload Credentials Provider as an AWS Lambda extension](h
 
 **Note:** The Certificate Management capability is not supported on AWS Lambda\.
 
-The following instructions show how to get a secret named *MyTest* by using the example script `secrets-manager-provider-extension.sh` in [https://github\.com/aws/aws\-secretsmanager\-agent](https://github.com/aws/aws-secretsmanager-agent) to install the Workload Credentials Provider as a Lambda extension\.
+The following instructions show how to get a secret named *MyTest* by using the example script `secrets-manager-provider-extension.sh` in [https://github\.com/aws/aws\-workload\-credentials\-provider](https://github.com/aws/aws-workload-credentials-provider) to install the Workload Credentials Provider as a Lambda extension\.
 
 **To create a Lambda extension that packages the Workload Credentials Provider**
 
