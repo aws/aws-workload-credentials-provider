@@ -1,12 +1,12 @@
-name: Benchmark PR Check
+name: Push Benchmark Baseline
 
 on:
-  pull_request:
+  push:
     branches: [main]
-  workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
+  deployments: write
   pull-requests: write
 
 env:
@@ -16,27 +16,22 @@ jobs:
   benchmark:
     runs-on: ubuntu-latest
     steps:
-      - name: Harden Runner
-        uses: step-security/harden-runner@v2.19.4
-        with:
-          egress-policy: audit
-
       - name: Checkout
         uses: actions/checkout@v6
 
       - name: Log toolchain versions
         run: rustup --version && rustc --version && cargo --version
-
       - name: Run benchmarks
         working-directory: aws_secretsmanager_caching
         run: cargo bench --bench benchmark -- --output-format bencher | tee ../bench-result.txt
 
-      - name: Compare benchmarks
+      - name: Compare and push benchmarks
         uses: benchmark-action/github-action-benchmark@v1
         with:
-          name: Secrets Manager Caching Benchmarks
+          name: Secrets Manager Agent Benchmarks
           tool: cargo
           output-file-path: bench-result.txt
           github-token: ${{ secrets.GITHUB_TOKEN }}
           comment-on-alert: true
           summary-always: true
+          auto-push: true
