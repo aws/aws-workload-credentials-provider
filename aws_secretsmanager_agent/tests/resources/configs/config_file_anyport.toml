@@ -1,3 +1,0 @@
-# Let the server pick the port
-http_port = "0"
-max_conn = 1

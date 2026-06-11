@@ -34,7 +34,7 @@ jobs:
       - name: Compare benchmarks
         uses: benchmark-action/github-action-benchmark@v1
         with:
-          name: Secrets Manager Agent Benchmarks
+          name: Secrets Manager Caching Benchmarks
           tool: cargo
           output-file-path: bench-result.txt
           github-token: ${{ secrets.GITHUB_TOKEN }}
