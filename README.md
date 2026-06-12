@@ -732,6 +732,7 @@ secrets = [
 + **cache\_size** – The maximum number of secrets that can be stored in the cache, in the range 1 to 1000\. The default is 1000\.
 + **ssrf\_headers** – A list of header names the Workload Credentials Provider checks for the SSRF token\. The default is "X\-Aws\-Parameters\-Secrets\-Token, X\-Vault\-Token"\.
 + **ssrf\_env\_variables** – A list of environment variable names the Workload Credentials Provider checks in sequential order for the SSRF token\. The environment variable can contain the token or a reference to the token file as in: `AWS_TOKEN=file:///var/run/awssmatoken`\. The default is "AWS\_TOKEN, AWS\_SESSION\_TOKEN, AWS\_CONTAINER\_AUTHORIZATION\_TOKEN"\.
++ **credentials\_file\_path** – The path to a file containing AWS credentials in the standard AWS credentials file format\. When set, the provider reads credentials from this file instead of using the default SDK credential provider chain\. The provider automatically reloads credentials when the file changes, making it compatible with credential rotation systems such as [IAM Roles Anywhere](https://docs.aws.amazon.com/rolesanywhere/latest/userguide/introduction.html) that deliver refreshed credentials to the filesystem\. This parameter is optional\.
 
 ### Certificate Management configuration
 
@@ -807,6 +808,71 @@ sudo ./aws-workload-credentials-provider acm reload --config /path/to/config.tom
 .\aws-workload-credentials-provider.exe acm reload --Config C:\path\to\config.toml
 ```
 
+
+## File-based credentials
+
+By default, the Workload Credentials Provider uses the [AWS SDK default credential provider chain](https://docs.aws.amazon.com/sdk-for-rust/latest/dg/credproviders.html) to authenticate with Secrets Manager\. This works well on Amazon EC2 \(via IMDS\), Lambda, and ECS/EKS \(via container credentials\)\.
+
+For environments where credentials are delivered to the filesystem — such as on\-premises or multicloud hosts using [IAM Roles Anywhere](https://docs.aws.amazon.com/rolesanywhere/latest/userguide/introduction.html) — you can configure the provider to read credentials from a file\. The IAM Roles Anywhere credential helper's `update` command writes rotating temporary credentials to the standard AWS credentials file, and the provider automatically picks up refreshed credentials without requiring a restart\.
+
+### Credentials file format
+
+The credentials file must use the standard AWS credentials file format and must include a session token \(temporary credentials\):
+
+```
+[default]
+aws_access_key_id = AKIAIOSFODNN7EXAMPLE
+aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+aws_session_token = IQoJb3JpZ2luX2Vj...
+```
+
+**Important:** The provider enforces a session token gate — credentials without an `aws_session_token` are rejected\. This prevents use of long\-term IAM User credentials\. IAM Roles Anywhere credentials always include a session token\.
+
+### Configuration
+
+Set the `credentials_file_path` parameter in your configuration file:
+
+```toml
+[capabilities.secrets_manager]
+region = "us-east-1"
+credentials_file_path = "/path/to/credentials"
+```
+
+Or in the legacy flat format:
+
+```toml
+region = "us-east-1"
+credentials_file_path = "/path/to/credentials"
+```
+
+### Credential refresh behavior
+
+The provider automatically detects and re\-reads updated credentials from the file:
+
++ The provider checks the credentials file for changes every 5 minutes\.
++ When the file's modification time changes, the provider reloads the credentials\.
++ After every load or reload, the provider validates that `aws_session_token` is present\. If absent, the credentials are rejected and previously cached valid credentials are retained\.
++ If the file is missing or malformed during a reload, the provider continues using the previously cached credentials and retries on the next cycle\.
++ Credentials are served to the AWS SDK with a 10\-minute expiry window, ensuring the SDK periodically requests fresh credentials from the provider\.
+
+### Startup behavior
+
+The provider is designed to start successfully regardless of the credentials file state:
+
++ If the file exists and contains valid temporary credentials, the provider loads them immediately\.
++ If the file is missing, empty, or malformed, the provider starts without credentials and the background reload task will pick up valid credentials when they appear\.
++ When file\-based credentials are configured, the provider skips the STS credential validation check at startup, since the credentials file may not yet exist\.
++ Calls to Secrets Manager will fail until valid credentials are available\. The provider process itself remains running and will begin serving requests once credentials appear in the file\.
+
+### Security
+
+The session token gate ensures that only temporary credentials can be used via the file path\.
+
+On Unix systems, the provider logs a warning if the credentials file has permissions more permissive than owner\-only \(`0600`\)\. Consider restricting file permissions:
+
+```sh
+chmod 600 /path/to/credentials
+```
 
 ## Optional features<a name="workload-credentials-provider-features"></a>
 
@@ -911,3 +977,4 @@ The integration tests are organized into the following modules:
 - **`role_chaining.rs`** - Tests cross\-account secret retrieval via IAM role assumption, including invalid role ARN handling, access denied scenarios, refreshNow with role chaining, and separate per\-role cache isolation
 - **`prefetch.rs`** - Tests pre\-fetching secrets into the cache at startup, including explicit secrets, tag\-based discovery, inline TOML syntax, cross\-account pre\-fetching via role chaining, and resilience to nonexistent secrets
 - **`certificate_provider.rs`** - Tests the Certificate Management capability including certificate export, file writing, fullchain mode, refresh command execution, and file permission configuration
+- **`file_credentials.rs`** - Tests file\-based credential loading including valid/invalid/missing credentials, session token gate enforcement, self\-healing \(credentials appearing after startup\), and credential rotation

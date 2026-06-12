@@ -3,6 +3,7 @@
 
 mod cache_manager;
 mod constants;
+pub mod credentials_file_provider;
 mod error;
 mod parse;
 mod prefetch;
