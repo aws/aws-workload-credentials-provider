@@ -155,8 +155,8 @@ pub async fn validate_and_create_asm_client(
     #[cfg(debug_assertions)]
     if std::env::var("SMA_DISABLE_IDENTITY_CACHE").is_ok() {
         log::info!("Identity caching disabled via SMA_DISABLE_IDENTITY_CACHE");
-        asm_builder = asm_builder
-            .identity_cache(aws_sdk_secretsmanager::config::IdentityCache::no_cache());
+        asm_builder =
+            asm_builder.identity_cache(aws_sdk_secretsmanager::config::IdentityCache::no_cache());
     }
 
     if let Some(ref region) = config.region {

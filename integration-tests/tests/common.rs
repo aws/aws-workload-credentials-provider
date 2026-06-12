@@ -154,7 +154,6 @@ ttl_seconds = {}
     }
 
     /// Start the provider with a custom config and extra environment variables.
-    #[allow(dead_code)]
     pub async fn start_with_config_content_and_env(
         port: u16,
         config_content: &str,

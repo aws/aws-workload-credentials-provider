@@ -387,16 +387,9 @@ impl<F: FileSystem> ConfigValidator<F> {
             secrets_manager_config.validate_credentials = validate_credentials;
         }
 
-        if let Some(ref path) = secrets_manager_config_input.credentials_file_path {
-            if !path.is_file() {
-                log::warn!(
-                    "Configured credentials_file_path does not exist yet: {}. \
-                     The agent will watch for it to appear.",
-                    path.display()
-                );
-            }
-            secrets_manager_config.credentials_file_path =
-                secrets_manager_config_input.credentials_file_path;
+        if let Some(path) = secrets_manager_config_input.credentials_file_path {
+            warn_if_credentials_file_missing(&path);
+            secrets_manager_config.credentials_file_path = Some(path);
         }
 
         if let Some(prefetch_input) = secrets_manager_config_input.prefetch {
@@ -632,15 +625,9 @@ impl<F: FileSystem> ConfigValidator<F> {
             secrets_manager_config.validate_credentials = validate_credentials;
         }
 
-        if let Some(ref path) = config_file.credentials_file_path {
-            if !path.is_file() {
-                log::warn!(
-                    "Configured credentials_file_path does not exist yet: {}. \
-                     The agent will watch for it to appear.",
-                    path.display()
-                );
-            }
-            secrets_manager_config.credentials_file_path = config_file.credentials_file_path.clone();
+        if let Some(path) = config_file.credentials_file_path.clone() {
+            warn_if_credentials_file_missing(&path);
+            secrets_manager_config.credentials_file_path = Some(path);
         }
 
         if let Some(prefetch_input) = config_file.prefetch.clone() {
@@ -897,6 +884,16 @@ impl<F: FileSystem> ConfigValidator<F> {
 impl Default for ConfigValidator<RealFileSystem> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn warn_if_credentials_file_missing(path: &std::path::Path) {
+    if !path.is_file() {
+        log::warn!(
+            "Configured credentials_file_path does not exist yet: {}. \
+             The agent will watch for it to appear.",
+            path.display()
+        );
     }
 }
 

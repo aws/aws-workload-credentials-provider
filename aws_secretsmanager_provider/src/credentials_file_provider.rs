@@ -53,7 +53,7 @@ impl FileBasedCredentialsProvider {
         let path = path.into();
         let cached = Arc::new(ArcSwapOption::new(None));
 
-        match load_and_validate(&path).await {
+        match CredentialsLoader::new(&path).load_and_validate().await {
             Ok(creds) => {
                 cached.store(Some(Arc::new(creds)));
                 warn_if_broad_permissions(&path);
@@ -83,15 +83,12 @@ impl FileBasedCredentialsProvider {
                     continue;
                 }
 
-                match load_and_validate(&path).await {
+                match CredentialsLoader::new(&path).load_and_validate().await {
                     Ok(creds) => {
                         reload_cached.store(Some(Arc::new(creds)));
                         last_modified = current_modified;
                         warn_if_broad_permissions(&path);
-                        log::debug!(
-                            "Successfully reloaded credentials from {}",
-                            path.display()
-                        );
+                        log::debug!("Successfully reloaded credentials from {}", path.display());
                     }
                     Err(e) => {
                         log::warn!(
@@ -126,31 +123,41 @@ impl ProvideCredentials for FileBasedCredentialsProvider {
     }
 }
 
-/// Parse credentials from a file and validate they contain a session token.
-async fn load_and_validate(path: &Path) -> Result<Credentials, CredentialsError> {
-    let creds = load_from_file(path).await?;
-
-    if creds.session_token().is_none() {
-        return Err(CredentialsError::provider_error(
-            "Security Policy Violation: Long-term IAM User credentials are not permitted. \
-             The credentials file must contain temporary credentials with an aws_session_token.",
-        ));
-    }
-
-    Ok(creds)
+struct CredentialsLoader<'a> {
+    path: &'a Path,
 }
 
-/// Parse credentials from a file using the AWS SDK's profile file parser.
-async fn load_from_file(path: &Path) -> Result<Credentials, CredentialsError> {
-    let env_config_files = EnvConfigFiles::builder()
-        .with_file(EnvConfigFileKind::Credentials, path)
-        .build();
+impl<'a> CredentialsLoader<'a> {
+    fn new(path: &'a Path) -> Self {
+        Self { path }
+    }
 
-    ProfileFileCredentialsProvider::builder()
-        .profile_files(env_config_files)
-        .build()
-        .provide_credentials()
-        .await
+    /// Parse credentials from the file and validate they contain a session token.
+    async fn load_and_validate(&self) -> Result<Credentials, CredentialsError> {
+        let creds = self.load_from_file().await?;
+
+        if creds.session_token().is_none() {
+            return Err(CredentialsError::provider_error(
+                "Security Policy Violation: Long-term IAM User credentials are not permitted. \
+                 The credentials file must contain temporary credentials with an aws_session_token.",
+            ));
+        }
+
+        Ok(creds)
+    }
+
+    /// Parse credentials from the file using the AWS SDK's profile file parser.
+    async fn load_from_file(&self) -> Result<Credentials, CredentialsError> {
+        let env_config_files = EnvConfigFiles::builder()
+            .with_file(EnvConfigFileKind::Credentials, self.path)
+            .build();
+
+        ProfileFileCredentialsProvider::builder()
+            .profile_files(env_config_files)
+            .build()
+            .provide_credentials()
+            .await
+    }
 }
 
 /// Wrap credentials with an SDK expiry so the SDK knows when to ask again.
@@ -254,7 +261,11 @@ mod tests {
 
         let provider = FileBasedCredentialsProvider::new(tmp.path()).await;
         assert_eq!(
-            provider.provide_credentials().await.unwrap().access_key_id(),
+            provider
+                .provide_credentials()
+                .await
+                .unwrap()
+                .access_key_id(),
             "AKIAIOSFODNN7EXAMPLE"
         );
 
@@ -276,7 +287,11 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(1)).await;
 
         assert_eq!(
-            provider.provide_credentials().await.unwrap().access_key_id(),
+            provider
+                .provide_credentials()
+                .await
+                .unwrap()
+                .access_key_id(),
             "ROTATED_KEY"
         );
     }
@@ -288,7 +303,11 @@ mod tests {
 
         let provider = FileBasedCredentialsProvider::new(tmp.path()).await;
         assert_eq!(
-            provider.provide_credentials().await.unwrap().access_key_id(),
+            provider
+                .provide_credentials()
+                .await
+                .unwrap()
+                .access_key_id(),
             "AKIAIOSFODNN7EXAMPLE"
         );
 
@@ -311,7 +330,11 @@ mod tests {
 
         // Should still have the original valid credentials
         assert_eq!(
-            provider.provide_credentials().await.unwrap().access_key_id(),
+            provider
+                .provide_credentials()
+                .await
+                .unwrap()
+                .access_key_id(),
             "AKIAIOSFODNN7EXAMPLE"
         );
     }
