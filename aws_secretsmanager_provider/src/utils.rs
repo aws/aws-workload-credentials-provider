@@ -125,19 +125,46 @@ pub fn time_out_test() -> Duration {
 #[cfg(not(test))]
 pub async fn validate_and_create_asm_client(
     config: &SecretsManagerConfig,
-) -> Result<SecretsManagerClient, Box<dyn std::error::Error>> {
+) -> Result<(SecretsManagerClient, aws_config::SdkConfig), Box<dyn std::error::Error>> {
     use aws_config::{BehaviorVersion, Region};
     use aws_secretsmanager_caching::error::is_transient_error;
-    let default_config = &aws_config::load_defaults(BehaviorVersion::latest()).await;
-    let mut asm_builder = aws_sdk_secretsmanager::config::Builder::from(default_config)
+
+    use crate::credentials_file_provider::FileBasedCredentialsProvider;
+
+    let mut sdk_config = aws_config::load_defaults(BehaviorVersion::latest()).await;
+
+    // Use file-based credentials if configured.
+    let has_file_provider = if let Some(path) = discover_credentials_file(config) {
+        log::info!("Using file-based credentials from: {}", path.display());
+        let provider = FileBasedCredentialsProvider::new(&path).await;
+        sdk_config = sdk_config
+            .into_builder()
+            .credentials_provider(
+                aws_sdk_secretsmanager::config::SharedCredentialsProvider::new(provider),
+            )
+            .build();
+        true
+    } else {
+        log::info!("No credentials file found, using default SDK credential chain");
+        false
+    };
+
+    let mut asm_builder = aws_sdk_secretsmanager::config::Builder::from(&sdk_config)
         .interceptor(AgentModifierInterceptor);
+
+    #[cfg(debug_assertions)]
+    if std::env::var("SMA_DISABLE_IDENTITY_CACHE").is_ok() {
+        log::info!("Identity caching disabled via SMA_DISABLE_IDENTITY_CACHE");
+        asm_builder = asm_builder
+            .identity_cache(aws_sdk_secretsmanager::config::IdentityCache::no_cache());
+    }
 
     if let Some(ref region) = config.region {
         asm_builder.set_region(Some(Region::new(region.clone())));
     }
 
-    if config.validate_credentials {
-        let mut sts_builder = aws_sdk_sts::config::Builder::from(default_config);
+    if config.validate_credentials && !has_file_provider {
+        let mut sts_builder = aws_sdk_sts::config::Builder::from(&sdk_config);
         if let Some(ref region) = config.region {
             sts_builder.set_region(Some(Region::new(region.clone())));
         }
@@ -148,11 +175,36 @@ pub async fn validate_and_create_asm_client(
             Err(e) if config.ignore_transient_errors && is_transient_error(&e) => (),
             Err(e) => Err(e)?,
         };
+    } else if has_file_provider {
+        log::info!("Skipping STS credential validation for file-based credentials");
     }
 
-    Ok(aws_sdk_secretsmanager::Client::from_conf(
-        asm_builder.build(),
+    Ok((
+        aws_sdk_secretsmanager::Client::from_conf(asm_builder.build()),
+        sdk_config,
     ))
+}
+
+/// Discover a credentials file from explicit config.
+///
+/// Returns the configured credentials file path, if set.
+/// If the configured path does not exist yet, it is still returned — the provider
+/// will start with an empty cache and the background reload will pick up the file
+/// when it appears.
+#[cfg(not(test))]
+fn discover_credentials_file(config: &SecretsManagerConfig) -> Option<std::path::PathBuf> {
+    if let Some(path) = &config.credentials_file_path {
+        if !path.is_file() {
+            log::warn!(
+                "Configured credentials_file_path does not exist yet: {}. \
+                 The agent will watch for it to appear.",
+                path.display()
+            );
+        }
+        return Some(path.clone());
+    }
+
+    None
 }
 
 /// SDK interceptor to append the agent name and version to the User-Agent header for CloudTrail records.

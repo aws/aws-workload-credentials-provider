@@ -153,6 +153,53 @@ ttl_seconds = {}
         }
     }
 
+    /// Start the provider with a custom config and extra environment variables.
+    #[allow(dead_code)]
+    pub async fn start_with_config_content_and_env(
+        port: u16,
+        config_content: &str,
+        extra_env: &[(&str, &str)],
+    ) -> ProviderProcess {
+        let config_path = std::env::temp_dir().join(format!("test_config_{}.toml", port));
+        std::fs::write(&config_path, config_content).expect("Failed to write test config");
+
+        let provider_path = locate_provider_binary();
+
+        let mut cmd = TokioCommand::new(&provider_path);
+        cmd.arg("sm")
+            .arg("start")
+            .arg("--config")
+            .arg(&config_path)
+            .env("AWS_TOKEN", "test-token-123")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+
+        for (key, val) in extra_env {
+            cmd.env(key, val);
+        }
+
+        let mut child = cmd.spawn().expect("Failed to start provider");
+
+        let stdout = child.stdout.take().expect("Failed to get stdout");
+        let mut reader = BufReader::new(stdout).lines();
+
+        match reader.next_line().await {
+            Ok(Some(line)) => {
+                if !line.contains("listening on") {
+                    panic!("Provider failed to start - no listening message found");
+                }
+            }
+            Ok(None) => panic!("Stream ended without finding listening message"),
+            Err(e) => panic!("Failed to read provider output: {}", e),
+        }
+
+        ProviderProcess {
+            _child: child,
+            port,
+        }
+    }
+
     #[allow(dead_code)]
     pub async fn make_request(&self, query: &ProviderQuery) -> String {
         let response = self.make_request_raw(query).await;
