@@ -1,0 +1,52 @@
+#!/bin/bash
+#
+# AWS Workload Credentials Provider Uninstaller
+# Removes SM provider, ACM provider, and all related components.
+#
+
+PATH=/bin:/usr/bin:/sbin:/usr/sbin
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+source "${SCRIPT_DIR}/common.sh"
+
+if [ "$(id -u)" -ne 0 ]; then
+    echo "This script must be run as root" >&2
+    exit 1
+fi
+
+#
+# Stop and disable services
+#
+
+systemctl stop "${ACM_SERVICE}"
+systemctl disable "${ACM_SERVICE}"
+
+systemctl stop "${SM_SERVICE}"
+systemctl disable "${SM_SERVICE}"
+
+systemctl stop "${TOKEN_SCRIPT}"
+systemctl disable "${TOKEN_SCRIPT}"
+
+#
+# Remove unit files
+#
+
+rm -f "${SYSTEMD_FILES}/${TOKEN_SCRIPT}.service"
+rm -f "${SYSTEMD_FILES}/${SM_SERVICE}.service"
+rm -f "${SYSTEMD_FILES}/${ACM_SERVICE}.service"
+
+systemctl daemon-reload
+
+rm -rf "${PROVIDER_DIR}"
+rm -f "/etc/sudoers.d/${PROVIDER_BIN}"
+
+#
+# Remove user and group
+#
+
+userdel "${PROVIDER_USER}"
+groupdel "${TOKEN_GROUP}"
+groupdel "${PROVIDER_GROUP}"
+
+echo "Uninstall complete."
+echo "Note: ${CONFIG_DIR} was preserved. Remove manually if no longer needed."

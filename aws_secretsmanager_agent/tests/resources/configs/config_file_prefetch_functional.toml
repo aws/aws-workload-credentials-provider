@@ -1,8 +1,0 @@
-# Config for prefetch functional tests
-http_port = "0"
-
-[prefetch]
-cache_buffer_ratio = 0.8
-
-[[prefetch.secrets]]
-secret_id = "MyTest"
