@@ -817,7 +817,7 @@ For environments where credentials are delivered to the filesystem — such as o
 
 ### Credentials file format
 
-The credentials file must use the standard AWS credentials file format and must include a session token \(temporary credentials\):
+The credentials file must use the standard AWS credentials file format with a `[default]` profile and must include a session token \(temporary credentials\):
 
 ```
 [default]
@@ -825,6 +825,7 @@ aws_access_key_id = AKIAIOSFODNN7EXAMPLE
 aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
 aws_session_token = IQoJb3JpZ2luX2Vj...
 ```
+
 
 **Important:** The provider enforces a session token gate — credentials without an `aws_session_token` are rejected\. This prevents use of long\-term IAM User credentials\. IAM Roles Anywhere credentials always include a session token\.
 
