@@ -53,10 +53,10 @@ impl FileBasedCredentialsProvider {
         let path = path.into();
         let cached = Arc::new(ArcSwapOption::new(None));
 
-        match CredentialsLoader::new(&path).load_and_validate().await {
+        match Self::load_and_validate(&path).await {
             Ok(creds) => {
                 cached.store(Some(Arc::new(creds)));
-                warn_if_broad_permissions(&path);
+                Self::warn_if_broad_permissions(&path);
                 log::info!("Loaded file-based credentials from: {}", path.display());
             }
             Err(e) => {
@@ -72,22 +72,22 @@ impl FileBasedCredentialsProvider {
 
         let reload_cached = cached.clone();
         let handle = tokio::spawn(async move {
-            let mut last_modified = file_modified_time(&path);
+            let mut last_modified = Self::file_modified_time(&path);
             let mut interval = tokio::time::interval(reload_delay());
             interval.tick().await; // skip immediate first tick
             loop {
                 interval.tick().await;
 
-                let current_modified = file_modified_time(&path);
+                let current_modified = Self::file_modified_time(&path);
                 if current_modified == last_modified {
                     continue;
                 }
 
-                match CredentialsLoader::new(&path).load_and_validate().await {
+                match Self::load_and_validate(&path).await {
                     Ok(creds) => {
                         reload_cached.store(Some(Arc::new(creds)));
                         last_modified = current_modified;
-                        warn_if_broad_permissions(&path);
+                        Self::warn_if_broad_permissions(&path);
                         log::debug!("Successfully reloaded credentials from {}", path.display());
                     }
                     Err(e) => {
@@ -106,35 +106,17 @@ impl FileBasedCredentialsProvider {
             _reload_handle: Arc::new(ReloadHandle(handle)),
         }
     }
-}
 
-impl ProvideCredentials for FileBasedCredentialsProvider {
-    fn provide_credentials<'a>(&'a self) -> future::ProvideCredentials<'a>
-    where
-        Self: 'a,
-    {
-        future::ProvideCredentials::new(async {
-            self.cached
-                .load()
-                .as_ref()
-                .map(|c| with_expiry((**c).clone()))
-                .ok_or_else(|| CredentialsError::not_loaded("No credentials available"))
-        })
-    }
-}
+    async fn load_and_validate<P: Into<PathBuf>>(path: P) -> Result<Credentials, CredentialsError> {
+        let env_config_files = EnvConfigFiles::builder()
+            .with_file(EnvConfigFileKind::Credentials, path)
+            .build();
 
-struct CredentialsLoader<'a> {
-    path: &'a Path,
-}
-
-impl<'a> CredentialsLoader<'a> {
-    fn new(path: &'a Path) -> Self {
-        Self { path }
-    }
-
-    /// Parse credentials from the file and validate they contain a session token.
-    async fn load_and_validate(&self) -> Result<Credentials, CredentialsError> {
-        let creds = self.load_from_file().await?;
+        let creds = ProfileFileCredentialsProvider::builder()
+            .profile_files(env_config_files)
+            .build()
+            .provide_credentials()
+            .await?;
 
         if creds.session_token().is_none() {
             return Err(CredentialsError::provider_error(
@@ -146,53 +128,55 @@ impl<'a> CredentialsLoader<'a> {
         Ok(creds)
     }
 
-    /// Parse credentials from the file using the AWS SDK's profile file parser.
-    async fn load_from_file(&self) -> Result<Credentials, CredentialsError> {
-        let env_config_files = EnvConfigFiles::builder()
-            .with_file(EnvConfigFileKind::Credentials, self.path)
-            .build();
-
-        ProfileFileCredentialsProvider::builder()
-            .profile_files(env_config_files)
-            .build()
-            .provide_credentials()
-            .await
+    /// Wrap credentials with an SDK expiry so the SDK knows when to ask again.
+    fn with_expiry(creds: Credentials) -> Credentials {
+        Credentials::new(
+            creds.access_key_id(),
+            creds.secret_access_key(),
+            creds.session_token().map(|s| s.to_string()),
+            Some(SystemTime::now() + SDK_CREDENTIALS_TTL),
+            "FileBasedCredentialsProvider",
+        )
     }
-}
 
-/// Wrap credentials with an SDK expiry so the SDK knows when to ask again.
-fn with_expiry(creds: Credentials) -> Credentials {
-    Credentials::new(
-        creds.access_key_id(),
-        creds.secret_access_key(),
-        creds.session_token().map(|s| s.to_string()),
-        Some(SystemTime::now() + SDK_CREDENTIALS_TTL),
-        "FileBasedCredentialsProvider",
-    )
-}
+    fn file_modified_time(path: &Path) -> Option<SystemTime> {
+        std::fs::metadata(path).and_then(|m| m.modified()).ok()
+    }
 
-fn file_modified_time(path: &Path) -> Option<SystemTime> {
-    std::fs::metadata(path).and_then(|m| m.modified()).ok()
-}
-
-#[cfg(unix)]
-fn warn_if_broad_permissions(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    if let Ok(metadata) = std::fs::metadata(path) {
-        let mode = metadata.permissions().mode();
-        if mode & 0o077 != 0 {
-            log::warn!(
-                "Credentials file {} has broad permissions ({:o}). \
+    #[cfg(unix)]
+    fn warn_if_broad_permissions(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(metadata) = std::fs::metadata(path) {
+            let mode = metadata.permissions().mode();
+            if mode & 0o077 != 0 {
+                log::warn!(
+                    "Credentials file {} has broad permissions ({:o}). \
                  Consider restricting to owner-only (chmod 600).",
-                path.display(),
-                mode & 0o777
-            );
+                    path.display(),
+                    mode & 0o777
+                );
+            }
         }
     }
+
+    #[cfg(not(unix))]
+    fn warn_if_broad_permissions(_path: &Path) {}
 }
 
-#[cfg(not(unix))]
-fn warn_if_broad_permissions(_path: &Path) {}
+impl ProvideCredentials for FileBasedCredentialsProvider {
+    fn provide_credentials<'a>(&'a self) -> future::ProvideCredentials<'a>
+    where
+        Self: 'a,
+    {
+        future::ProvideCredentials::new(async {
+            self.cached
+                .load()
+                .as_ref()
+                .map(|c| Self::with_expiry((**c).clone()))
+                .ok_or_else(|| CredentialsError::not_loaded("No credentials available"))
+        })
+    }
+}
 
 #[cfg(test)]
 mod tests {
