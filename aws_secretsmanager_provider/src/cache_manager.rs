@@ -43,8 +43,9 @@ use crate::utils::create_role_asm_client;
 impl CacheManager {
     /// Create a new CacheManager.
     pub async fn new(cfg: &SecretsManagerConfig) -> Result<Self, Box<dyn std::error::Error>> {
+        let (client, sdk_config) = asm_client(cfg).await?;
         let default_client = Arc::new(SecretsManagerCachingClient::new(
-            asm_client(cfg).await?,
+            client,
             cfg.cache.cache_size,
             Duration::from_secs(cfg.cache.ttl_seconds as u64),
             cfg.ignore_transient_errors,
@@ -55,7 +56,7 @@ impl CacheManager {
             role_clients: RwLock::new(HashMap::new()),
             config: cfg.clone(),
             #[cfg(not(test))]
-            base_sdk_config: aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await,
+            base_sdk_config: sdk_config,
         })
     }
 
@@ -268,8 +269,9 @@ impl CacheManager {
         &self,
         _role_arn: &str,
     ) -> Result<SecretsManagerCachingClient, Box<dyn std::error::Error>> {
+        let (client, _) = asm_client(&self.config).await?;
         Ok(SecretsManagerCachingClient::new(
-            asm_client(&self.config).await?,
+            client,
             self.config.cache.cache_size,
             Duration::from_secs(self.config.cache.ttl_seconds as u64),
             self.config.ignore_transient_errors,
@@ -424,8 +426,8 @@ pub mod tests {
     // Used to replace the real client with the stub client.
     pub async fn init_client(
         _cfg: &SecretsManagerConfig,
-    ) -> Result<secretsmanager::Client, Box<dyn std::error::Error>> {
-        Ok(CLIENT.with_borrow(|v| v.clone()))
+    ) -> Result<(secretsmanager::Client, ()), Box<dyn std::error::Error>> {
+        Ok((CLIENT.with_borrow(|v| v.clone()), ()))
     }
 
     // Private helper to look at the request and provide the correct response.
