@@ -826,7 +826,6 @@ aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
 aws_session_token = IQoJb3JpZ2luX2Vj...
 ```
 
-
 **Important:** The provider enforces a session token gate — credentials without an `aws_session_token` are rejected\. This prevents use of long\-term IAM User credentials\. IAM Roles Anywhere credentials always include a session token\.
 
 ### Configuration
