@@ -87,6 +87,9 @@ pub struct SecretsManagerConfig {
 
     /// Pre-fetch configuration for warming the cache at startup
     pub prefetch: PrefetchConfig,
+
+    /// Optional path to a credentials file for file-based credential loading
+    pub credentials_file_path: Option<PathBuf>,
 }
 
 impl Default for SecretsManagerConfig {
@@ -103,6 +106,7 @@ impl Default for SecretsManagerConfig {
             ignore_transient_errors: true,
             validate_credentials: true,
             prefetch: PrefetchConfig::default(),
+            credentials_file_path: None,
         }
     }
 }
@@ -299,6 +303,7 @@ pub struct ConfigInput {
     pub validate_credentials: Option<bool>,
     #[serde(default)]
     pub prefetch: Option<PrefetchConfigInput>,
+    pub credentials_file_path: Option<PathBuf>,
 
     // Nested capabilities
     pub capabilities: Option<CapabilitiesConfig>,
@@ -331,6 +336,7 @@ pub struct SecretsManagerConfigInput {
     pub validate_credentials: Option<bool>,
     #[serde(default)]
     pub prefetch: Option<PrefetchConfigInput>,
+    pub credentials_file_path: Option<PathBuf>,
 }
 
 /// Cache configuration in nested format.
