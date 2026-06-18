@@ -222,15 +222,21 @@ role_arn = "{}"
 /// Verify that tag-based prefetch discovers and caches secrets, serving from cache
 #[tokio::test]
 async fn test_prefetch_with_tags_serves_cached_value() {
-    let tag_key = "aws-sm-provider-prefetch-integ-test";
-    let secrets = TestSecrets::setup_tagged(tag_key).await;
+    let tag_key = format!(
+        "aws-sm-provider-prefetch-integ-test-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let secrets = TestSecrets::setup_tagged(&tag_key).await;
     let secret_type = SecretType::Tagged {
         tag_key: tag_key.to_string(),
     };
     let secret_name = secrets.secret_name(&secret_type);
 
     secrets
-        .wait_for_tag(&secret_type, tag_key)
+        .wait_for_tag(&secret_type, &tag_key)
         .await
         .expect("Timed out waiting for tag to propagate on secret");
 
