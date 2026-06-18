@@ -74,24 +74,17 @@ if [ ! -f "${PROVIDER_SOURCE_DIR}/${PROVIDER_BIN}" ]; then
 fi
 
 #
-# User and group setup
+# User, group, and directory permissions
 #
 
-groupadd -f "${PROVIDER_GROUP}"
-groupadd -f "${TOKEN_GROUP}"
-# useradd exits with code 9 if the user already exists — ignore that, but fail on any other error
-useradd -r -M -d "${PROVIDER_DIR}" -s /sbin/nologin -g "${PROVIDER_GROUP}" -G "${TOKEN_GROUP}" "${PROVIDER_USER}" || [ $? -eq 9 ]
+"${SCRIPT_DIR}/setup-permissions.sh"
 
 #
 # File installation
 #
 
-mkdir -p "${PROVIDER_DIR}"
-chmod 755 "${PROVIDER_DIR}"
-
 install -D -T -m 755 "${PROVIDER_SOURCE_DIR}/${PROVIDER_BIN}" "${PROVIDER_DIR}/bin/${PROVIDER_BIN}"
 install -D -T -m 755 "${TOKEN_SCRIPT}" "${PROVIDER_DIR}/bin/${TOKEN_SCRIPT}"
-chown "${PROVIDER_USER}" "${PROVIDER_DIR}"
 
 #
 # Service installation
