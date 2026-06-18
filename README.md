@@ -21,7 +21,10 @@ The Workload Credentials Provider exports certificates from AWS Certificate Mana
 
 The Certificate Management capability supports Linux and Windows, and works with web servers such as NGINX and Apache\.
 
-The Workload Credentials Provider uses the AWS credentials you provide in your environment to assume the role you have configured for each certificate, and then calls ACM to export the certificate\. The install script sets up the necessary permissions for the provider process to write certificate files to customer\-specified directories and execute refresh commands\.
+The Workload Credentials Provider uses the AWS credentials you provide in your environment to assume the role you have configured for each certificate, and then calls ACM to export the certificate\.
+
+**Important**  
+The Certificate Management capability requires elevated permissions for the provider to write certificate files and execute refresh commands\. The `install` script (Linux) or `install.ps1` script (Windows) configures these permissions automatically and is the recommended setup path\. On Linux, if you need to manage specific permissions yourself, use the `--no-privileges` or `--no-sudoers` flags rather than bypassing the install script entirely\. For details on what permissions are configured, see [Security considerations](#workload-credentials-provider-security)\.
 
 You can provide a custom configuration by passing `--config /path/to/config.toml` on startup or on reload while the provider is running\. On Windows, use `-Config C:\path\to\config.toml` when invoking the PowerShell scripts and `--Config C:\path\to\config.toml` when executing the binary command\. The reload re\-applies permissions and restarts the ACM service\.
 
