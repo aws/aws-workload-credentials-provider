@@ -3,11 +3,6 @@ name: Staging
 on:
   workflow_call:
   workflow_dispatch:
-    inputs:
-      version:
-        description: Version number in the pattern x.y.z
-        required: true
-        type: string
 
 env:
   CARGO_TERM_COLOR: always
@@ -19,7 +14,9 @@ permissions:
 jobs:
   integ:
     uses: ./.github/workflows/integration-tests.yml
+    secrets: inherit
   publish:
+    needs: [integ]
     environment: staging
     strategy:
       fail-fast: false
@@ -50,10 +47,10 @@ jobs:
         uses: aws-actions/configure-aws-credentials@99214aa6889fcddfa57764031d71add364327e59 # v6.1.3
         with:
           role-to-assume: ${{ secrets.STAGING_ROLE_ARN }}
-          role-session-name: secrets-manager-agent-staging-${{ github.run_id }}
+          role-session-name: aws-wcp-staging-${{ github.run_id }}
           aws-region: us-west-2
 
       - name: Upload artifacts to S3
         run: |
-          aws s3 cp target/${{ matrix.target }}/aws_secretsmanager_agent \
-            "s3://${{ secrets.STAGING_BUCKET }}/${{ inputs.version }}/${{ matrix.target }}/aws_secretsmanager_agent"
+          aws s3 cp target/${{ matrix.target }}/release/aws-workload-credentials-provider${{ runner.os == 'Windows' && '.exe' || '' }} \
+            "s3://${{ secrets.STAGING_BUCKET }}/${{ github.run_id }}/${{ matrix.target }}/aws-workload-credentials-provider${{ runner.os == 'Windows' && '.exe' || '' }}"

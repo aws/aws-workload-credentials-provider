@@ -16,9 +16,11 @@ permissions:
   id-token: write
 
 jobs:
-  integ:
-    uses: ./.github/workflows/integration-tests.yml
+  staging:
+    uses: ./.github/workflows/staging.yml
+    secrets: inherit
   publish:
+    needs: [staging]
     environment: release
     strategy:
       fail-fast: false
@@ -49,10 +51,10 @@ jobs:
         uses: aws-actions/configure-aws-credentials@99214aa6889fcddfa57764031d71add364327e59 # v6.1.3
         with:
           role-to-assume: ${{ secrets.RELEASE_ROLE_ARN }}
-          role-session-name: secrets-manager-agent-release-${{ github.run_id }}
+          role-session-name: aws-wcp-release-${{ github.run_id }}
           aws-region: us-west-2
 
       - name: Upload artifacts to S3
         run: |
-          aws s3 cp target/${{ matrix.target }}/aws_secretsmanager_agent \
-            "s3://${{ secrets.RELEASE_BUCKET }}/${{ inputs.version }}/${{ matrix.target }}/aws_secretsmanager_agent"
+          aws s3 cp target/${{ matrix.target }}/release/aws-workload-credentials-provider${{ runner.os == 'Windows' && '.exe' || '' }} \
+            "s3://${{ secrets.RELEASE_BUCKET }}/${{ inputs.version }}/${{ matrix.target }}/aws-workload-credentials-provider${{ runner.os == 'Windows' && '.exe' || '' }}"
