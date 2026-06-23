@@ -20,6 +20,7 @@ fi
 
 groupadd -f "${PROVIDER_GROUP}"
 groupadd -f "${TOKEN_GROUP}"
+# useradd exits with code 9 if the user already exists — ignore that, but fail on any other error
 useradd -r -M -d "${PROVIDER_DIR}" -s /sbin/nologin -g "${PROVIDER_GROUP}" -G "${TOKEN_GROUP}" "${PROVIDER_USER}" || [ $? -eq 9 ]
 
 #
