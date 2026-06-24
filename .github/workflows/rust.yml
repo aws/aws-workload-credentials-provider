@@ -28,9 +28,9 @@ jobs:
           egress-policy: audit
 
       - name: Checkout 
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
       - name: Restore cached dependencies
-        uses: actions/cache/restore@v5
+        uses: actions/cache/restore@v6
         id: cache-restore
         with:
           path: |
@@ -52,7 +52,7 @@ jobs:
         uses: ilammy/setup-nasm@v1
       - name: Install Go (macOS)
         if: runner.os == 'macOS'
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: 'stable'
       - name: Install Cargo binaries
@@ -68,7 +68,7 @@ jobs:
       - name: Code Coverage
         run: cargo llvm-cov --all-features --workspace --exclude integration-tests --codecov --output-path ./codecov.json
       - name: Publish Code Coverage
-        uses: codecov/codecov-action@v6
+        uses: codecov/codecov-action@v7
         with:
           files: ./codecov.json
           fail_ci_if_error: true
@@ -78,7 +78,7 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --all-features
       - name: Cache dependencies
-        uses: actions/cache/save@v5
+        uses: actions/cache/save@v6
         if: steps.cache-restore.outputs.cache-hit != 'true'
         with:
           path: |
