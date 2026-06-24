@@ -1,7 +1,7 @@
 //! # Cache Behavior Integration Tests
 //!
-//! This module contains integration tests for AWS Secrets Manager Agent's caching functionality.
-//! These tests verify that the agent correctly caches secrets, respects TTL settings, handles
+//! This module contains integration tests for AWS Secrets Manager Provider's caching functionality.
+//! These tests verify that the provider correctly caches secrets, respects TTL settings, handles
 //! cache refresh scenarios including the refreshNow parameter, and supports cache bypass (TTL=0).
 
 mod common;
@@ -13,16 +13,16 @@ use tokio::time::sleep;
 #[tokio::test]
 async fn test_refresh_now_on_updated_secret_succeeds() {
     let secrets = TestSecrets::setup_basic().await;
-    let secret_name: String = secrets.secret_name(SecretType::Basic);
+    let secret_name: String = secrets.secret_name(&SecretType::Basic);
 
-    let agent = AgentProcess::start().await;
+    let provider = ProviderProcess::start().await;
 
     // First request - populate cache with original value
-    let query = AgentQueryBuilder::default()
+    let query = ProviderQueryBuilder::default()
         .secret_id(&secret_name)
         .build()
         .unwrap();
-    let response1 = agent.make_request(&query).await;
+    let response1 = provider.make_request(&query).await;
     let json1: serde_json::Value = serde_json::from_str(&response1).unwrap();
     let original_secret = json1["SecretString"].as_str().unwrap();
     assert!(original_secret.contains("testuser"));
@@ -48,7 +48,7 @@ async fn test_refresh_now_on_updated_secret_succeeds() {
     sleep(Duration::from_millis(500)).await;
 
     // Second request without refreshNow - should return stale cached value
-    let response2 = agent.make_request(&query).await;
+    let response2 = provider.make_request(&query).await;
     let json2: serde_json::Value = serde_json::from_str(&response2).unwrap();
     let cached_secret = json2["SecretString"].as_str().unwrap();
 
@@ -56,12 +56,12 @@ async fn test_refresh_now_on_updated_secret_succeeds() {
     assert!(cached_secret.contains("testuser"));
 
     // Third request with refreshNow=true - should get fresh value
-    let refresh_query = AgentQueryBuilder::default()
+    let refresh_query = ProviderQueryBuilder::default()
         .secret_id(&secret_name)
         .refresh_now(true)
         .build()
         .unwrap();
-    let response3 = agent.make_request(&refresh_query).await;
+    let response3 = provider.make_request(&refresh_query).await;
     let json3: serde_json::Value = serde_json::from_str(&response3).unwrap();
     let fresh_secret = json3["SecretString"].as_str().unwrap();
 
@@ -77,19 +77,19 @@ async fn test_refresh_now_on_updated_secret_succeeds() {
 #[tokio::test]
 async fn test_cache_expiration_and_refresh() {
     let secrets = TestSecrets::setup_basic().await;
-    let secret_name = secrets.secret_name(SecretType::Basic);
+    let secret_name = secrets.secret_name(&SecretType::Basic);
 
-    // Start agent with short TTL for faster testing
+    // Start provider with short TTL for faster testing
     const TTL_SECONDS: u64 = 5;
-    let agent = AgentProcess::start_with_config(2777, TTL_SECONDS).await;
+    let provider = ProviderProcess::start_with_config(2777, TTL_SECONDS).await;
 
-    let query = AgentQueryBuilder::default()
+    let query = ProviderQueryBuilder::default()
         .secret_id(&secret_name)
         .build()
         .unwrap();
 
     // First request - populate cache
-    let response1 = agent.make_request(&query).await;
+    let response1 = provider.make_request(&query).await;
     let json1: serde_json::Value = serde_json::from_str(&response1).unwrap();
     let version1 = json1["VersionId"].as_str().unwrap();
     assert!(json1["SecretString"].as_str().unwrap().contains("testuser"));
@@ -114,7 +114,7 @@ async fn test_cache_expiration_and_refresh() {
     sleep(Duration::from_millis(500)).await;
 
     // Second request before TTL expires - should still return cached value
-    let response2 = agent.make_request(&query).await;
+    let response2 = provider.make_request(&query).await;
     let json2: serde_json::Value = serde_json::from_str(&response2).unwrap();
     assert_eq!(json2["VersionId"], version1); // Same version as cached
     assert!(json2["SecretString"].as_str().unwrap().contains("testuser"));
@@ -123,7 +123,7 @@ async fn test_cache_expiration_and_refresh() {
     sleep(Duration::from_secs(TTL_SECONDS + 1)).await;
 
     // Third request after TTL expiry - should fetch fresh value from AWS
-    let response3 = agent.make_request(&query).await;
+    let response3 = provider.make_request(&query).await;
     let json3: serde_json::Value = serde_json::from_str(&response3).unwrap();
 
     // Should now have the updated value with new version ID and AWSCURRENT label
@@ -141,19 +141,19 @@ async fn test_cache_expiration_and_refresh() {
 #[tokio::test]
 async fn test_ttl_zero_disables_caching() {
     let secrets = TestSecrets::setup_basic().await;
-    let secret_name = secrets.secret_name(SecretType::Basic);
+    let secret_name = secrets.secret_name(&SecretType::Basic);
 
-    // Start agent with TTL=0 to disable caching
+    // Start provider with TTL=0 to disable caching
     const TTL_SECONDS: u64 = 0;
-    let agent = AgentProcess::start_with_config(2780, TTL_SECONDS).await;
+    let provider = ProviderProcess::start_with_config(2780, TTL_SECONDS).await;
 
-    let query = AgentQueryBuilder::default()
+    let query = ProviderQueryBuilder::default()
         .secret_id(&secret_name)
         .build()
         .unwrap();
 
     // First request - should fetch from AWS
-    let response1 = agent.make_request(&query).await;
+    let response1 = provider.make_request(&query).await;
     let json1: serde_json::Value = serde_json::from_str(&response1).unwrap();
     let version1 = json1["VersionId"].as_str().unwrap();
     assert!(json1["SecretString"].as_str().unwrap().contains("testuser"));
@@ -178,7 +178,7 @@ async fn test_ttl_zero_disables_caching() {
     sleep(Duration::from_millis(500)).await;
 
     // Second request - with TTL=0, should always fetch fresh value from AWS
-    let response2 = agent.make_request(&query).await;
+    let response2 = provider.make_request(&query).await;
     let json2: serde_json::Value = serde_json::from_str(&response2).unwrap();
 
     // Should immediately have the updated value (no caching)

@@ -110,4 +110,4 @@ Please use these community resources for getting help:
 
 * Ask a question on [Stack Overflow](https://stackoverflow.com/) and tag it with [aws-secrets-manager](https://stackoverflow.com/questions/tagged/aws-secrets-manager).
 * Open a support ticket with [AWS Support](https://console.aws.amazon.com/support/home#/)
-* If it turns out that you may have found a bug, or have a feature request, please [open an issue](https://github.com/aws/aws-secretsmanager-agent/issues/new/choose).
+* If it turns out that you may have found a bug, or have a feature request, please [open an issue](https://github.com/aws/aws-workload-credentials-provider/issues/new/choose).

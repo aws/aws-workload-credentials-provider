@@ -33,6 +33,11 @@ jobs:
       PR_NUMBER: ${{ github.event.pull_request.number }}
     
     steps:
+    - name: Harden Runner
+      uses: step-security/harden-runner@v2.19.4
+      with:
+        egress-policy: audit
+
     - name: Remove label
       run: |
         echo "Removing label '$LABEL_NAME' from PR #$PR_NUMBER on repo $REPO" 
@@ -59,13 +64,16 @@ jobs:
       uses: aws-actions/configure-aws-credentials@v6
       with:
         role-to-assume: ${{ secrets.ROLE_ARN }}
-        role-session-name: secrets-manager-agent-ci-${{ github.run_id }}
+        role-session-name: aws-workload-credentials-provider-ci-${{ github.run_id }}
         aws-region: us-west-2
     
-    - name: Build agent binary
+    - name: Build provider binary
       run: cargo build
     
     - name: Run integration tests
+      env:
+        ACM_TEST_ROLE_ARN: ${{ secrets.ACM_TEST_ROLE_ARN }}
+        ACM_TEST_CERTIFICATE_ARN: ${{ secrets.ACM_TEST_CERTIFICATE_ARN }}
       run: |
         cd integration-tests
         cargo test -- --test-threads=1

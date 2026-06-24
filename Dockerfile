@@ -14,6 +14,6 @@ FROM scratch
 WORKDIR /app
 
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
-COPY --from=builder /app/target/release/aws_secretsmanager_agent .
+COPY --from=builder /app/target/release/aws-workload-credentials-provider .
 
-ENTRYPOINT [ "./aws_secretsmanager_agent" ]
+ENTRYPOINT [ "./aws-workload-credentials-provider", "sm", "start" ]

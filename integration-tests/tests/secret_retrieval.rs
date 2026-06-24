@@ -1,7 +1,7 @@
 //! # Secret Retrieval Integration Tests
 //!
-//! This module contains integration tests for AWS Secrets Manager Agent's core secret retrieval functionality.
-//! These tests verify that the agent can correctly fetch different types of secrets using various
+//! This module contains integration tests for AWS Secrets Manager Provider's core secret retrieval functionality.
+//! These tests verify that the provider can correctly fetch different types of secrets using various
 //! identification methods and handle different secret formats.
 
 mod common;
@@ -11,15 +11,15 @@ use common::*;
 #[tokio::test]
 async fn test_secret_retrieval_by_name() {
     let secrets = TestSecrets::setup_basic().await;
-    let secret_name = secrets.secret_name(SecretType::Basic);
+    let secret_name = secrets.secret_name(&SecretType::Basic);
 
-    let agent = AgentProcess::start().await;
+    let provider = ProviderProcess::start().await;
 
-    let query = AgentQueryBuilder::default()
+    let query = ProviderQueryBuilder::default()
         .secret_id(&secret_name)
         .build()
         .unwrap();
-    let response = agent.make_request(&query).await;
+    let response = provider.make_request(&query).await;
     let json: serde_json::Value = serde_json::from_str(&response).unwrap();
 
     assert_eq!(json["Name"], secret_name);
@@ -30,7 +30,7 @@ async fn test_secret_retrieval_by_name() {
 #[tokio::test]
 async fn test_secret_retrieval_by_arn() {
     let secrets = TestSecrets::setup_basic().await;
-    let secret_name = secrets.secret_name(SecretType::Basic);
+    let secret_name = secrets.secret_name(&SecretType::Basic);
 
     // Get the ARN using AWS SDK
     let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
@@ -45,10 +45,13 @@ async fn test_secret_retrieval_by_arn() {
 
     let arn = describe_response.arn().expect("Secret ARN not found");
 
-    let agent = AgentProcess::start().await;
+    let provider = ProviderProcess::start().await;
 
-    let query = AgentQueryBuilder::default().secret_id(arn).build().unwrap();
-    let response = agent.make_request(&query).await;
+    let query = ProviderQueryBuilder::default()
+        .secret_id(arn)
+        .build()
+        .unwrap();
+    let response = provider.make_request(&query).await;
     let json: serde_json::Value = serde_json::from_str(&response).unwrap();
 
     assert_eq!(json["ARN"], arn);
@@ -58,15 +61,15 @@ async fn test_secret_retrieval_by_arn() {
 #[tokio::test]
 async fn test_binary_secret_retrieval() {
     let secrets = TestSecrets::setup_binary().await;
-    let secret_name = secrets.secret_name(SecretType::Binary);
+    let secret_name = secrets.secret_name(&SecretType::Binary);
 
-    let agent = AgentProcess::start().await;
+    let provider = ProviderProcess::start().await;
 
-    let query = AgentQueryBuilder::default()
+    let query = ProviderQueryBuilder::default()
         .secret_id(&secret_name)
         .build()
         .unwrap();
-    let response = agent.make_request(&query).await;
+    let response = provider.make_request(&query).await;
     let json: serde_json::Value = serde_json::from_str(&response).unwrap();
 
     assert_eq!(json["Name"], secret_name);
@@ -77,22 +80,22 @@ async fn test_binary_secret_retrieval() {
 #[tokio::test]
 async fn test_version_stage_retrieval() {
     let secrets = TestSecrets::setup_versioned().await;
-    let secret_name = secrets.secret_name(SecretType::Versioned);
+    let secret_name = secrets.secret_name(&SecretType::Versioned);
 
     // Wait for AWSPENDING version to be available
     let _ = secrets
-        .wait_for_pending_version(SecretType::Versioned)
+        .wait_for_pending_version(&SecretType::Versioned)
         .await;
 
-    let agent = AgentProcess::start().await;
+    let provider = ProviderProcess::start().await;
 
     // Test AWSCURRENT stage (latest version)
-    let current_query = AgentQueryBuilder::default()
+    let current_query = ProviderQueryBuilder::default()
         .secret_id(&secret_name)
         .version_stage("AWSCURRENT")
         .build()
         .unwrap();
-    let current_response = agent.make_request(&current_query).await;
+    let current_response = provider.make_request(&current_query).await;
     let current_json: serde_json::Value = serde_json::from_str(&current_response).unwrap();
 
     assert_eq!(current_json["Name"], secret_name);
@@ -106,12 +109,12 @@ async fn test_version_stage_retrieval() {
         .contains(&serde_json::Value::String("AWSCURRENT".to_string())));
 
     // Test AWSPENDING stage (previous version)
-    let pending_query = AgentQueryBuilder::default()
+    let pending_query = ProviderQueryBuilder::default()
         .secret_id(&secret_name)
         .version_stage("AWSPENDING")
         .build()
         .unwrap();
-    let pending_response = agent.make_request(&pending_query).await;
+    let pending_response = provider.make_request(&pending_query).await;
     let pending_json: serde_json::Value = serde_json::from_str(&pending_response).unwrap();
 
     assert_eq!(pending_json["Name"], secret_name);
@@ -128,26 +131,26 @@ async fn test_version_stage_retrieval() {
 #[tokio::test]
 async fn test_version_id_retrieval() {
     let secrets = TestSecrets::setup_versioned().await;
-    let secret_name = secrets.secret_name(SecretType::Versioned);
+    let secret_name = secrets.secret_name(&SecretType::Versioned);
 
     // Wait for AWSPENDING version to be available
     let _ = secrets
-        .wait_for_pending_version(SecretType::Versioned)
+        .wait_for_pending_version(&SecretType::Versioned)
         .await;
 
     // Get the version IDs for both stages
     let (current_version_id, pending_version_id) =
-        secrets.get_version_ids(SecretType::Versioned).await;
+        secrets.get_version_ids(&SecretType::Versioned).await;
 
-    let agent = AgentProcess::start().await;
+    let provider = ProviderProcess::start().await;
 
     // Test retrieval by AWSCURRENT version ID
-    let current_query = AgentQueryBuilder::default()
+    let current_query = ProviderQueryBuilder::default()
         .secret_id(&secret_name)
         .version_id(&current_version_id)
         .build()
         .unwrap();
-    let current_response = agent.make_request(&current_query).await;
+    let current_response = provider.make_request(&current_query).await;
     let current_json: serde_json::Value = serde_json::from_str(&current_response).unwrap();
 
     assert_eq!(current_json["Name"], secret_name);
@@ -158,12 +161,12 @@ async fn test_version_id_retrieval() {
         .contains("currentuser"));
 
     // Test retrieval by AWSPENDING version ID
-    let pending_query = AgentQueryBuilder::default()
+    let pending_query = ProviderQueryBuilder::default()
         .secret_id(&secret_name)
         .version_id(&pending_version_id)
         .build()
         .unwrap();
-    let pending_response = agent.make_request(&pending_query).await;
+    let pending_response = provider.make_request(&pending_query).await;
     let pending_json: serde_json::Value = serde_json::from_str(&pending_response).unwrap();
 
     assert_eq!(pending_json["Name"], secret_name);
@@ -177,15 +180,15 @@ async fn test_version_id_retrieval() {
 #[tokio::test]
 async fn test_large_secret_retrieval() {
     let secrets = TestSecrets::setup_large().await;
-    let secret_name = secrets.secret_name(SecretType::Large);
+    let secret_name = secrets.secret_name(&SecretType::Large);
 
-    let agent = AgentProcess::start().await;
+    let provider = ProviderProcess::start().await;
 
-    let query = AgentQueryBuilder::default()
+    let query = ProviderQueryBuilder::default()
         .secret_id(&secret_name)
         .build()
         .unwrap();
-    let response = agent.make_request(&query).await;
+    let response = provider.make_request(&query).await;
     let json: serde_json::Value = serde_json::from_str(&response).unwrap();
 
     assert_eq!(json["Name"], secret_name);
@@ -204,7 +207,7 @@ async fn test_large_secret_retrieval() {
 
 #[tokio::test]
 async fn test_real_nonexistent_secret() {
-    let agent = AgentProcess::start().await;
+    let provider = ProviderProcess::start().await;
 
     // Generate a guaranteed non-existent secret name
     let nonexistent_secret = format!(
@@ -215,13 +218,13 @@ async fn test_real_nonexistent_secret() {
             .as_nanos()
     );
 
-    let query = AgentQueryBuilder::default()
+    let query = ProviderQueryBuilder::default()
         .secret_id(&nonexistent_secret)
         .build()
         .unwrap();
 
     // Request non-existent secret - should return proper error response
-    let response = agent.make_request_raw(&query).await;
+    let response = provider.make_request_raw(&query).await;
 
     // Should return 400 status for ResourceNotFoundException
     assert_eq!(response.status(), 400);
@@ -236,13 +239,13 @@ async fn test_real_nonexistent_secret() {
     );
 
     // Test with refreshNow=true - should also fail consistently
-    let refresh_query = AgentQueryBuilder::default()
+    let refresh_query = ProviderQueryBuilder::default()
         .secret_id(&nonexistent_secret)
         .refresh_now(true)
         .build()
         .unwrap();
 
-    let refresh_response = agent.make_request_raw(&refresh_query).await;
+    let refresh_response = provider.make_request_raw(&refresh_query).await;
     assert_eq!(refresh_response.status(), 400);
 
     let refresh_body = refresh_response

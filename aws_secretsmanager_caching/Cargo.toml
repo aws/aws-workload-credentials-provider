@@ -1,11 +1,11 @@
 [package]
 name = "aws_secretsmanager_caching"
-version = "2.0.0"
+version = "2.1.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "The AWS Secrets Manager Rust caching client enables in-process caching of secrets for Rust applications."
-homepage = "https://github.com/aws/aws-secretsmanager-agent/aws_secretsmanager_caching"
-repository = "https://github.com/aws/aws-secretsmanager-agent"
+homepage = "https://github.com/aws/aws-workload-credentials-provider/aws_secretsmanager_caching"
+repository = "https://github.com/aws/aws-workload-credentials-provider"
 readme = "README.md"
 
 [features]
@@ -19,6 +19,7 @@ rt-tokio = ["aws-config/rt-tokio", "aws-sdk-secretsmanager/rt-tokio"]
 rustls = ["aws-sdk-secretsmanager/rustls"]
 sso = ["aws-config/sso"]
 fips = ["rustls/fips"]
+test-util = []
 
 [dependencies]
 aws-sdk-secretsmanager = { version = "1", default-features = false }
@@ -45,8 +46,8 @@ aws-sdk-secretsmanager = { version = "1", default-features = false, features = [
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "test-util"] }
 http = "0"
 tokio-test = "0.4.4"
-criterion = { version = "0.7.0", features = ["async_tokio", "html_reports"] }
-rand = "0.9.2"
+criterion = { version = "0.8.2", features = ["async_tokio", "html_reports"] }
+rand = "0.10.1"
 
 [[bench]]
 name = "benchmark"

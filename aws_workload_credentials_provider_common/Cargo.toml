@@ -1,0 +1,38 @@
+[package]
+name = "aws_workload_credentials_provider_common"
+version = "3.0.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Common library for AWS Workload Credentials Provider configuration validation and shared utilities."
+
+[dependencies]
+chrono = "0.4"
+dunce = "1.0"
+log = "0.4"
+log4rs = { version = "1.2.0", features = ["gzip"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+toml = "1.1.2"
+regex = "1.12.3"
+
+
+[target.'cfg(unix)'.dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+
+[target.'cfg(windows)'.dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = "0.7.18"
+windows = { version = "0.62", features = [
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_Foundation",
+] }
+windows-service = "0.8"
+
+[target.'cfg(windows)'.dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "test-util"] }
+windows = { version = "0.62", features = [
+    "Win32_System_Threading",
+] }
