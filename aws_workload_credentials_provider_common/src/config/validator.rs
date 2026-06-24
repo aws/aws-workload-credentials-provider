@@ -216,6 +216,11 @@ impl<F: FileSystem> ConfigValidator<F> {
             "capabilities.secrets_manager.validate_credentials",
         );
         reject(
+            "credentials_file_path",
+            config_file.credentials_file_path.is_some(),
+            "capabilities.secrets_manager.credentials_file_path",
+        );
+        reject(
             "log_level",
             config_file.log_level.is_some(),
             "logging.log_level",
@@ -380,6 +385,11 @@ impl<F: FileSystem> ConfigValidator<F> {
 
         if let Some(validate_credentials) = secrets_manager_config_input.validate_credentials {
             secrets_manager_config.validate_credentials = validate_credentials;
+        }
+
+        if let Some(path) = secrets_manager_config_input.credentials_file_path {
+            warn_if_credentials_file_missing(&path);
+            secrets_manager_config.credentials_file_path = Some(path);
         }
 
         if let Some(prefetch_input) = secrets_manager_config_input.prefetch {
@@ -613,6 +623,11 @@ impl<F: FileSystem> ConfigValidator<F> {
 
         if let Some(validate_credentials) = config_file.validate_credentials {
             secrets_manager_config.validate_credentials = validate_credentials;
+        }
+
+        if let Some(path) = config_file.credentials_file_path.clone() {
+            warn_if_credentials_file_missing(&path);
+            secrets_manager_config.credentials_file_path = Some(path);
         }
 
         if let Some(prefetch_input) = config_file.prefetch.clone() {
@@ -869,6 +884,16 @@ impl<F: FileSystem> ConfigValidator<F> {
 impl Default for ConfigValidator<RealFileSystem> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn warn_if_credentials_file_missing(path: &std::path::Path) {
+    if !path.is_file() {
+        log::warn!(
+            "Configured credentials_file_path does not exist yet: {}. \
+             The agent will watch for it to appear.",
+            path.display()
+        );
     }
 }
 
