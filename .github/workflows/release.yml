@@ -16,7 +16,19 @@ permissions:
   id-token: write
 
 jobs:
+  validate-version:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate version is semver
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if [[ ! "$VERSION" =~ ^(\d+)\.(\d+)\.(\d+)$ ]]; then
+            echo "::error::Version '$VERSION' is not valid semver (expected x.y.z)"
+            exit 1
+          fi
   staging:
+    needs: [validate-version]
     uses: ./.github/workflows/staging.yml
     secrets: inherit
   publish:
