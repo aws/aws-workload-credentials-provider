@@ -69,6 +69,9 @@ jobs:
               exit 1
             fi
             binary=$(find "$dir" -type f -name 'aws-workload-credentials-provider*')
-            aws s3 cp "$binary" \
-              "s3://${{ secrets.RELEASE_BUCKET }}/${{ inputs.version }}/${target}/$(basename "$binary")"
+            aws s3api put-object \
+              --bucket "${{ secrets.RELEASE_BUCKET }}" \
+              --key "${{ inputs.version }}/${target}/$(basename "$binary")" \
+              --body "$binary" \
+              --if-none-match "*"
           done
