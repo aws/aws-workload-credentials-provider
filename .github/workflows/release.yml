@@ -56,6 +56,10 @@ jobs:
 
       - name: Upload artifacts to S3
         run: |
+          # Each downloaded artifact is a directory named "aws-wcp-<target>"
+          # (e.g. artifacts/aws-wcp-x86_64-unknown-linux-gnu/) containing a
+          # single binary: aws-workload-credentials-provider, or .exe on
+          # Windows. Strip the "artifacts/aws-wcp-" prefix and trailing slash
           for dir in artifacts/aws-wcp-*/; do
             target="${dir#artifacts/aws-wcp-}"
             target="${target%/}"
@@ -64,7 +68,7 @@ jobs:
               echo "::error::Expected exactly one binary for target $target in $dir, found $count"
               exit 1
             fi
-binary=$(find "$dir" -type f -name 'aws-workload-credentials-provider*')
+            binary=$(find "$dir" -type f -name 'aws-workload-credentials-provider*')
             aws s3 cp "$binary" \
               "s3://${{ secrets.RELEASE_BUCKET }}/${{ inputs.version }}/${target}/$(basename "$binary")"
           done
