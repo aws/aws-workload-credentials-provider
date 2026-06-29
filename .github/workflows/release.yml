@@ -59,11 +59,12 @@ jobs:
           for dir in artifacts/aws-wcp-*/; do
             target="${dir#artifacts/aws-wcp-}"
             target="${target%/}"
-            binary=$(find "$dir" -type f -name 'aws-workload-credentials-provider*' -print -quit)
-            if [[ -z "$binary" ]]; then
-              echo "::error::No binary found for target $target in $dir"
+            count=$(find "$dir" -type f -name 'aws-workload-credentials-provider*' | wc -l)
+            if [[ "$count" -ne 1 ]]; then
+              echo "::error::Expected exactly one binary for target $target in $dir, found $count"
               exit 1
             fi
+binary=$(find "$dir" -type f -name 'aws-workload-credentials-provider*')
             aws s3 cp "$binary" \
               "s3://${{ secrets.RELEASE_BUCKET }}/${{ inputs.version }}/${target}/$(basename "$binary")"
           done
