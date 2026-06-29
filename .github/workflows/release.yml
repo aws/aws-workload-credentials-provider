@@ -1,0 +1,77 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version number in the pattern x.y.z
+        required: true
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  validate-version:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate version is semver
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Version '$VERSION' is not valid semver (expected x.y.z)"
+            exit 1
+          fi
+  staging:
+    needs: [validate-version]
+    uses: ./.github/workflows/staging.yml
+    secrets: inherit
+  publish:
+    needs: [staging]
+    environment: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - name: Download binary artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: aws-wcp-*
+          path: artifacts
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@99214aa6889fcddfa57764031d71add364327e59 # v6.1.3
+        with:
+          role-to-assume: ${{ secrets.RELEASE_ROLE_ARN }}
+          role-session-name: aws-wcp-release-${{ github.run_id }}
+          aws-region: us-west-2
+
+      - name: Upload artifacts to S3
+        run: |
+          # Each downloaded artifact is a directory named "aws-wcp-<target>"
+          # (e.g. artifacts/aws-wcp-x86_64-unknown-linux-gnu/) containing a
+          # single binary: aws-workload-credentials-provider, or .exe on
+          # Windows. Strip the "artifacts/aws-wcp-" prefix and trailing slash
+          for dir in artifacts/aws-wcp-*/; do
+            target="${dir#artifacts/aws-wcp-}"
+            target="${target%/}"
+            count=$(find "$dir" -type f -name 'aws-workload-credentials-provider*' | wc -l)
+            if [[ "$count" -ne 1 ]]; then
+              echo "::error::Expected exactly one binary for target $target in $dir, found $count"
+              exit 1
+            fi
+            binary=$(find "$dir" -type f -name 'aws-workload-credentials-provider*')
+            aws s3api put-object \
+              --bucket "${{ secrets.RELEASE_BUCKET }}" \
+              --key "${{ inputs.version }}/${target}/$(basename "$binary")" \
+              --body "$binary" \
+              --if-none-match "*"
+          done
