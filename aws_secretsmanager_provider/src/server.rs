@@ -14,6 +14,7 @@ use crate::error::HttpError;
 use crate::parse::GSVQuery;
 use crate::utils::{get_token, time_out};
 use aws_workload_credentials_provider_common::config::types::ValidatedConfig;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 /// Handle incoming HTTP requests.
@@ -73,14 +74,14 @@ impl Server {
     ///
     /// * `std::io::Error` - Error while accepting request.
     pub async fn serve_request(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let (stream, _) = self.listener.accept().await?;
+        let (stream, peer_addr) = self.listener.accept().await?;
         stream.set_ttl(1)?; // Prohibit network hops
         let io = TokioIo::new(stream);
         let svr_clone = self.clone();
         let rq_cnt = Arc::strong_count(&self.cache_mgr); // concurrent request count
         tokio::task::spawn(async move {
             let svc_fn = service_fn(|req: Request<IncomingBody>| async {
-                svr_clone.complete_req(req, rq_cnt).await
+                svr_clone.complete_req(req, rq_cnt, peer_addr).await
             });
             let mut http = http1::Builder::new();
             let http = http.max_buf_size(MAX_BUF_BYTES);
@@ -108,8 +109,9 @@ impl Server {
         &self,
         req: Request<IncomingBody>,
         count: usize,
+        peer_addr: SocketAddr,
     ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-        let result = self.get_result(&req, count).await;
+        let result = self.get_result(&req, count, peer_addr).await;
 
         // Format the response.
         match result {
@@ -139,9 +141,10 @@ impl Server {
         &self,
         req: &Request<IncomingBody>,
         count: usize,
+        peer_addr: SocketAddr,
     ) -> Result<String, HttpError> {
         self.validate_max_conn(req, count)?; // Verify connection limits are not exceeded
-        self.validate_token(req)?; // Check for a valid SSRF token
+        self.validate_token(req, peer_addr)?; // Check for a valid SSRF token
         self.validate_method(req)?; // Allow only GET requests
 
         match req.uri().path() {
@@ -219,34 +222,61 @@ impl Server {
     /// # Arguments
     ///
     /// * `req` - The incoming HTTP request.
+    /// * `peer_addr` - The socket address of the connecting client.
     ///
     /// # Returns
     ///
-    /// * `Ok(String)` - The value of the secret.
-    /// * `Err((u16, String))` - The error code and message.
     /// * `Ok(())` - For health checks or when the request has the correct token.
     /// * `Err((u16, String))` - A 400 or 403 error code (if header is set or token is missing or wrong) and error message.
     #[doc(hidden)]
-    fn validate_token(&self, req: &Request<IncomingBody>) -> Result<(), HttpError> {
+    fn validate_token(
+        &self,
+        req: &Request<IncomingBody>,
+        peer_addr: SocketAddr,
+    ) -> Result<(), HttpError> {
         if req.uri().path() == "/ping" {
             return Ok(());
         }
 
-        // Prohibit forwarding.
         let headers = req.headers();
+        let method = req.method();
+        let path = req.uri().path();
+
+        // Prohibit forwarding — indicates a proxied request (potential SSRF).
         if headers.contains_key("X-Forwarded-For") {
-            error!("Rejecting request with X-Forwarded-For header");
+            error!(
+                "SSRF rejection: X-Forwarded-For header present; \
+                 peer={}, method={}, path={}",
+                peer_addr, method, path
+            );
             return Err(HttpError(400, "Forwarded".into()));
         }
 
-        // Iterate through the headers looking for our token
+        // Check configured SSRF headers for a matching token.
+        let mut token_header_present = false;
         for header in self.ssrf_headers.iter() {
-            if headers.contains_key(header) && headers[header] == self.ssrf_token.as_str() {
-                return Ok(());
+            if headers.contains_key(header) {
+                token_header_present = true;
+                if headers[header] == self.ssrf_token.as_str() {
+                    return Ok(());
+                }
             }
         }
 
-        error!("Rejecting request with incorrect SSRF token");
+        if token_header_present {
+            error!(
+                "SSRF rejection: token value mismatch; \
+                 peer={}, method={}, path={}",
+                peer_addr, method, path
+            );
+        } else {
+            error!(
+                "SSRF rejection: no recognized token header present; \
+                 peer={}, method={}, path={}",
+                peer_addr, method, path
+            );
+        }
+
         Err(HttpError(403, "Bad Token".into()))
     }
 
