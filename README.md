@@ -814,9 +814,17 @@ sudo ./aws-workload-credentials-provider acm reload --config /path/to/config.tom
 
 ## File-based credentials
 
-By default, the Workload Credentials Provider uses the [AWS SDK default credential provider chain](https://docs.aws.amazon.com/sdk-for-rust/latest/dg/credproviders.html) to authenticate with Secrets Manager\. This works well on Amazon EC2 \(via IMDS\), Lambda, and ECS/EKS \(via container credentials\)\.
+By default, the Workload Credentials Provider uses the [AWS SDK default credential provider chain](https://docs.aws.amazon.com/sdk-for-rust/latest/dg/credproviders.html) to authenticate with Secrets Manager\. In this default mode, the SDK obtains credentials from the environment on its own \(IMDS on EC2, container credentials on ECS/EKS, environment variables, etc\.\)\.
 
-For environments where credentials are delivered to the filesystem — such as on\-premises or multicloud hosts using [IAM Roles Anywhere](https://docs.aws.amazon.com/rolesanywhere/latest/userguide/introduction.html) — you can configure the provider to read credentials from a file\. The IAM Roles Anywhere credential helper's `update` command writes rotating temporary credentials to the standard AWS credentials file, and the provider automatically picks up refreshed credentials without requiring a restart\.
+For environments where credentials are delivered to the filesystem — such as on\-premises or multicloud hosts using [IAM Roles Anywhere](https://docs.aws.amazon.com/rolesanywhere/latest/userguide/introduction.html) — the provider supports an alternative model: **it reads credentials from a file and supplies them to the AWS SDK**, rather than relying on the SDK's built\-in credential resolution\. The IAM Roles Anywhere credential helper's `update` command writes rotating temporary credentials to the standard AWS credentials file, and the provider automatically picks up refreshed credentials without requiring a restart\.
+
+The credential flow is:
+
+```
+Credentials file (on disk) → Workload Credentials Provider → AWS SDK → Secrets Manager
+```
+
+This differs from the default SDK behavior where the SDK resolves credentials on its own\. Here, the SDK delegates credential resolution to the Workload Credentials Provider's file\-based credential provider, which monitors the file for changes and handles renewal\.
 
 ### Credentials file format
 
@@ -829,7 +837,7 @@ aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
 aws_session_token = IQoJb3JpZ2luX2Vj...
 ```
 
-**Important:** The provider enforces a session token gate — credentials without an `aws_session_token` are rejected\. This prevents use of long\-term IAM User credentials\. IAM Roles Anywhere credentials always include a session token\.
+**Important:** The provider enforces a session token gate — credentials without an `aws_session_token` are rejected\. This ensures only temporary credentials \(such as those issued by IAM Roles Anywhere or STS\) can be used via the file path, preventing accidental use of long\-term IAM User access keys\. IAM Roles Anywhere credentials always include a session token\.
 
 ### Configuration
 
@@ -856,7 +864,7 @@ The provider automatically detects and re\-reads updated credentials from the fi
 + When the file's modification time changes, the provider reloads the credentials\.
 + After every load or reload, the provider validates that `aws_session_token` is present\. If absent, the credentials are rejected and previously cached valid credentials are retained\.
 + If the file is missing or malformed during a reload, the provider continues using the previously cached credentials and retries on the next cycle\.
-+ Credentials are served to the AWS SDK with a 10\-minute expiry window, ensuring the SDK periodically requests fresh credentials from the provider\.
++ Each time the AWS SDK needs credentials to sign a request to Secrets Manager, it calls back into the file\-based credential provider, which returns the latest valid credentials loaded from disk\. The provider attaches a 10\-minute expiry to these credentials, ensuring the SDK does not cache them indefinitely and periodically re\-requests them — picking up any rotated credentials that were reloaded from the file\.
 
 ### Startup behavior
 
@@ -980,4 +988,4 @@ The integration tests are organized into the following modules:
 - **`role_chaining.rs`** - Tests cross\-account secret retrieval via IAM role assumption, including invalid role ARN handling, access denied scenarios, refreshNow with role chaining, and separate per\-role cache isolation
 - **`prefetch.rs`** - Tests pre\-fetching secrets into the cache at startup, including explicit secrets, tag\-based discovery, inline TOML syntax, cross\-account pre\-fetching via role chaining, and resilience to nonexistent secrets
 - **`certificate_provider.rs`** - Tests the Certificate Management capability including certificate export, file writing, fullchain mode, refresh command execution, and file permission configuration
-- **`file_credentials.rs`** - Tests file\-based credential loading including valid/invalid/missing credentials, session token gate enforcement, self\-healing \(credentials appearing after startup\), and credential rotation
+- **`file_credentials.rs`** - Tests file\-based credential loading including valid/invalid/missing credentials, session token gate enforcement \(rejecting credentials that lack `aws_session_token` to prevent use of long\-term IAM User keys\), self\-healing \(credentials appearing after startup\), and credential rotation
