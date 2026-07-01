@@ -24,7 +24,7 @@ jobs:
           egress-policy: audit
 
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Log toolchain versions
         run: rustup --version && rustc --version && cargo --version
@@ -34,7 +34,7 @@ jobs:
         run: cargo bench --bench benchmark -- --output-format bencher | tee ../bench-result.txt
 
       - name: Download previous benchmark data
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ./cache
           key: benchmark-${{ runner.os }}-${{ github.run_id }}
