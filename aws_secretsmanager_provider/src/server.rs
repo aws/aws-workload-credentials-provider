@@ -245,7 +245,7 @@ impl Server {
         // Prohibit forwarding — indicates a proxied request (potential SSRF).
         if headers.contains_key("X-Forwarded-For") {
             error!(
-                "SSRF rejection: X-Forwarded-For header present; \
+                "Rejecting request with X-Forwarded-For header; \
                  peer={}, method={}, path={}",
                 peer_addr, method, path
             );
@@ -265,14 +265,14 @@ impl Server {
 
         if token_header_present {
             error!(
-                "SSRF rejection: token value mismatch; \
-                 peer={}, method={}, path={}",
+                "Rejecting request with incorrect SSRF token; \
+                 reason=token_mismatch, peer={}, method={}, path={}",
                 peer_addr, method, path
             );
         } else {
             error!(
-                "SSRF rejection: no recognized token header present; \
-                 peer={}, method={}, path={}",
+                "Rejecting request with incorrect SSRF token; \
+                 reason=missing_header, peer={}, method={}, path={}",
                 peer_addr, method, path
             );
         }
