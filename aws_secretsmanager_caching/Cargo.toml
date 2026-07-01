@@ -9,11 +9,20 @@ repository = "https://github.com/aws/aws-workload-credentials-provider"
 readme = "README.md"
 
 [features]
+default = ["rustls", "default-https-client", "rt-tokio", "credentials-process", "sso"]
+credentials-process = ["aws-config/credentials-process"]
+default-https-client = [
+    "aws-config/default-https-client",
+    "aws-sdk-secretsmanager/default-https-client",
+]
+rt-tokio = ["aws-config/rt-tokio", "aws-sdk-secretsmanager/rt-tokio"]
+rustls = ["aws-sdk-secretsmanager/rustls"]
+sso = ["aws-config/sso"]
 fips = ["rustls/fips"]
 test-util = []
 
 [dependencies]
-aws-sdk-secretsmanager = "1"
+aws-sdk-secretsmanager = { version = "1", default-features = false }
 aws-smithy-runtime-api = "1"
 aws-smithy-types = "1"
 serde_json = "1"
@@ -22,14 +31,18 @@ serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
 linked-hash-map = "0.5.6"
-aws-config = "1"
+aws-config = { version = "1", default-features = false }
 rustls = "0.23"
 log = "0.4.29"
 
 [dev-dependencies]
 aws-smithy-mocks = "0.2"
 aws-smithy-runtime = { version = "1", features = ["test-util", "wire-mock"] }
-aws-sdk-secretsmanager = { version = "1", features = ["test-util"] }
+aws-sdk-secretsmanager = { version = "1", default-features = false, features = [
+    "test-util",
+    "default-https-client",
+    "rt-tokio",
+] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "test-util"] }
 http = "0"
 tokio-test = "0.4.4"
