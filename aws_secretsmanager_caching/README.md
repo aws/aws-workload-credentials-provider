@@ -25,6 +25,34 @@ cargo add tokio -F rt-multi-thread,net,macros
 cargo add aws_secretsmanager_caching
 ```
 
+By default, this crate enables `rustls`, `default-https-client`, `rt-tokio`,
+`credentials-process`, and `sso`. The `rustls` feature is a backwards-compatible
+alias for `aws-sdk-secretsmanager/rustls`, which wires the legacy Smithy TLS
+stack (`aws-smithy-runtime/tls-rustls`) with rustls 0.21.
+
+`default-https` and `fips` skip that feature and enable `default-https-client`
+on `aws-config` and `aws-sdk-secretsmanager` instead. That turns on Smithy's
+default HTTPS client (`aws-smithy-http-client`), which uses rustls 0.23.
+`fips` additionally pulls in this crate's `rustls-crypto` dependency to install
+the FIPS crypto provider on that rustls 0.23 stack.
+
+Use `default-https` when you want to disable this crate's defaults and pick only
+the credential-provider features you need:
+
+```toml
+aws_secretsmanager_caching = { version = "2.2", default-features = false, features = [
+    "default-https",
+    "credentials-process",
+    "sso",
+] }
+```
+
+For FIPS, enable `fips` (includes `default-https`):
+
+```toml
+aws_secretsmanager_caching = { version = "2.2", default-features = false, features = ["fips"] }
+```
+
 ```rust
 use aws_secretsmanager_caching::SecretsManagerCachingClient;
 use std::num::NonZeroUsize;

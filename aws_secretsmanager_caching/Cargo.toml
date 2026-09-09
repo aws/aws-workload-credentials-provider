@@ -1,6 +1,6 @@
 [package]
 name = "aws_secretsmanager_caching"
-version = "2.1.0"
+version = "2.2.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "The AWS Secrets Manager Rust caching client enables in-process caching of secrets for Rust applications."
@@ -9,11 +9,21 @@ repository = "https://github.com/aws/aws-workload-credentials-provider"
 readme = "README.md"
 
 [features]
-fips = ["rustls/fips"]
+default = ["rustls", "default-https-client", "rt-tokio", "credentials-process", "sso"]
+credentials-process = ["aws-config/credentials-process"]
+default-https-client = [
+    "aws-config/default-https-client",
+    "aws-sdk-secretsmanager/default-https-client",
+]
+rt-tokio = ["aws-config/rt-tokio", "aws-sdk-secretsmanager/rt-tokio"]
+default-https = ["default-https-client", "rt-tokio"]
+rustls = ["aws-sdk-secretsmanager/rustls"]
+sso = ["aws-config/sso"]
+fips = ["dep:rustls-crypto", "rustls-crypto/fips", "default-https"]
 test-util = []
 
 [dependencies]
-aws-sdk-secretsmanager = "1"
+aws-sdk-secretsmanager = { version = "1", default-features = false }
 aws-smithy-runtime-api = "1"
 aws-smithy-types = "1"
 serde_json = "1"
@@ -22,14 +32,18 @@ serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
 linked-hash-map = "0.5.6"
-aws-config = "1"
-rustls = "0.23"
+aws-config = { version = "1", default-features = false }
+rustls-crypto = { package = "rustls", version = "0.23", optional = true }
 log = "0.4.29"
 
 [dev-dependencies]
 aws-smithy-mocks = "0.2"
 aws-smithy-runtime = { version = "1", features = ["test-util", "wire-mock"] }
-aws-sdk-secretsmanager = { version = "1", features = ["test-util"] }
+aws-sdk-secretsmanager = { version = "1", default-features = false, features = [
+    "test-util",
+    "default-https-client",
+    "rt-tokio",
+] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "test-util"] }
 http = "0"
 tokio-test = "0.4.4"
