@@ -774,6 +774,7 @@ dependencies = [
 name = "aws_workload_credentials_provider_common"
 version = "3.1.1"
 dependencies = [
+ "aws-smithy-types",
  "chrono",
  "dunce",
  "log",

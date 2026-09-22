@@ -35,6 +35,15 @@ pub(crate) fn classify_export_error(
     e: SdkError<ExportCertificateError, HttpResponse>,
 ) -> AcmManagerError {
     let summary = summarize_sdk_error(&e);
+    // Distinct, actionable log when the per-attempt SDK operation timeout fires
+    // (surfaces as SdkError::TimeoutError, distinct from a connect-level
+    // DispatchFailure). Warning+ so it reaches on-call, not just debug.
+    if matches!(e, SdkError::TimeoutError(_)) {
+        log::warn!(
+            "ACM ExportCertificate exceeded the per-attempt SDK operation timeout \
+             (SMA_ACM_OP_TIMEOUT); treating as transient and retrying"
+        );
+    }
     if is_transient_error(&e)
         || matches!(
             e.as_service_error(),

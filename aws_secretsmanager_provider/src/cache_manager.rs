@@ -7,7 +7,7 @@ use aws_secretsmanager_caching::SecretsManagerCachingClient;
 use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
 use aws_smithy_runtime_api::client::result::SdkError;
 use aws_workload_credentials_provider_common::config::types::SecretsManagerConfig;
-use log::{error, info};
+use log::{error, info, warn};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -309,9 +309,15 @@ where
     let err_meta = match sdk_err {
         SdkError::ServiceError(serr) => serr.err().meta(),
         SdkError::DispatchFailure(derr) if derr.is_timeout() => {
+            warn!("Secrets Manager request exceeded the per-attempt SDK timeout (connect-level); returning 504");
             return Ok(("TimeoutError".into(), "Timeout".into(), 504));
         }
         SdkError::TimeoutError(_) => {
+            warn!(
+                "Secrets Manager request exceeded the per-attempt SDK operation timeout \
+                 (SMA_SM_OP_TIMEOUT, default {}s); returning 504",
+                crate::constants::SDK_OP_ATTEMPT_TIMEOUT.as_secs()
+            );
             return Ok(("TimeoutError".into(), "Timeout".into(), 504));
         }
         SdkError::DispatchFailure(derr) if derr.is_io() => {
@@ -579,7 +585,15 @@ pub mod tests {
     }
 
     // Test client that makes all Secrets Manager calls time out.
+    //
+    // Wired the same way production is: a NeverClient (never responds) behind
+    // the shared per-attempt `op_timeout_config` helper, with retries disabled
+    // so the client aborts at a single attempt's timeout instead of retrying.
+    // This lets fetch-level tests assert the SDK bound fires on TIMING.
     pub fn timeout_client() -> secretsmanager::Client {
+        use aws_smithy_types::retry::RetryConfig;
+        use aws_workload_credentials_provider_common::sdk_timeout::op_timeout_config;
+
         let fake_creds = secretsmanager::config::Credentials::new(
             "AKIDTESTKEY",
             "astestsecretkey",
@@ -593,6 +607,11 @@ pub mod tests {
                 .behavior_version(BehaviorVersion::latest())
                 .credentials_provider(fake_creds)
                 .region(secretsmanager::config::Region::new("us-west-2"))
+                .timeout_config(op_timeout_config(
+                    "SMA_SM_OP_TIMEOUT",
+                    crate::constants::SDK_OP_ATTEMPT_TIMEOUT,
+                ))
+                .retry_config(RetryConfig::disabled())
                 .http_client(NeverClient::new())
                 .build(),
         )
@@ -618,6 +637,40 @@ pub mod tests {
         // Verify no role clients were created
         let clients = cm.role_clients.read().await;
         assert_eq!(clients.len(), 0);
+    }
+
+    // Verify a hung Secrets Manager response is bounded by the per-attempt SDK
+    // operation timeout wired via `op_timeout_config` (rather than hanging until
+    // the inbound-server wrapper). Asserts on TIMING — the fetch returns well
+    // under the 10s test-`time_out` deadline — plus the body carries the
+    // "TimeoutError" code. (Status alone can't discriminate: fetch maps a
+    // TimeoutError to HttpError(504), the same numeric code the server wrapper
+    // emits; timing is what proves the SDK bound fired.)
+    #[tokio::test]
+    async fn test_fetch_bounded_by_op_timeout() {
+        set_client(timeout_client());
+        let config = SecretsManagerConfig::default();
+        let cm = cache_manager_with_config(&config).await;
+
+        let start = std::time::Instant::now();
+        let result = cm.fetch("MySecret", None, None, false, None).await;
+        let elapsed = start.elapsed();
+
+        let err = result.expect_err("expected a timeout error");
+        assert_eq!(err.0, 504, "timeout should surface as HTTP 504");
+        let body: Value = serde_json::from_str(&err.1).unwrap();
+        assert_eq!(body["__type"], "TimeoutError");
+
+        // The per-attempt timeout (SDK_OP_ATTEMPT_TIMEOUT, retries disabled) must
+        // fire far under the 10s test deadline. Generous upper bound to avoid CI
+        // flakiness; stays valid as long as the tier is < ~4s.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "fetch should abort at the op timeout, took {elapsed:?}"
+        );
+
+        // Restore the default client so later tests in this thread aren't affected.
+        set_client(def_fake_client());
     }
 
     // Verify the role client is cached and reused on subsequent requests.

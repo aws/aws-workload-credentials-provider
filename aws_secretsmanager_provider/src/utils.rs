@@ -128,10 +128,27 @@ pub async fn validate_and_create_asm_client(
 ) -> Result<(SecretsManagerClient, aws_config::SdkConfig), Box<dyn std::error::Error>> {
     use aws_config::{BehaviorVersion, Region};
     use aws_secretsmanager_caching::error::is_transient_error;
+    use aws_workload_credentials_provider_common::sdk_timeout::op_timeout_config;
 
+    use crate::constants::SDK_OP_ATTEMPT_TIMEOUT;
     use crate::credentials_file_provider::FileBasedCredentialsProvider;
 
     let mut sdk_config = aws_config::load_defaults(BehaviorVersion::latest()).await;
+
+    // Bound every SM/STS call with a per-attempt operation timeout so a hung
+    // service response can't stall a secret fetch. Reuse the existing `mut`
+    // binding (no `let`-shadow — that would break the reassignment below).
+    // This one edit covers both the direct path (asm/sts builders below, each
+    // `Builder::from(&sdk_config)`) and the per-role path
+    // (`create_role_asm_client(base_config)`), which derive their configs from
+    // this `sdk_config`.
+    sdk_config = sdk_config
+        .into_builder()
+        .timeout_config(op_timeout_config(
+            "SMA_SM_OP_TIMEOUT",
+            SDK_OP_ATTEMPT_TIMEOUT,
+        ))
+        .build();
 
     // Use file-based credentials if configured.
     let has_file_provider = if let Some(path) = discover_credentials_file(config) {
