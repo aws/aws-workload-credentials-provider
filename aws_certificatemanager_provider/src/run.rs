@@ -5,16 +5,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aws_config::BehaviorVersion;
-use aws_workload_credentials_provider_common::sdk_timeout::op_timeout_config;
+use aws_workload_credentials_provider_common::sdk_timeout::with_op_timeout;
 use log::info;
 use tokio_util::sync::CancellationToken;
-
-/// Per-attempt SDK operation timeout for ACM `ExportCertificate` / inline
-/// STS AssumeRole calls. Slow tier (ExportCertificate p99 ~193ms → ~5x headroom),
-/// with extra margin for cold-connection TLS setup. Note: exceeds the SDK's 3.1s
-/// default connect timeout, which still bounds TCP connect as a tighter sub-limit.
-/// Overridable at startup via the SMA_ACM_OP_TIMEOUT env var (seconds).
-const ACM_SDK_OP_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 
 use crate::acm_manager::AcmManager;
 use crate::certificate_file_store::certificate_store::CertificateFileStore;
@@ -24,6 +17,11 @@ use aws_workload_credentials_provider_common::config::types::AcmConfig;
 use aws_workload_credentials_provider_common::filesystem::RealFileSystem;
 #[cfg(unix)]
 use aws_workload_credentials_provider_common::shutdown_signal;
+
+/// Per-attempt SDK operation timeout for ACM `ExportCertificate` / inline
+/// STS AssumeRole calls. Slow tier: well above cross-region ExportCertificate
+/// latency. The SDK's 3.1s default connect timeout still bounds TCP connect.
+pub(crate) const ACM_SDK_OP_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Runs the ACM certificate refresh loop until SIGINT/SIGTERM.
 ///
@@ -59,17 +57,12 @@ pub async fn acm_workload(
     info!("Initializing ACM provider");
 
     // Bound every ACM/STS call with a per-attempt operation timeout so a hung
-    // service response can't stall a certificate refresh (→ cert expiry). This
-    // config flows into AcmManager's per-role `Builder::from(base_sdk_config)`
-    // / `.configure(base_config)` clients, covering ACM ExportCertificate and
-    // the inline AssumeRole.
-    let sdk_config = aws_config::defaults(BehaviorVersion::latest())
-        .timeout_config(op_timeout_config(
-            "SMA_ACM_OP_TIMEOUT",
-            ACM_SDK_OP_ATTEMPT_TIMEOUT,
-        ))
-        .load()
-        .await;
+    // service response can't stall a certificate refresh (→ cert expiry).
+    // Applies to every client built from this config.
+    let sdk_config = with_op_timeout(
+        aws_config::load_defaults(BehaviorVersion::latest()).await,
+        ACM_SDK_OP_ATTEMPT_TIMEOUT,
+    );
 
     let role_arns = acm_config
         .certificates

@@ -10,9 +10,7 @@ pub const MAX_REQ_TIME_SEC: u64 = 61;
 pub const MAX_BUF_BYTES: usize = (65 + 256) * 1024; // 321 KB
 
 // Per-attempt SDK operation timeout for Secrets Manager / STS AssumeRole calls.
-// Fast tier. Sized off cross-region latency: the worst legitimate case is a cold
-// connection to a distant region (GetSecretValue cold p99 ~757ms / max ~800ms,
-// dominated by TLS setup); warm is <~280ms everywhere. 2s gives ~2.5x over the
-// cold max, with room for farther regions.
-// Overridable at startup via the SMA_SM_OP_TIMEOUT env var (seconds).
+// Fast tier: covers a new connection to a distant region, even for a max-size
+// secret. A large prefetch batch can exceed it; those secrets are then fetched
+// individually on first request.
 pub const SDK_OP_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);

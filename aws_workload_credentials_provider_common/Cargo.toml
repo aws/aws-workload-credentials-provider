@@ -7,6 +7,7 @@ description = "Common library for AWS Workload Credentials Provider configuratio
 
 [dependencies]
 aws-smithy-types = "1"
+aws-types = "1"
 chrono = "0.4"
 dunce = "1.0"
 log = "0.4"

@@ -309,13 +309,16 @@ where
     let err_meta = match sdk_err {
         SdkError::ServiceError(serr) => serr.err().meta(),
         SdkError::DispatchFailure(derr) if derr.is_timeout() => {
-            warn!("Secrets Manager request exceeded the per-attempt SDK timeout (connect-level); returning 504");
+            // Connector-level timeout (connect / TLS / read). The per-attempt
+            // operation timeout surfaces as SdkError::TimeoutError below.
+            warn!("Secrets Manager request failed with a connector-level timeout (connect/TLS/read); returning 504");
             return Ok(("TimeoutError".into(), "Timeout".into(), 504));
         }
         SdkError::TimeoutError(_) => {
+            // Print the bound so on-call can see which timeout fired.
             warn!(
-                "Secrets Manager request exceeded the per-attempt SDK operation timeout \
-                 (SMA_SM_OP_TIMEOUT, default {}s); returning 504",
+                "Secrets Manager request exceeded the {}s per-attempt SDK operation \
+                 timeout; returning 504",
                 crate::constants::SDK_OP_ATTEMPT_TIMEOUT.as_secs()
             );
             return Ok(("TimeoutError".into(), "Timeout".into(), 504));
@@ -557,7 +560,7 @@ pub mod tests {
     }
 
     // Test client that stubs off network call and provides a canned response.
-    fn def_fake_client() -> secretsmanager::Client {
+    pub fn def_fake_client() -> secretsmanager::Client {
         let fake_creds = secretsmanager::config::Credentials::new(
             "AKIDTESTKEY",
             "astestsecretkey",
@@ -584,15 +587,33 @@ pub mod tests {
         )
     }
 
-    // Test client that makes all Secrets Manager calls time out.
-    //
-    // Wired the same way production is: a NeverClient (never responds) behind
-    // the shared per-attempt `op_timeout_config` helper, with retries disabled
-    // so the client aborts at a single attempt's timeout instead of retrying.
-    // This lets fetch-level tests assert the SDK bound fires on TIMING.
+    // Test client that makes all Secrets Manager calls hang. Sets NO SDK
+    // timeout, so `timeout_test` still exercises the inbound-server deadline in
+    // `server.rs`.
     pub fn timeout_client() -> secretsmanager::Client {
+        let fake_creds = secretsmanager::config::Credentials::new(
+            "AKIDTESTKEY",
+            "astestsecretkey",
+            Some("atestsessiontoken".to_string()),
+            None,
+            "",
+        );
+
+        secretsmanager::Client::from_conf(
+            secretsmanager::Config::builder()
+                .behavior_version(BehaviorVersion::latest())
+                .credentials_provider(fake_creds)
+                .region(secretsmanager::config::Region::new("us-west-2"))
+                .http_client(NeverClient::new())
+                .build(),
+        )
+    }
+
+    // Like `timeout_client()`, but calls abort at `attempt_timeout`. Retries are
+    // disabled so it stops after a single attempt.
+    pub fn op_timeout_test_client(attempt_timeout: Duration) -> secretsmanager::Client {
         use aws_smithy_types::retry::RetryConfig;
-        use aws_workload_credentials_provider_common::sdk_timeout::op_timeout_config;
+        use aws_smithy_types::timeout::TimeoutConfig;
 
         let fake_creds = secretsmanager::config::Credentials::new(
             "AKIDTESTKEY",
@@ -607,10 +628,11 @@ pub mod tests {
                 .behavior_version(BehaviorVersion::latest())
                 .credentials_provider(fake_creds)
                 .region(secretsmanager::config::Region::new("us-west-2"))
-                .timeout_config(op_timeout_config(
-                    "SMA_SM_OP_TIMEOUT",
-                    crate::constants::SDK_OP_ATTEMPT_TIMEOUT,
-                ))
+                .timeout_config(
+                    TimeoutConfig::builder()
+                        .operation_attempt_timeout(attempt_timeout)
+                        .build(),
+                )
                 .retry_config(RetryConfig::disabled())
                 .http_client(NeverClient::new())
                 .build(),
@@ -640,15 +662,23 @@ pub mod tests {
     }
 
     // Verify a hung Secrets Manager response is bounded by the per-attempt SDK
-    // operation timeout wired via `op_timeout_config` (rather than hanging until
-    // the inbound-server wrapper). Asserts on TIMING — the fetch returns well
-    // under the 10s test-`time_out` deadline — plus the body carries the
-    // "TimeoutError" code. (Status alone can't discriminate: fetch maps a
-    // TimeoutError to HttpError(504), the same numeric code the server wrapper
-    // emits; timing is what proves the SDK bound fired.)
+    // timeout. Asserts on timing, because the inbound-server deadline also
+    // returns 504, so the status alone can't show which timeout fired.
     #[tokio::test]
     async fn test_fetch_bounded_by_op_timeout() {
-        set_client(timeout_client());
+        // RAII guard: restore the default client even if an assertion below
+        // panics, so this test never leaves the NeverClient installed.
+        struct ClientGuard;
+        impl Drop for ClientGuard {
+            fn drop(&mut self) {
+                set_client(def_fake_client());
+            }
+        }
+        let _guard = ClientGuard;
+
+        // Use the real production per-attempt value.
+        let attempt_timeout = crate::constants::SDK_OP_ATTEMPT_TIMEOUT;
+        set_client(op_timeout_test_client(attempt_timeout));
         let config = SecretsManagerConfig::default();
         let cm = cache_manager_with_config(&config).await;
 
@@ -661,16 +691,13 @@ pub mod tests {
         let body: Value = serde_json::from_str(&err.1).unwrap();
         assert_eq!(body["__type"], "TimeoutError");
 
-        // The per-attempt timeout (SDK_OP_ATTEMPT_TIMEOUT, retries disabled) must
-        // fire far under the 10s test deadline. Generous upper bound to avoid CI
-        // flakiness; stays valid as long as the tier is < ~4s.
+        // The per-attempt timeout (retries disabled) fires at
+        // SDK_OP_ATTEMPT_TIMEOUT (2s), far under the 10s inbound-server
+        // deadline. Generous upper bound to avoid CI flakiness.
         assert!(
             elapsed < Duration::from_secs(5),
             "fetch should abort at the op timeout, took {elapsed:?}"
         );
-
-        // Restore the default client so later tests in this thread aren't affected.
-        set_client(def_fake_client());
     }
 
     // Verify the role client is cached and reused on subsequent requests.

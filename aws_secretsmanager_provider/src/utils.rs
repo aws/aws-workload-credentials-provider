@@ -128,7 +128,7 @@ pub async fn validate_and_create_asm_client(
 ) -> Result<(SecretsManagerClient, aws_config::SdkConfig), Box<dyn std::error::Error>> {
     use aws_config::{BehaviorVersion, Region};
     use aws_secretsmanager_caching::error::is_transient_error;
-    use aws_workload_credentials_provider_common::sdk_timeout::op_timeout_config;
+    use aws_workload_credentials_provider_common::sdk_timeout::with_op_timeout;
 
     use crate::constants::SDK_OP_ATTEMPT_TIMEOUT;
     use crate::credentials_file_provider::FileBasedCredentialsProvider;
@@ -136,19 +136,9 @@ pub async fn validate_and_create_asm_client(
     let mut sdk_config = aws_config::load_defaults(BehaviorVersion::latest()).await;
 
     // Bound every SM/STS call with a per-attempt operation timeout so a hung
-    // service response can't stall a secret fetch. Reuse the existing `mut`
-    // binding (no `let`-shadow — that would break the reassignment below).
-    // This one edit covers both the direct path (asm/sts builders below, each
-    // `Builder::from(&sdk_config)`) and the per-role path
-    // (`create_role_asm_client(base_config)`), which derive their configs from
-    // this `sdk_config`.
-    sdk_config = sdk_config
-        .into_builder()
-        .timeout_config(op_timeout_config(
-            "SMA_SM_OP_TIMEOUT",
-            SDK_OP_ATTEMPT_TIMEOUT,
-        ))
-        .build();
+    // service response can't stall a secret fetch. Applies to every client
+    // built from this config, including the per-role clients.
+    sdk_config = with_op_timeout(sdk_config, SDK_OP_ATTEMPT_TIMEOUT);
 
     // Use file-based credentials if configured.
     let has_file_provider = if let Some(path) = discover_credentials_file(config) {
@@ -189,7 +179,13 @@ pub async fn validate_and_create_asm_client(
         let sts_client = aws_sdk_sts::Client::from_conf(sts_builder.build());
         match sts_client.get_caller_identity().send().await {
             Ok(_) => (),
-            Err(e) if config.ignore_transient_errors && is_transient_error(&e) => (),
+            Err(e) if config.ignore_transient_errors && is_transient_error(&e) => {
+                log::warn!(
+                    "STS credential validation failed with a transient error; continuing \
+                     without it: {}",
+                    aws_sdk_sts::error::DisplayErrorContext(&e)
+                );
+            }
             Err(e) => Err(e)?,
         };
     } else if has_file_provider {
