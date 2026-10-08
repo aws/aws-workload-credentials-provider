@@ -44,12 +44,7 @@ impl CacheManager {
     /// Create a new CacheManager.
     pub async fn new(cfg: &SecretsManagerConfig) -> Result<Self, Box<dyn std::error::Error>> {
         let (client, sdk_config) = asm_client(cfg).await?;
-        let default_client = Arc::new(SecretsManagerCachingClient::new(
-            client,
-            cfg.cache.cache_size,
-            Duration::from_secs(cfg.cache.ttl_seconds as u64),
-            cfg.ignore_transient_errors,
-        )?);
+        let default_client = Arc::new(caching_client(client, cfg)?);
 
         Ok(Self {
             default_client,
@@ -58,6 +53,20 @@ impl CacheManager {
             #[cfg(not(test))]
             base_sdk_config: sdk_config,
         })
+    }
+
+    /// Test helper: a CacheManager that uses `default_client` as is, for tests
+    /// that need different timeouts than `caching_client` sets.
+    #[cfg(test)]
+    pub(crate) fn with_default_client(
+        cfg: &SecretsManagerConfig,
+        default_client: SecretsManagerCachingClient,
+    ) -> Self {
+        Self {
+            default_client: Arc::new(default_client),
+            role_clients: RwLock::new(HashMap::new()),
+            config: cfg.clone(),
+        }
     }
 
     /// Fetch a secret from the cache, routing to the appropriate client based on role ARN.
@@ -252,12 +261,7 @@ impl CacheManager {
         let asm_client =
             create_role_asm_client(&self.config, &self.base_sdk_config, role_arn).await?;
 
-        Ok(SecretsManagerCachingClient::new(
-            asm_client,
-            self.config.cache.cache_size,
-            Duration::from_secs(self.config.cache.ttl_seconds as u64),
-            self.config.ignore_transient_errors,
-        )?)
+        Ok(caching_client(asm_client, &self.config)?)
     }
 
     /// Test stub for creating role clients — uses the same fake client as default.
@@ -267,13 +271,30 @@ impl CacheManager {
         _role_arn: &str,
     ) -> Result<SecretsManagerCachingClient, Box<dyn std::error::Error>> {
         let (client, _) = asm_client(&self.config).await?;
-        Ok(SecretsManagerCachingClient::new(
-            client,
-            self.config.cache.cache_size,
-            Duration::from_secs(self.config.cache.ttl_seconds as u64),
-            self.config.ignore_transient_errors,
-        )?)
+        Ok(caching_client(client, &self.config)?)
     }
+}
+
+/// Wraps an SDK client in a caching client with the provider's cache size,
+/// TTL and transient error settings. Prefetch batch calls get their own,
+/// longer per-attempt timeout.
+///
+/// # Arguments
+///
+/// * `asm_client` - The Secrets Manager SDK client to wrap.
+/// * `cfg` - The provider's Secrets Manager settings.
+fn caching_client(
+    asm_client: aws_sdk_secretsmanager::Client,
+    cfg: &SecretsManagerConfig,
+) -> Result<SecretsManagerCachingClient, aws_secretsmanager_caching::secret_store::SecretStoreError>
+{
+    Ok(SecretsManagerCachingClient::new(
+        asm_client,
+        cfg.cache.cache_size,
+        Duration::from_secs(cfg.cache.ttl_seconds as u64),
+        cfg.ignore_transient_errors,
+    )?
+    .with_batch_attempt_timeout(crate::constants::PREFETCH_BATCH_ATTEMPT_TIMEOUT))
 }
 
 /// Private helper to format in internal service error response.
@@ -797,6 +818,24 @@ pub mod tests {
         // Verify only one client was created
         let clients = cm.role_clients.read().await;
         assert_eq!(clients.len(), 1);
+    }
+
+    // Prefetch batch calls get the longer prefetch bound on both the default
+    // and role clients.
+    #[tokio::test]
+    async fn test_caching_clients_use_prefetch_batch_timeout() {
+        let config = SecretsManagerConfig::default();
+        let cm = cache_manager_with_config(&config).await;
+        let expected = Some(crate::constants::PREFETCH_BATCH_ATTEMPT_TIMEOUT);
+
+        let default_client = cm.get_client(None).await.expect("default client");
+        assert_eq!(default_client.batch_attempt_timeout(), expected);
+
+        let role_client = cm
+            .get_client(Some("arn:aws:iam::123456789012:role/PrefetchRole"))
+            .await
+            .expect("role client");
+        assert_eq!(role_client.batch_attempt_timeout(), expected);
     }
 
     // Verify max_roles limit is enforced.
