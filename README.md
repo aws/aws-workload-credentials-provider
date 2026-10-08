@@ -565,7 +565,8 @@ The Workload Credentials Provider creates and caches a separate caching client f
 
 **Error responses: **
 + `400` – If the `roleArn` format is invalid or the maximum number of assumed roles has been reached\.
-+ `403` – If the STS `AssumeRole` call fails \(for example, the trust policy does not allow the provider's identity to assume the role\)\.
++ `403` – If the STS `AssumeRole` call fails for a reason other than a timeout \(for example, the trust policy does not allow the provider's identity to assume the role\)\.
++ `504` – If setting up or refreshing the role's credentials times out\. You can retry the request\.
 
 You can configure the maximum number of simultaneous assumed roles with the `max_roles` option in the [Configuration file](#workload-credentials-provider-config)\. The default is 20\.
 

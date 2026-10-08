@@ -1,4 +1,5 @@
 use crate::cache_manager::CacheManager;
+use crate::constants::PREFETCH_BATCH_ATTEMPT_TIMEOUT;
 use aws_sdk_secretsmanager::types::{Filter, FilterNameStringType};
 use aws_workload_credentials_provider_common::config::types::{
     SecretPrefetchConfig, SecretsManagerConfig, TagFilter,
@@ -25,6 +26,10 @@ fn role_display(role_arn: Option<&str>) -> &str {
 struct PrefetchStats {
     success: usize,
     failed: usize,
+    /// Tag-filter searches that stopped early on an error (e.g. a timeout, or no
+    /// client for the role). Counted separately from `failed` because the number
+    /// of secrets behind the unfetched pages is unknown.
+    tag_searches_stopped: usize,
 }
 
 /// Spawn the prefetch background task.
@@ -48,8 +53,8 @@ pub fn start_prefetch_task(cache_manager: Arc<CacheManager>, config: SecretsMana
         run_prefetch(&cache_manager, &config, &mut stats).await;
 
         info!(
-            "Pre-fetch complete: success={}, failed={}",
-            stats.success, stats.failed
+            "Pre-fetch complete: success={}, failed={}, tag_searches_stopped={}",
+            stats.success, stats.failed, stats.tag_searches_stopped
         );
     });
 }
@@ -225,7 +230,18 @@ async fn fetch_secret_id_group(
                     );
                 }
             }
+            // `Ok(None)` means the caching client suppressed a transient error
+            // (e.g. a per-attempt SDK timeout) under `ignore_transient_errors`.
+            // Log it so a timed-out batch isn't dropped silently; these secrets
+            // are still fetched on their first request.
             Ok(None) => {
+                warn!(
+                    "Pre-fetch: BatchGetSecretValue for {} hit a transient error \
+                     (e.g. the {}s per-attempt timeout); {} secret(s) not prefetched",
+                    role_display(role_arn),
+                    PREFETCH_BATCH_ATTEMPT_TIMEOUT.as_secs(),
+                    batch_len
+                );
                 stats.failed += batch_len;
             }
             Err(e) => {
@@ -275,6 +291,7 @@ async fn fetch_tag_group(
                 role_display(role_arn),
                 e.1
             );
+            stats.tag_searches_stopped += 1;
             return;
         }
     };
@@ -326,9 +343,21 @@ async fn fetch_tag_group(
 
                 next_token = resp.next_token().map(String::from);
             }
-            Ok(None) => break,
+            // Transient error suppressed by the caching client; see the
+            // secret-ID path above.
+            Ok(None) => {
+                warn!(
+                    "Pre-fetch: BatchGetSecretValue with filters for {} hit a transient \
+                     error (e.g. the {}s per-attempt timeout); stopping tag-based prefetch",
+                    role_display(role_arn),
+                    PREFETCH_BATCH_ATTEMPT_TIMEOUT.as_secs()
+                );
+                stats.tag_searches_stopped += 1;
+                break;
+            }
             Err(e) => {
                 error!("Pre-fetch: BatchGetSecretValue with filters failed: {}", e);
+                stats.tag_searches_stopped += 1;
                 break;
             }
         }
@@ -343,7 +372,35 @@ async fn fetch_tag_group(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache_manager::tests::op_timeout_test_client;
+    use aws_secretsmanager_caching::SecretsManagerCachingClient;
     use aws_workload_credentials_provider_common::config::types::PrefetchConfig;
+
+    /// Attempt timeout for the hung-call tests, for both the client and the
+    /// batch override. Kept well under the SDK's ~5s stalled-upload check, which
+    /// would otherwise end a call to the hung test client.
+    const TEST_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(100);
+
+    /// Upper bound for a hung-call test: proves the call ended at our timeout,
+    /// not at the SDK's stalled-upload check.
+    const TEST_TIMEOUT_CEILING: Duration = Duration::from_secs(3);
+
+    // A CacheManager whose calls hang and time out after one short attempt.
+    // The batch timeout is set short too; the 10s production value would let
+    // the hung call run on to the SDK's stalled-upload check instead. This
+    // skips `caching_client()`, so the production 10s wiring is checked in
+    // cache_manager's `test_caching_clients_use_prefetch_batch_timeout`.
+    fn timeout_cache_manager(config: &SecretsManagerConfig) -> CacheManager {
+        let client = SecretsManagerCachingClient::new(
+            op_timeout_test_client(TEST_ATTEMPT_TIMEOUT),
+            config.cache.cache_size,
+            Duration::from_secs(config.cache.ttl_seconds as u64),
+            config.ignore_transient_errors,
+        )
+        .expect("caching client failed")
+        .with_batch_attempt_timeout(TEST_ATTEMPT_TIMEOUT);
+        CacheManager::with_default_client(config, client)
+    }
 
     async fn test_cache_manager(config: &SecretsManagerConfig) -> Arc<CacheManager> {
         Arc::new(
@@ -647,6 +704,47 @@ mod tests {
         assert_eq!(stats3.success, 0);
     }
 
+    // Verify a tag search that can't get a client (max_roles exceeded) is counted
+    // as stopped.
+    #[tokio::test]
+    async fn test_fetch_tag_group_client_failure_counts_stopped() {
+        let config = SecretsManagerConfig {
+            max_roles: 2,
+            ..Default::default()
+        };
+        let cache_manager = test_cache_manager(&config).await;
+        let mut stats = PrefetchStats::default();
+
+        // Fill both role slots
+        for role in [
+            "arn:aws:iam::111111111111:role/Role1",
+            "arn:aws:iam::222222222222:role/Role2",
+        ] {
+            fetch_secret_id_group(
+                &cache_manager,
+                Some(role),
+                &["MyTest".to_string()],
+                &mut 100,
+                &mut stats,
+            )
+            .await;
+        }
+
+        // Third role exceeds max_roles — get_client() returns Err
+        let mut stats3 = PrefetchStats::default();
+        fetch_tag_group(
+            &cache_manager,
+            Some("arn:aws:iam::333333333333:role/Role3"),
+            &["Environment".to_string()],
+            &mut 100,
+            &mut stats3,
+        )
+        .await;
+
+        assert_eq!(stats3.tag_searches_stopped, 1);
+        assert_eq!(stats3.success, 0);
+    }
+
     // Verify tag-based prefetch respects buffer limit.
     #[tokio::test]
     async fn test_fetch_tag_group_buffer_limit() {
@@ -664,5 +762,61 @@ mod tests {
         .await;
 
         assert_eq!(stats.success, 0);
+    }
+
+    // Verify a timed-out batch (suppressed as transient by default) counts every
+    // secret in the batch as failed rather than being dropped from the stats.
+    #[tokio::test]
+    async fn test_fetch_secret_id_group_timeout() {
+        let config = SecretsManagerConfig::default();
+        let cache_manager = timeout_cache_manager(&config);
+        let mut stats = PrefetchStats::default();
+
+        let start = std::time::Instant::now();
+        fetch_secret_id_group(
+            &cache_manager,
+            None,
+            &["s1".to_string(), "s2".to_string()],
+            &mut 100,
+            &mut stats,
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < TEST_TIMEOUT_CEILING,
+            "batch should end at the attempt timeout, took {elapsed:?}"
+        );
+        assert_eq!(stats.success, 0);
+        assert_eq!(stats.failed, 2);
+    }
+
+    // Verify a timed-out tag-filter page stops tag-based prefetch without caching,
+    // and is recorded in the stats.
+    #[tokio::test]
+    async fn test_fetch_tag_group_timeout() {
+        let config = SecretsManagerConfig::default();
+        let cache_manager = timeout_cache_manager(&config);
+        let mut stats = PrefetchStats::default();
+
+        let start = std::time::Instant::now();
+        fetch_tag_group(
+            &cache_manager,
+            None,
+            &["Environment".to_string()],
+            &mut 100,
+            &mut stats,
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < TEST_TIMEOUT_CEILING,
+            "batch should end at the attempt timeout, took {elapsed:?}"
+        );
+        assert_eq!(stats.success, 0);
+        assert_eq!(stats.tag_searches_stopped, 1);
+        let client = cache_manager.get_client(None).await.unwrap();
+        assert!(!client.cache_contains("TaggedSecret").await);
     }
 }
