@@ -29,9 +29,9 @@ serde_derive = "1"
 aws-config = "1"
 aws-credential-types = "1"
 aws-runtime = "1"
-aws-sdk-secretsmanager = "1"
+aws-sdk-secretsmanager = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-smithy-runtime-api = "1"
-aws-sdk-sts = "1"
+aws-sdk-sts = { version = "1", default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
 arc-swap = "1"
 log = "0.4.29"
 log4rs = { version = "1.2.0", features = ["gzip"] }
