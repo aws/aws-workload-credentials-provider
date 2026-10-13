@@ -24,7 +24,7 @@ log = "0.4.29"
 tokio-util = "0.7.18"
 
 # We are required to use the sha1 feature to decrypt the password protected private keys.
-pkcs8 = { version = "0.10", features = ["encryption", "pem", "sha1-insecure"] }
+pkcs8 = { version = "0.11", features = ["encryption", "pem", "sha1-insecure"] }
 pkcs5 = "0.7"
 aws_workload_credentials_provider_common = { version = "3.1.1", path = "../aws_workload_credentials_provider_common" }
 
