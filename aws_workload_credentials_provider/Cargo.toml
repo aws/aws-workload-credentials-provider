@@ -1,6 +1,6 @@
 [package]
 name = "aws_workload_credentials_provider"
-version = "3.1.1"
+version.workspace = true
 edition = "2021"
 license = "Apache-2.0"
 description = "AWS Workload Credentials Provider binary — unified entry point for ACM and Secrets Manager modes."
@@ -13,9 +13,9 @@ path = "src/main.rs"
 fips = ["aws_certificatemanager_provider/fips", "aws_secretsmanager_provider/fips"]
 
 [dependencies]
-aws_workload_credentials_provider_common = { version = "3.1.1", path = "../aws_workload_credentials_provider_common" }
-aws_certificatemanager_provider = { version = "3.1.1", path = "../aws_certificatemanager_provider" }
-aws_secretsmanager_provider = { version = "3.1.1", path = "../aws_secretsmanager_provider" }
+aws_workload_credentials_provider_common.workspace = true
+aws_certificatemanager_provider.workspace = true
+aws_secretsmanager_provider.workspace = true
 
 clap = { version = "4", features = ["derive"] }
 tokio-util = "0.7.18"

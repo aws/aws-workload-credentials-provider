@@ -1,6 +1,6 @@
 [package]
 name = "aws_workload_credentials_provider_common"
-version = "3.1.1"
+version.workspace = true
 edition = "2021"
 license = "Apache-2.0"
 description = "Common library for AWS Workload Credentials Provider configuration validation and shared utilities."

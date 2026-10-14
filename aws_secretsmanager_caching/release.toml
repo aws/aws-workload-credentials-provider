@@ -1,0 +1,2 @@
+shared-version = false
+tag-name = "aws_secretsmanager_caching-v{{version}}"

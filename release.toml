@@ -1,0 +1,8 @@
+allow-branch = ["main"]
+shared-version = true
+consolidate-commits = true
+pre-release-commit-message = "chore: release {{version}}"
+tag-message = "chore: release {{version}}"
+tag-name = "v{{version}}"
+# Publishing is handled by the publish-crates.yml GitHub Actions workflow.
+publish = false
