@@ -13,8 +13,10 @@ env:
 
 jobs:
   integration-tests:
-    runs-on: ubuntu-latest
-    
+    # CodeBuild-hosted runner. AWS credentials come from the runner's own IAM role, so the workflow
+    # does not assume a role.
+    runs-on: codebuild-awcp-runner-${{ github.run_id }}-${{ github.run_attempt }}-linux-5.0-large
+
     # Run if:
     # 1. Manual trigger or push to main, OR
     # 2. PR with "safe-to-test" label
@@ -23,17 +25,19 @@ jobs:
       contains(github.event.pull_request.labels.*.name, 'safe-to-test')
     
     permissions:
-      id-token: write
       contents: read
       pull-requests: write
 
     env:
+      AWS_REGION: us-west-2
       LABEL_NAME: safe-to-test
       REPO: ${{ github.event.pull_request.base.repo.full_name }}
       PR_NUMBER: ${{ github.event.pull_request.number }}
     
     steps:
     - name: Harden Runner
+      # Self-hosted runners need a StepSecurity agent, which CodeBuild runners do not have.
+      if: runner.environment == 'github-hosted'
       uses: step-security/harden-runner@v2.19.4
       with:
         egress-policy: audit
@@ -60,13 +64,6 @@ jobs:
       with:
         toolchain: stable
         override: true
-    
-    - name: Configure AWS credentials
-      uses: aws-actions/configure-aws-credentials@v6
-      with:
-        role-to-assume: ${{ secrets.ROLE_ARN }}
-        role-session-name: aws-workload-credentials-provider-ci-${{ github.run_id }}
-        aws-region: us-west-2
     
     - name: Build provider binary
       run: cargo build
