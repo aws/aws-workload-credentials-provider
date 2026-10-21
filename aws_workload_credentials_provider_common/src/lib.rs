@@ -3,6 +3,7 @@ pub mod constants;
 pub mod filesystem;
 pub mod fs_permissions;
 pub mod logging;
+pub mod sdk_timeout;
 
 #[cfg(windows)]
 pub mod win_service;

@@ -19,6 +19,7 @@ use aws_config::BehaviorVersion;
 use aws_sdk_secretsmanager::operation::batch_get_secret_value::BatchGetSecretValueOutput;
 use aws_sdk_secretsmanager::types::Filter;
 use aws_sdk_secretsmanager::Client as SecretsManagerClient;
+use aws_smithy_types::timeout::TimeoutConfig;
 use error::is_transient_error;
 #[cfg(debug_assertions)]
 use log::{info, warn};
@@ -38,6 +39,9 @@ pub struct SecretsManagerCachingClient {
     /// A store used to cache secrets.
     store: RwLock<Box<dyn SecretStore>>,
     ignore_transient_errors: bool,
+    /// Per-attempt timeout for `batch_get_secret_value` only. `None` uses the
+    /// SDK client's own timeout config.
+    batch_attempt_timeout: Option<Duration>,
     #[cfg(debug_assertions)]
     metrics: CacheMetrics,
 }
@@ -88,6 +92,7 @@ impl SecretsManagerCachingClient {
             asm_client,
             store: RwLock::new(Box::new(MemoryStore::new(max_size, ttl))),
             ignore_transient_errors,
+            batch_attempt_timeout: None,
             #[cfg(debug_assertions)]
             metrics: CacheMetrics {
                 hits: AtomicU32::new(0),
@@ -166,6 +171,49 @@ impl SecretsManagerCachingClient {
             asm_builder.interceptor(CachingLibraryInterceptor).build(),
         );
         Self::new(asm_client, max_size, ttl, ignore_transient_errors)
+    }
+
+    /// Sets a per-attempt timeout for `batch_get_secret_value` calls only.
+    ///
+    /// A batch call can return far more data than a single-secret call, so it
+    /// may need a longer bound than the one set on the SDK client. Only the
+    /// attempt timeout changes; the client's other timeout settings (such as
+    /// the connect timeout) and its retry policy still apply. Other calls keep
+    /// the client's timeout config.
+    ///
+    /// # Arguments
+    ///
+    /// * `timeout` - Per-attempt timeout for each BatchGetSecretValue attempt.
+    ///
+    /// ```rust
+    /// use aws_sdk_secretsmanager::Client as SecretsManagerClient;
+    /// use aws_sdk_secretsmanager::Config;
+    /// use aws_secretsmanager_caching::SecretsManagerCachingClient;
+    /// use std::num::NonZeroUsize;
+    /// use std::time::Duration;
+    ///
+    /// let asm_client = SecretsManagerClient::from_conf(
+    /// Config::builder()
+    ///     .behavior_version_latest()
+    ///     .build(),
+    /// );
+    /// let client = SecretsManagerCachingClient::new(
+    ///     asm_client,
+    ///     NonZeroUsize::new(1000).unwrap(),
+    ///     Duration::from_secs(300),
+    ///     false,
+    /// )
+    /// .unwrap()
+    /// .with_batch_attempt_timeout(Duration::from_secs(10));
+    /// ```
+    pub fn with_batch_attempt_timeout(mut self, timeout: Duration) -> Self {
+        self.batch_attempt_timeout = Some(timeout);
+        self
+    }
+
+    /// Returns the per-attempt timeout set for `batch_get_secret_value`, if any.
+    pub fn batch_attempt_timeout(&self) -> Option<Duration> {
+        self.batch_attempt_timeout
     }
 
     /// Retrieves the value of the secret from the specified version.
@@ -307,16 +355,31 @@ impl SecretsManagerCachingClient {
         max_results: Option<i32>,
         next_token: Option<String>,
     ) -> Result<Option<BatchGetSecretValueOutput>, Box<dyn Error>> {
-        let response = match self
+        let request = self
             .asm_client
             .batch_get_secret_value()
             .set_secret_id_list(secret_id_list)
             .set_filters(filters)
             .set_max_results(max_results)
-            .set_next_token(next_token)
-            .send()
-            .await
-        {
+            .set_next_token(next_token);
+        let result = match self.batch_attempt_timeout {
+            // The SDK merges the override's timeout config into the client's
+            // field by field, so only the attempt timeout changes.
+            Some(timeout) => {
+                let timeouts = TimeoutConfig::builder()
+                    .operation_attempt_timeout(timeout)
+                    .build();
+                request
+                    .customize()
+                    .config_override(
+                        aws_sdk_secretsmanager::config::Builder::default().timeout_config(timeouts),
+                    )
+                    .send()
+                    .await
+            }
+            None => request.send().await,
+        };
+        let response = match result {
             Ok(resp) => resp,
             Err(e) if self.ignore_transient_errors && is_transient_error(&e) => {
                 return Ok(None);
@@ -1087,6 +1150,192 @@ mod tests {
         // Transient error should be suppressed → Ok(None)
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
+    }
+
+    use aws_sdk_secretsmanager::config::{
+        interceptors::BeforeTransmitInterceptorContextRef, Intercept, RuntimeComponents,
+    };
+    use aws_smithy_types::config_bag::ConfigBag;
+
+    /// Records the timeout config each request is sent with.
+    #[derive(Debug, Clone, Default)]
+    struct TimeoutRecorder(std::sync::Arc<std::sync::Mutex<Vec<TimeoutConfig>>>);
+
+    impl Intercept for TimeoutRecorder {
+        fn name(&self) -> &'static str {
+            "TimeoutRecorder"
+        }
+
+        fn read_before_transmit(
+            &self,
+            _context: &BeforeTransmitInterceptorContextRef<'_>,
+            _runtime_components: &RuntimeComponents,
+            cfg: &mut ConfigBag,
+        ) -> Result<(), aws_sdk_secretsmanager::error::BoxError> {
+            if let Some(timeouts) = cfg.load::<TimeoutConfig>() {
+                self.0.lock().unwrap().push(timeouts.clone());
+            }
+            Ok(())
+        }
+    }
+
+    impl TimeoutRecorder {
+        fn take(&self) -> Vec<TimeoutConfig> {
+            std::mem::take(&mut *self.0.lock().unwrap())
+        }
+    }
+
+    /// A caching client with a 3.1s connect timeout and a 100ms attempt
+    /// timeout, retries off. Every call gets an empty BatchGetSecretValue
+    /// response, which is enough to see the timeouts it was sent with.
+    fn timeout_recording_client(recorder: TimeoutRecorder) -> SecretsManagerCachingClient {
+        use aws_sdk_secretsmanager::config::{BehaviorVersion, Credentials, Region};
+        use aws_smithy_runtime::client::http::test_util::infallible_client_fn;
+        use aws_smithy_types::body::SdkBody;
+        use aws_smithy_types::retry::RetryConfig;
+
+        let config = aws_sdk_secretsmanager::Config::builder()
+            .behavior_version(BehaviorVersion::latest())
+            .credentials_provider(Credentials::new(
+                "AKIDTESTKEY",
+                "astestsecretkey",
+                None,
+                None,
+                "",
+            ))
+            .region(Region::new("us-west-2"))
+            .timeout_config(
+                TimeoutConfig::builder()
+                    .connect_timeout(Duration::from_millis(3100))
+                    .operation_attempt_timeout(Duration::from_millis(100))
+                    .build(),
+            )
+            .retry_config(RetryConfig::disabled())
+            .interceptor(recorder)
+            .http_client(infallible_client_fn(|_req| {
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::from(r#"{"SecretValues":[],"Errors":[]}"#))
+                    .unwrap()
+            }))
+            .build();
+
+        SecretsManagerCachingClient::new(
+            SecretsManagerClient::from_conf(config),
+            NonZeroUsize::new(1000).unwrap(),
+            Duration::from_secs(1000),
+            false,
+        )
+        .expect("client should create")
+    }
+
+    #[tokio::test]
+    async fn test_batch_attempt_timeout_changes_only_attempt_timeout() {
+        let recorder = TimeoutRecorder::default();
+        let client = timeout_recording_client(recorder.clone())
+            .with_batch_attempt_timeout(Duration::from_secs(10));
+        assert_eq!(
+            client.batch_attempt_timeout(),
+            Some(Duration::from_secs(10))
+        );
+
+        client
+            .batch_get_secret_value(Some(vec!["MyTest".to_string()]), None, None, None)
+            .await
+            .expect("batch call should succeed");
+
+        let sent = recorder.take();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].operation_attempt_timeout(),
+            Some(Duration::from_secs(10))
+        );
+        // The client's connect timeout survives the per-call override.
+        assert_eq!(sent[0].connect_timeout(), Some(Duration::from_millis(3100)));
+    }
+
+    #[tokio::test]
+    async fn test_batch_attempt_timeout_leaves_other_calls_alone() {
+        let recorder = TimeoutRecorder::default();
+        let client = timeout_recording_client(recorder.clone())
+            .with_batch_attempt_timeout(Duration::from_secs(10));
+
+        // The canned response isn't a valid secret; only the timeouts matter.
+        let _ = client.get_secret_value("MyTest", None, None, false).await;
+
+        let sent = recorder.take();
+        assert!(!sent.is_empty());
+        for timeouts in sent {
+            assert_eq!(
+                timeouts.operation_attempt_timeout(),
+                Some(Duration::from_millis(100))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_batch_attempt_timeout_unset_uses_client_timeouts() {
+        let recorder = TimeoutRecorder::default();
+        let client = timeout_recording_client(recorder.clone());
+        assert_eq!(client.batch_attempt_timeout(), None);
+
+        client
+            .batch_get_secret_value(Some(vec!["MyTest".to_string()]), None, None, None)
+            .await
+            .expect("batch call should succeed");
+
+        let sent = recorder.take();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].operation_attempt_timeout(),
+            Some(Duration::from_millis(100))
+        );
+        assert_eq!(sent[0].connect_timeout(), Some(Duration::from_millis(3100)));
+    }
+
+    #[tokio::test]
+    async fn test_batch_attempt_timeout_bounds_hung_call() {
+        use aws_sdk_secretsmanager::error::SdkError;
+        use aws_smithy_runtime::client::http::test_util::NeverClient;
+
+        // The client's own attempt timeout is 100ms (see def_fake_client); the
+        // batch call gets 400ms, so a hung batch must outlive the client's bound.
+        let batch_timeout = Duration::from_millis(400);
+        let client = fake_client(
+            None,
+            false,
+            Some(SharedHttpClient::new(NeverClient::new())),
+            None,
+        )
+        .with_batch_attempt_timeout(batch_timeout);
+
+        let start = std::time::Instant::now();
+        let err = client
+            .batch_get_secret_value(Some(vec!["MyTest".to_string()]), None, None, None)
+            .await
+            .expect_err("a hung batch call should time out");
+        let elapsed = start.elapsed();
+
+        let sdk_err = err
+            .downcast_ref::<SdkError<
+                aws_sdk_secretsmanager::operation::batch_get_secret_value::BatchGetSecretValueError,
+                aws_smithy_runtime_api::http::Response,
+            >>()
+            .expect("error should be an SdkError");
+        assert!(
+            matches!(sdk_err, SdkError::TimeoutError(_)),
+            "expected TimeoutError, got {sdk_err:?}"
+        );
+        assert!(
+            elapsed >= batch_timeout,
+            "batch call was cut after {elapsed:?}, before its {batch_timeout:?} bound"
+        );
+        // Well under the SDK's ~5s stalled-upload check, which would also end a
+        // call to NeverClient; this proves the batch bound is what fired.
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "batch call ran {elapsed:?}, past its {batch_timeout:?} bound"
+        );
     }
 
     mod asm_mock {

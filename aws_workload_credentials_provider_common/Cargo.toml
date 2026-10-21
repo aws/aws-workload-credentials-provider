@@ -6,6 +6,8 @@ license = "Apache-2.0"
 description = "Common library for AWS Workload Credentials Provider configuration validation and shared utilities."
 
 [dependencies]
+aws-smithy-types = "1"
+aws-types = "1"
 chrono = "0.4"
 dunce = "1.0"
 log = "0.4"
