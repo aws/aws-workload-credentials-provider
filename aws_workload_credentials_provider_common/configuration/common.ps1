@@ -246,3 +246,223 @@ function Get-Config {
         return $null
     }
 }
+
+# SYSTEM, BUILTIN\Administrators, TrustedInstaller
+$ADMIN_SIDS = @(
+    "S-1-5-18",
+    "S-1-5-32-544",
+    "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"
+)
+# OWNER RIGHTS (applies to the owner, checked separately) and CREATOR OWNER (grants nothing on a file)
+$OWNER_PLACEHOLDER_SIDS = @("S-1-3-4", "S-1-3-0")
+# FILE_WRITE_DATA, FILE_APPEND_DATA, FILE_WRITE_EA, FILE_DELETE_CHILD, FILE_WRITE_ATTRIBUTES,
+# DELETE, WRITE_DAC, WRITE_OWNER, GENERIC_ALL, GENERIC_WRITE
+$WRITE_RIGHTS_MASK = 0x500D0156
+$ADMIN_DESCRIPTION = "SYSTEM, TrustedInstaller, the Administrators group, the current user, or a direct member of the local Administrators group"
+$script:LocalAdministratorMembers = $null
+$script:CurrentUserSid = $null
+
+<#
+.DESCRIPTION
+    Prints why the existing config is not used and how to continue, then exits 1
+
+.PARAMETER Path
+    Path to the existing config file
+.PARAMETER Reason
+    Why the existing config is not used
+#>
+function Write-ConfigRefusal {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Reason
+    )
+
+    $dir = Split-Path -Parent $Path
+    Write-Host "`n Not using the existing config at ${Path}: $Reason." -ForegroundColor Red
+    Write-Host " Without -Config, an existing config is only used if an administrator owns it and no account other than an" -ForegroundColor Red
+    Write-Host " administrator has a write grant on it." -ForegroundColor Red
+    Write-Host " To continue:" -ForegroundColor Red
+    Write-Host "   1. Stop the $ACM_SERVICE and $ASM_SERVICE services if" -ForegroundColor Red
+    Write-Host "      they are running." -ForegroundColor Red
+    Write-Host "   2. Copy $Path to a folder only administrators can write to, and review it, including every refresh_command." -ForegroundColor Red
+    Write-Host "   3. Delete ${dir}:  cmd /c rmdir /s /q `"$dir`"" -ForegroundColor Red
+    Write-Host "   4. Re-run the installer with -Config <path to the reviewed copy>." -ForegroundColor Red
+    Write-Host " Do steps 3 and 4 one right after the other, without restarting the computer in between." -ForegroundColor Red
+    exit 1
+}
+
+<#
+.DESCRIPTION
+    Returns $true if the provider data directory contains a config file. Lists the
+    directory rather than probing the path, so the result does not depend on the
+    file's own permissions. Exits 1 if the directory cannot be listed.
+#>
+function Test-ExistingConfig {
+    try {
+        # -eq is case-insensitive, matching NTFS file names
+        $entries = @(Get-ChildItem -LiteralPath $PROVIDER_DIR -Force -ErrorAction Stop |
+            Where-Object { $_.Name -eq $CONFIG_FILE_NAME })
+    } catch {
+        Write-ConfigRefusal -Path "$PROVIDER_DIR\$CONFIG_FILE_NAME" -Reason "the folder $PROVIDER_DIR could not be listed"
+    }
+    return $entries.Count -gt 0
+}
+
+<#
+.DESCRIPTION
+    Returns "Member", "NotMember", or "Unknown" for whether Sid is a direct member of
+    the local Administrators group. The group is read once per run.
+
+.PARAMETER Sid
+    SID string to look up
+#>
+function Get-LocalAdministratorMembership {
+    param([Parameter(Mandatory)][string]$Sid)
+
+    if ($null -eq $script:LocalAdministratorMembers) {
+        $members = @{ Readable = $false; Complete = $true; Sids = @() }
+        try {
+            # The group name is localised; drop the domain part (also localised)
+            $groupName = (New-Object Security.Principal.SecurityIdentifier "S-1-5-32-544").Translate(
+                [Security.Principal.NTAccount]).Value
+            $groupName = $groupName.Substring($groupName.LastIndexOf('\') + 1)
+            $group = [ADSI]"WinNT://./$groupName,group"
+            $groupMembers = @($group.Invoke("Members"))
+            $members.Readable = $true
+            foreach ($m in $groupMembers) {
+                try {
+                    $bytes = $m.GetType().InvokeMember("objectSid", "GetProperty", $null, $m, $null)
+                    $members.Sids += (New-Object Security.Principal.SecurityIdentifier -ArgumentList $bytes, 0).Value
+                } catch {
+                    $members.Complete = $false
+                }
+            }
+        } catch {
+            $members.Readable = $false
+        }
+        $script:LocalAdministratorMembers = $members
+    }
+
+    $members = $script:LocalAdministratorMembers
+    if (-not $members.Readable) { return "Unknown" }
+    if ($members.Sids -contains $Sid) { return "Member" }
+    if (-not $members.Complete) { return "Unknown" }
+    return "NotMember"
+}
+
+<#
+.DESCRIPTION
+    Returns "Admin", "NotAdmin", or "Unknown" for a SID. Only looks up the local
+    Administrators group for SIDs outside the fixed administrator set.
+
+.PARAMETER Sid
+    SID string to check
+#>
+function Get-AdministratorStatus {
+    param([Parameter(Mandatory)][string]$Sid)
+
+    if ($ADMIN_SIDS -contains $Sid) { return "Admin" }
+    if ($null -eq $script:CurrentUserSid) {
+        $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+        try { $script:CurrentUserSid = $identity.User.Value } finally { $identity.Dispose() }
+    }
+    if ($Sid -eq $script:CurrentUserSid) { return "Admin" }
+    switch (Get-LocalAdministratorMembership -Sid $Sid) {
+        "Member" { return "Admin" }
+        "NotMember" { return "NotAdmin" }
+        default { return "Unknown" }
+    }
+}
+
+<#
+.DESCRIPTION
+    Returns the account name for a SID, or the SID string if it does not resolve
+
+.PARAMETER Sid
+    SID string to translate
+#>
+function Get-PrincipalName {
+    param([Parameter(Mandatory)][string]$Sid)
+
+    try {
+        return (New-Object Security.Principal.SecurityIdentifier $Sid).Translate(
+            [Security.Principal.NTAccount]).Value
+    } catch {
+        return $Sid
+    }
+}
+
+<#
+.DESCRIPTION
+    Returns why the file at Path is not controlled by administrators, or $null if it is
+
+.PARAMETER Path
+    Path to the config file to check
+#>
+function Get-ConfigControlProblem {
+    param([Parameter(Mandatory)][string]$Path)
+
+    $acl = $null
+    try {
+        $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+    } catch {
+        $acl = $null
+    }
+    if (-not $acl) { return "its permissions could not be read" }
+
+    # GetAccessRules only returns plain allow and deny entries, so refuse any other kind
+    # (for example conditional entries) rather than skip it
+    $raw = New-Object Security.AccessControl.RawSecurityDescriptor -ArgumentList $acl.GetSecurityDescriptorBinaryForm(), 0
+    foreach ($ace in @($raw.DiscretionaryAcl)) {
+        if ($ace -and $ace.AceType -ne [Security.AccessControl.AceType]::AccessAllowed -and
+                $ace.AceType -ne [Security.AccessControl.AceType]::AccessDenied) {
+            return "it has an access entry of type $($ace.AceType), which this check does not support"
+        }
+    }
+
+    $owner = $acl.GetOwner([Security.Principal.SecurityIdentifier])
+    if (-not $owner) { return "its owner could not be read" }
+    $status = Get-AdministratorStatus -Sid $owner.Value
+    if ($status -eq "NotAdmin") { return "its owner $(Get-PrincipalName $owner.Value) is not $ADMIN_DESCRIPTION" }
+    if ($status -eq "Unknown") {
+        return "could not check whether its owner $(Get-PrincipalName $owner.Value) is a member of the local Administrators group"
+    }
+
+    foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
+        if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) { continue }
+        if ($rule.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly) { continue }
+        $sid = $rule.IdentityReference.Value
+        if ($OWNER_PLACEHOLDER_SIDS -contains $sid) { continue }
+        if (([int]$rule.FileSystemRights -band $WRITE_RIGHTS_MASK) -eq 0) { continue }
+
+        $status = Get-AdministratorStatus -Sid $sid
+        if ($status -eq "NotAdmin") {
+            return "$(Get-PrincipalName $sid) has a write grant on it, and is not $ADMIN_DESCRIPTION"
+        }
+        if ($status -eq "Unknown") {
+            return "could not check whether $(Get-PrincipalName $sid), which has a write grant on it, is a member of the local Administrators group"
+        }
+    }
+    return $null
+}
+
+<#
+.DESCRIPTION
+    Exits 1 with recovery steps unless the config at Path is owned by an administrator
+    and no account other than an administrator has a write grant on it
+
+.PARAMETER Path
+    Path to the existing config file
+#>
+function Assert-AdminControlledConfig {
+    param([Parameter(Mandatory)][string]$Path)
+
+    try {
+        $reason = Get-ConfigControlProblem -Path $Path
+    } catch {
+        $reason = "its permissions could not be checked: $($_.Exception.Message.Trim().TrimEnd('.'))"
+    }
+    if ($reason) {
+        Write-ConfigRefusal -Path $Path -Reason $reason
+    }
+}

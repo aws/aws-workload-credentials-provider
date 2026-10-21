@@ -114,6 +114,8 @@ The script verifies the Authenticode signature on the binary and passes `-Config
 - `-Force` — \(Optional\) Stop running provider services before installing
 - `-DryRun` — \(Optional\) Download and verify, then stop without installing
 
+If you run the quick install without `-Config` and a config already exists, newer versions only use that config if administrators control it\. See the Windows EC2 tab in [Step 2](#workload-credentials-provider-install) for details and how to continue\.
+
 ------
 
 ## Step 1: Build the Workload Credentials Provider binary<a name="workload-credentials-provider-build"></a>
@@ -258,6 +260,8 @@ Based on the type of compute, you have several options for installing the Worklo
    The script accepts the following parameters:
    - `-Config <file>` — (Optional) Bootstrap config to use
    - `-NoStart` — (Optional) Install but don't start services
+
+   If you don't pass `-Config` and `C:\ProgramData\AWS\WorkloadCredentialsProvider\config.toml` already exists, the script uses it only if an administrator owns it and no account other than an administrator has a write grant on it\. Otherwise it stops and prints how to continue: stop the services, copy and review the config, delete the folder, and re\-run with `-Config` right away, without restarting in between\. Deleting the folder also removes the token file, so after the re\-run, grant your application read access to the new token file again \(see the next step\)\. This can also happen when the config was installed by an account that is an administrator only through a domain group, or by an account that has since been deleted\.
 
    The script generates a random SSRF token on startup and stores it in the file `C:\ProgramData\AWS\WorkloadCredentialsProvider\awssmatoken`\. The token is readable by the Secrets Manager service account (`NT SERVICE\AWSWorkloadCredentialsProvider-SecretsManager`) that the install script configures\.
 

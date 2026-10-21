@@ -141,11 +141,13 @@ if ($Config) {
     $acmEnabled = $validatedConfig.enabledCapabilities -contains "acm"
     Copy-Item -Path $Config -Destination $defaultConfigPath -Force
 } else {
-    if (-not (Test-Path $defaultConfigPath)) {
+    if (-not (Test-ExistingConfig)) {
         $secretsManagerEnabled = $true
         $acmEnabled = $false
         Write-Host "No config found at $defaultConfigPath. Installing in default SecretsManager only mode."
     } else {
+        # Only use a config left in place if administrators control it.
+        Assert-AdminControlledConfig -Path $defaultConfigPath
         $validatedConfig = Confirm-Config -Config $defaultConfigPath -ProviderBinary $providerBinary
         $secretsManagerEnabled = $validatedConfig.enabledCapabilities -contains "secrets-manager"
         $acmEnabled = $validatedConfig.enabledCapabilities -contains "acm"
