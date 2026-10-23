@@ -126,8 +126,9 @@ if (-not (Test-Path $providerBinary)) {
     Write-Error "Cannot read $providerBinary"
 }
 
-# Ensure provider data directory exists before config validation/copy.
-New-Item -ItemType Directory -Path $PROVIDER_DIR -Force | Out-Null
+# Ensure provider data directory exists, and is controlled by administrators,
+# before config validation/copy.
+Assert-AdminControlledProviderDir
 
 # Copy over a new config if one was provided (first install, or reinstall with
 # updated config). On reinstalls without -Config, validate the config left
@@ -219,7 +220,7 @@ Write-Step "Configure provider directory ACLs"
 # Remove inherited ACLs (e.g., Users read access from ProgramData) so only
 # SYSTEM, Administrators, and the two service accounts can access this directory.
 # Take ownership first to neutralize pre-creation attacks via implicit owner DACL-write.
-takeown /f $PROVIDER_DIR /r /d y | Out-Null
+takeown /f $PROVIDER_DIR /a /r /d y | Out-Null
 if ($LASTEXITCODE -ne 0) { Write-Error "Failed to take ownership of $PROVIDER_DIR" }
 
 # Reset wipes all explicit ACEs and re-enables inheritance, then /inheritance:r
@@ -302,3 +303,5 @@ if ($secretsManagerEnabled) { $installedServices += $ASM_SERVICE }
 if ($installedServices) {
     Write-Host "  Services:   $($installedServices -join ', ')"
 }
+# A leftover native exit code must not read as a refusal to the quick installer
+exit 0

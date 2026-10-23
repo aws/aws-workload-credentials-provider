@@ -41,6 +41,13 @@ if (-not (Test-Path $providerBin)) {
     Write-Error "Provider binary not found at $providerBin. Is the provider installed?"
 }
 
+# Trust the provider folder, and without -Config the existing config, by the same
+# rule as install.ps1
+Assert-AdminControlledProviderDir -NoCreate
+if (-not $Config -and (Test-Path $configPath)) {
+    Assert-AdminControlledConfig -Path $configPath
+}
+
 # --- Step 1: Parse old config to capture existing certificate state ---
 
 Write-Step "Parse current config"

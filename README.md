@@ -114,7 +114,7 @@ The script verifies the Authenticode signature on the binary and passes `-Config
 - `-Force` — \(Optional\) Stop running provider services before installing
 - `-DryRun` — \(Optional\) Download and verify, then stop without installing
 
-If you run the quick install without `-Config` and a config already exists, newer versions only use that config if administrators control it\. See the Windows EC2 tab in [Step 2](#workload-credentials-provider-install) for details and how to continue\.
+Newer versions stop if administrators don't control the provider folder or `C:\ProgramData\AWS`, with or without `-Config`\. Without `-Config`, they also only use an existing config if administrators control it\. See the Windows EC2 tab in [Step 2](#workload-credentials-provider-install) for details and how to continue\.
 
 ------
 
@@ -261,7 +261,7 @@ Based on the type of compute, you have several options for installing the Worklo
    - `-Config <file>` — (Optional) Bootstrap config to use
    - `-NoStart` — (Optional) Install but don't start services
 
-   If you don't pass `-Config` and `C:\ProgramData\AWS\WorkloadCredentialsProvider\config.toml` already exists, the script uses it only if an administrator owns it and no account other than an administrator has a write grant on it\. Otherwise it stops and prints how to continue: stop the services, copy and review the config, delete the folder, and re\-run with `-Config` right away, without restarting in between\. Deleting the folder also removes the token file, so after the re\-run, grant your application read access to the new token file again \(see the next step\)\. This can also happen when the config was installed by an account that is an administrator only through a domain group, or by an account that has since been deleted\.
+   If you don't pass `-Config` and `C:\ProgramData\AWS\WorkloadCredentialsProvider\config.toml` already exists, the script uses it only if an administrator owns it and no account other than an administrator has a write grant on it\. The same rule applies to the `WorkloadCredentialsProvider` folder on every install, and `acmReloadConfig.ps1` follows it too\. `C:\ProgramData\AWS` must be owned by an administrator and must not let other accounts delete, rename, or change permissions on what is in it\. Otherwise the script stops and prints how to continue: stop the services, give administrators access to the folder, copy the logs and the config and review the config, delete the folder, remove leftover renewal tasks, and re\-run with `-Config`\. Before re\-running, make sure both services are stopped; they start again after a restart\. Deleting the folder also removes the token file, so after the re\-run, grant your application read access to the new token file again \(see the next step\)\. This can also happen when an older version installed the config under an account that is an administrator only through a domain group, or under an account that has since been deleted\. New installs make the Administrators group the owner\.
 
    The script generates a random SSRF token on startup and stores it in the file `C:\ProgramData\AWS\WorkloadCredentialsProvider\awssmatoken`\. The token is readable by the Secrets Manager service account (`NT SERVICE\AWSWorkloadCredentialsProvider-SecretsManager`) that the install script configures\.
 
