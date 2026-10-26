@@ -216,7 +216,8 @@ function Add-CertificateTasksPermissions($config) {
 <#
 .DESCRIPTION
     Validates the Config exists and passes validation implemented by the ProviderBinary
-    Return $null if the file doesn't exist, is not controlled by administrators, or validation fails
+    Return $null if the file doesn't exist or validation fails. The caller checks that
+    administrators control it first.
 
 .PARAMETER Config
     Path to the config file to be validated
@@ -230,9 +231,6 @@ function Get-Config {
     )
     if (-not (Test-Path $Config)) {
         Write-Host "  No config found at $Config"
-        return $null
-    }
-    if (-not (Test-AdminControlledConfig -Path $Config)) {
         return $null
     }
     try {
@@ -288,27 +286,23 @@ function Write-ConfigRefusal {
         [Parameter(Mandatory)][string]$Reason
     )
 
-    $dir = $PROVIDER_DIR
     Write-Host "`n Not using ${Path}: $Reason." -ForegroundColor Red
-    Write-Host " $dir, and without -Config an existing config in it, are only used if an administrator owns them and" -ForegroundColor Red
-    Write-Host " no account other than an administrator has a write grant on them." -ForegroundColor Red
-    Write-Host " To continue:" -ForegroundColor Red
-    # Whoever controls the folder can lock administrators out of it, so the steps
-    # start by giving them access, except for a junction, where takeown and icacls
-    # would change its target instead
-    $steps = @("Stop the $ACM_SERVICE and $ASM_SERVICE services if they are running.")
-    $item = Get-Item -LiteralPath $dir -Force -ErrorAction SilentlyContinue
-    if (-not ($item -and ($item.Attributes -band [IO.FileAttributes]::ReparsePoint))) {
-        $steps += "Give administrators access to ${dir}:  takeown /f `"$dir`" /r /a /d y  and then  icacls `"$dir`" /reset /t"
+    # The scripts that would fix it refuse first, so they can't stop the services
+    Write-Host " Only administrators should control it. Stop both provider services; they start again after a restart." -ForegroundColor Red
+    # A config that another account could edit may have its own refresh_command, and
+    # may have left renewal tasks behind. Both run as SYSTEM.
+    $tasks = "remove renewal tasks (AWSWorkloadCredentialsProvider-Reload-*) it no longer needs"
+    if ($Path -ne $PROVIDER_DIR) {
+        Write-Host " If you can't open it, take ownership of it and give administrators access first. Review it, including every refresh_command, and $tasks." -ForegroundColor Red
+        Write-Host " Then run this again with -Config and the reviewed copy, and start both services again if they are not running." -ForegroundColor Red
+    } else {
+        # Fixing it in place would keep whatever another account put in it, and
+        # deleting through a junction deletes what it points to
+        Write-Host " If you can't open the folder, take ownership of it and give administrators access first. Back up the logs, and the config if there is one," -ForegroundColor Red
+        Write-Host " then delete the folder. If it, or anything in it, is a junction or symbolic link, delete only the link." -ForegroundColor Red
+        Write-Host " If there was a config, review it, including every refresh_command, and $tasks." -ForegroundColor Red
+        Write-Host " Then run the installer again, with -Config and the reviewed config if there was one." -ForegroundColor Red
     }
-    $steps += "Copy the logs folder, and $CONFIG_FILE_NAME if there is one, from $dir to a folder only administrators can write to. Review the config, including every refresh_command."
-    $steps += "Delete ${dir}:  cmd /c rmdir /s /q `"$dir`""
-    $steps += "List the renewal tasks left from the old config:  Get-ScheduledTask -TaskName 'AWSWorkloadCredentialsProvider-Reload-*'  and remove the ones the reviewed config doesn't need with  Unregister-ScheduledTask -TaskName <name>"
-    $steps += "Re-run the installer with -Config <path to the reviewed copy>, or without -Config if there was no config."
-    for ($i = 0; $i -lt $steps.Count; $i++) {
-        Write-Host "   $($i + 1). $($steps[$i])" -ForegroundColor Red
-    }
-    Write-Host " Before step $($steps.Count), make sure both services are stopped; they start again after a restart." -ForegroundColor Red
     exit $EXIT_CONFIG_NOT_TRUSTED
 }
 
@@ -331,7 +325,16 @@ function Write-ParentRefusal {
     Write-Host "`n Not using ${Path}: $Reason." -ForegroundColor Red
     Write-Host " $Path must be a folder, not a junction or symbolic link. An administrator must own it, and no account" -ForegroundColor Red
     Write-Host " other than an administrator may delete, rename, change permissions on, or take ownership of what is in it." -ForegroundColor Red
-    Write-Host " Fix its owner and permissions, for example with icacls, then re-run the installer." -ForegroundColor Red
+    Write-Host " Stop both provider services; they start again after a restart." -ForegroundColor Red
+    # Changing the permissions of a junction or symbolic link changes its target instead,
+    # so unless it is known to be a real folder, replacing it is the safe advice
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    if (-not $item -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -or -not $item.PSIsContainer) {
+        Write-Host " Replace it with a real folder that only administrators control." -ForegroundColor Red
+    } else {
+        Write-Host " Fix its owner and permissions." -ForegroundColor Red
+    }
+    Write-Host " Then run this again, and start both services again if they are not running." -ForegroundColor Red
     exit $EXIT_CONFIG_NOT_TRUSTED
 }
 
@@ -444,11 +447,15 @@ function Get-PrincipalName {
     Path to the config file or folder to check
 .PARAMETER WriteRightsMask
     Rights that count as a write grant
+.PARAMETER CountInheritOnly
+    Also count grants that only pass down to new files and folders, for the provider
+    folder, so the files the installer creates in it can't get them
 #>
 function Get-ConfigControlProblem {
     param(
         [Parameter(Mandatory)][string]$Path,
-        [int]$WriteRightsMask = $WRITE_RIGHTS_MASK
+        [int]$WriteRightsMask = $WRITE_RIGHTS_MASK,
+        [switch]$CountInheritOnly
     )
 
     $acl = $null
@@ -481,7 +488,8 @@ function Get-ConfigControlProblem {
 
     foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
         if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) { continue }
-        if ($rule.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly) { continue }
+        if (-not $CountInheritOnly -and
+                ($rule.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly)) { continue }
         $sid = $rule.IdentityReference.Value
         if ($OWNER_PLACEHOLDER_SIDS -contains $sid) { continue }
         if (([int]$rule.FileSystemRights -band $WriteRightsMask) -eq 0) { continue }
@@ -499,7 +507,7 @@ function Get-ConfigControlProblem {
 
 <#
 .DESCRIPTION
-    Exits $EXIT_CONFIG_NOT_TRUSTED with recovery steps unless the config at Path is owned
+    Exits $EXIT_CONFIG_NOT_TRUSTED unless the config at Path is owned
     by an administrator and no account other than an administrator has a write grant on it
 
 .PARAMETER Path
@@ -508,11 +516,7 @@ function Get-ConfigControlProblem {
 function Assert-AdminControlledConfig {
     param([Parameter(Mandatory)][string]$Path)
 
-    try {
-        $reason = Get-ConfigControlProblem -Path $Path
-    } catch {
-        $reason = "its permissions could not be checked: $($_.Exception.Message.Trim().TrimEnd('.'))"
-    }
+    $reason = Get-ExistingConfigProblem -Path $Path
     if ($reason) {
         Write-ConfigRefusal -Path $Path -Reason $reason
     }
@@ -520,8 +524,26 @@ function Assert-AdminControlledConfig {
 
 <#
 .DESCRIPTION
+    Returns why the existing config at Path is not controlled by administrators, or
+    $null if it is
+
+.PARAMETER Path
+    Path to the existing config file
+#>
+function Get-ExistingConfigProblem {
+    param([Parameter(Mandatory)][string]$Path)
+
+    try {
+        return Get-ConfigControlProblem -Path $Path
+    } catch {
+        return "its permissions could not be checked: $($_.Exception.Message.Trim().TrimEnd('.'))"
+    }
+}
+
+<#
+.DESCRIPTION
     Returns $true if the config at Path is controlled by administrators. Otherwise
-    warns that cleanup based on it is skipped and returns $false.
+    warns and returns $false.
 
 .PARAMETER Path
     Path to the existing config file
@@ -529,16 +551,95 @@ function Assert-AdminControlledConfig {
 function Test-AdminControlledConfig {
     param([Parameter(Mandatory)][string]$Path)
 
-    try {
-        $reason = Get-ConfigControlProblem -Path $Path
-    } catch {
-        $reason = "its permissions could not be checked: $($_.Exception.Message.Trim().TrimEnd('.'))"
-    }
+    $reason = Get-ExistingConfigProblem -Path $Path
     if ($reason) {
         Write-Warning "Not using ${Path}: $reason - will skip permission cleanup"
         return $false
     }
     return $true
+}
+
+<#
+.DESCRIPTION
+    Writes a validated config to Destination as a new file, so no owner or explicit
+    ACE of an existing one is kept. Exits $EXIT_CONFIG_NOT_TRUSTED if Source is the
+    untrusted Destination under any path, or the untrusted Destination can't be opened
+    or moved.
+
+.PARAMETER Source
+    Path to the validated config
+.PARAMETER Destination
+    Path the config is installed to
+.PARAMETER ReplaceUntrusted
+    Destination exists and administrators don't control it
+#>
+function Copy-ConfigIntoPlace {
+    param(
+        [Parameter(Mandatory)][string]$Source,
+        [Parameter(Mandatory)][string]$Destination,
+        [switch]$ReplaceUntrusted
+    )
+
+    $sourcePath = (Resolve-Path -LiteralPath $Source).ProviderPath
+    # The folder is admin-only, so nobody else can make these names
+    $newPath = "$Destination.new"
+    $oldPath = "$Destination.old"
+    $cantUse = {
+        param($Action, $Err)
+        Write-Host "`n Could not $Action ${Destination}, which administrators don't control: $($Err.Exception.GetBaseException().Message.Trim())" -ForegroundColor Red
+        Write-Host " If you can't open it, take ownership of it and give administrators access first. If another program has it open, close that program. Then run this again." -ForegroundColor Red
+        exit $EXIT_CONFIG_NOT_TRUSTED
+    }
+    if ($ReplaceUntrusted) {
+        # While the untrusted file is held open with no sharing, opening it by any
+        # other path (a short name, a share or a link) fails. Opening it fails if its
+        # owner gave administrators no access to it, or another program has it open.
+        try {
+            $held = [IO.File]::Open($Destination, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)
+        } catch {
+            & $cantUse "open" $_
+        }
+        try {
+            $bytes = [IO.File]::ReadAllBytes($sourcePath)
+        } catch [IO.IOException] {
+            # ERROR_SHARING_VIOLATION
+            if ($_.Exception.GetBaseException().HResult -ne -2147024864) { throw }
+            Write-Host "`n -Config is the existing $CONFIG_FILE_NAME, which administrators don't control, or another program has it open. Pass a reviewed copy that only administrators can change." -ForegroundColor Red
+            exit $EXIT_CONFIG_NOT_TRUSTED
+        } finally {
+            $held.Dispose()
+        }
+    } else {
+        $bytes = [IO.File]::ReadAllBytes($sourcePath)
+    }
+    # Cleared only once Source is read, in case it is a leftover one
+    Remove-Item -LiteralPath $newPath, $oldPath -Force -ErrorAction SilentlyContinue
+    # Written as a new file and then renamed, so no owner or explicit ACE of the old
+    # one is kept
+    [IO.File]::WriteAllBytes($newPath, $bytes)
+    if (Test-Path -LiteralPath $Destination) {
+        try {
+            [IO.File]::Move($Destination, $oldPath)
+        } catch {
+            Remove-Item -LiteralPath $newPath -Force -ErrorAction SilentlyContinue
+            if (-not $ReplaceUntrusted) { throw }
+            & $cantUse "move aside" $_
+        }
+    }
+    try {
+        [IO.File]::Move($newPath, $Destination)
+    } catch {
+        # Without a config, later runs would install in Secrets Manager only mode
+        if (Test-Path -LiteralPath $oldPath) {
+            [IO.File]::Move($oldPath, $Destination)
+        }
+        throw
+    }
+    # -Force also deletes a read-only one
+    Remove-Item -LiteralPath $oldPath -Force -ErrorAction SilentlyContinue
+    if (Test-Path -LiteralPath $oldPath) {
+        Write-Warning "Could not delete the old config, $oldPath. Delete it."
+    }
 }
 
 <#
@@ -549,37 +650,86 @@ function Test-AdminControlledConfig {
     Path to the folder to check
 .PARAMETER WriteRightsMask
     Rights that count as a write grant
+.PARAMETER CountInheritOnly
+    Also count grants that only pass down to new files and folders
 #>
 function Get-FolderControlProblem {
     param(
         [Parameter(Mandatory)][string]$Path,
-        [Parameter(Mandatory)][int]$WriteRightsMask
+        [Parameter(Mandatory)][int]$WriteRightsMask,
+        [switch]$CountInheritOnly
     )
 
     $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
     if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { return "it is a junction or symbolic link" }
     if (-not $item.PSIsContainer) { return "it is not a folder" }
-    return Get-ConfigControlProblem -Path $Path -WriteRightsMask $WriteRightsMask
+    return Get-ConfigControlProblem -Path $Path -WriteRightsMask $WriteRightsMask -CountInheritOnly:$CountInheritOnly
 }
 
 <#
 .DESCRIPTION
-    Creates a folder owned by Administrators that only SYSTEM and Administrators can
-    access, in one step, so no other account can use it before its permissions are set
+    Returns a protected access list that gives only SYSTEM and Administrators access,
+    passed down to everything in the folder
 
-.PARAMETER Path
-    Path to the folder to create
+.PARAMETER UsersRead
+    Also let Users read, for C:\ProgramData\AWS, which other tools may share
 #>
-function New-AdminOnlyDirectory {
-    param([Parameter(Mandatory)][string]$Path)
+function New-AdminOnlyDirectorySecurity {
+    param([switch]$UsersRead)
 
     $security = New-Object Security.AccessControl.DirectorySecurity
-    $security.SetOwner((New-Object Security.Principal.SecurityIdentifier "S-1-5-32-544"))
     $security.SetAccessRuleProtection($true, $false)
     foreach ($sid in @("S-1-5-18", "S-1-5-32-544")) {
         $security.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule -ArgumentList `
             (New-Object Security.Principal.SecurityIdentifier $sid), "FullControl", "ContainerInherit, ObjectInherit", "None", "Allow"))
     }
+    if ($UsersRead) {
+        $security.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule -ArgumentList `
+            (New-Object Security.Principal.SecurityIdentifier "S-1-5-32-545"), "ReadAndExecute", "ContainerInherit, ObjectInherit", "None", "Allow"))
+    }
+    return $security
+}
+
+<#
+.DESCRIPTION
+    Replaces the whole access list of an existing folder with the admin-only one, in
+    one step, so no entry from before is left and it never inherits from its parent
+
+.PARAMETER Path
+    Path to the folder
+#>
+function Set-AdminOnlyDirectoryAcl {
+    param([Parameter(Mandatory)][string]$Path)
+
+    # Only the access list is written, the owner is left as is
+    $security = New-AdminOnlyDirectorySecurity
+    $dir = New-Object IO.DirectoryInfo $Path
+    if ($PSVersionTable.PSEdition -eq "Core") {
+        [IO.FileSystemAclExtensions]::SetAccessControl($dir, $security)
+    } else {
+        $dir.SetAccessControl($security)
+    }
+}
+
+<#
+.DESCRIPTION
+    Creates a folder owned by Administrators that only SYSTEM and Administrators can
+    access (and Users read, with -UsersRead), in one step, so no other account can use
+    it before its permissions are set
+
+.PARAMETER Path
+    Path to the folder to create
+.PARAMETER UsersRead
+    Also let Users read the folder, for C:\ProgramData\AWS, which other tools may share
+#>
+function New-AdminOnlyDirectory {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [switch]$UsersRead
+    )
+
+    $security = New-AdminOnlyDirectorySecurity -UsersRead:$UsersRead
+    $security.SetOwner((New-Object Security.Principal.SecurityIdentifier "S-1-5-32-544"))
     if ($PSVersionTable.PSEdition -eq "Core") {
         # PowerShell 7 has no Directory.CreateDirectory overload that takes security
         [IO.FileSystemAclExtensions]::Create((New-Object IO.DirectoryInfo $Path), $security)
@@ -591,7 +741,7 @@ function New-AdminOnlyDirectory {
 <#
 .DESCRIPTION
     Creates the provider data directory admin-only if it is missing. Then exits
-    $EXIT_CONFIG_NOT_TRUSTED with recovery steps unless both it and its parent are
+    $EXIT_CONFIG_NOT_TRUSTED unless both it and its parent are
     real folders owned by an administrator, the provider folder has no write grant
     for other accounts, and the parent gives other accounts no delete, delete-child,
     WRITE_DAC or WRITE_OWNER rights, so nobody else can rename the provider folder
@@ -606,7 +756,9 @@ function Assert-AdminControlledProviderDir {
     $parent = Split-Path -Parent $PROVIDER_DIR
     if (-not $NoCreate) {
         if (-not (Test-Path -LiteralPath $parent)) {
-            New-Item -ItemType Directory -Path $parent | Out-Null
+            # Owned by Administrators, and Users can't add folders, so nobody else
+            # can put their own provider folder in it later, after uninstall -RemoveAll
+            New-AdminOnlyDirectory -Path $parent -UsersRead
         } else {
             # Nothing is created in an existing parent before it is checked
             Assert-AdminControlledFolder -Path $parent -Parent
@@ -624,7 +776,7 @@ function Assert-AdminControlledProviderDir {
 
 <#
 .DESCRIPTION
-    Exits $EXIT_CONFIG_NOT_TRUSTED with recovery steps unless the folder at Path is a
+    Exits $EXIT_CONFIG_NOT_TRUSTED unless the folder at Path is a
     real folder controlled by administrators
 
 .PARAMETER Path
@@ -641,7 +793,9 @@ function Assert-AdminControlledFolder {
 
     $mask = if ($Parent) { $PARENT_WRITE_RIGHTS_MASK } else { $WRITE_RIGHTS_MASK }
     try {
-        $reason = Get-FolderControlProblem -Path $Path -WriteRightsMask $mask
+        # The parent's grants only reach the provider folder if it inherits, and the
+        # installer turns that off
+        $reason = Get-FolderControlProblem -Path $Path -WriteRightsMask $mask -CountInheritOnly:(-not $Parent)
     } catch {
         $reason = "its permissions could not be checked: $($_.Exception.Message.Trim().TrimEnd('.'))"
     }

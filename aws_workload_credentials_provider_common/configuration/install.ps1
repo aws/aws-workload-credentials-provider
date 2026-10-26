@@ -140,7 +140,11 @@ if ($Config) {
     $validatedConfig = Confirm-Config -Config $Config -ProviderBinary $providerBinary
     $secretsManagerEnabled = $validatedConfig.enabledCapabilities -contains "secrets-manager"
     $acmEnabled = $validatedConfig.enabledCapabilities -contains "acm"
-    Copy-Item -Path $Config -Destination $defaultConfigPath -Force
+    $oldConfigProblem = if (Test-ExistingConfig) { Get-ExistingConfigProblem -Path $defaultConfigPath } else { $null }
+    Copy-ConfigIntoPlace -Source $Config -Destination $defaultConfigPath -ReplaceUntrusted:([bool]$oldConfigProblem)
+    if ($oldConfigProblem) {
+        Write-Warning "Replaced the old ${defaultConfigPath}, which administrators didn't control: $oldConfigProblem. Renewal tasks from it (AWSWorkloadCredentialsProvider-Reload-*) and the permissions it granted on certificate files were not removed. The tasks run as SYSTEM, so remove the ones the new config doesn't need."
+    }
 } else {
     if (-not (Test-ExistingConfig)) {
         $secretsManagerEnabled = $true
@@ -223,14 +227,15 @@ Write-Step "Configure provider directory ACLs"
 takeown /f $PROVIDER_DIR /a /r /d y | Out-Null
 if ($LASTEXITCODE -ne 0) { Write-Error "Failed to take ownership of $PROVIDER_DIR" }
 
-# Reset wipes all explicit ACEs and re-enables inheritance, then /inheritance:r
-# strips the inherited ones, leaving a blank DACL to rebuild from scratch.
-icacls $PROVIDER_DIR /reset /T /Q | Out-Null
-if ($LASTEXITCODE -ne 0) { Write-Error "Failed to reset ACLs on $PROVIDER_DIR" }
-icacls $PROVIDER_DIR /inheritance:r /Q | Out-Null
-if ($LASTEXITCODE -ne 0) { Write-Error "Failed to remove inherited ACLs on $PROVIDER_DIR" }
-icacls $PROVIDER_DIR /grant "SYSTEM:(OI)(CI)F" /T /Q | Out-Null
-icacls $PROVIDER_DIR /grant "BUILTIN\Administrators:(OI)(CI)F" /T /Q | Out-Null
+# Replace the folder's whole access list first, so it never inherits from
+# C:\ProgramData\AWS, where Users can add files, and no older entry is left to pass
+# down. Then reset only its contents, which wipes their explicit ACEs and lets them
+# inherit from the locked folder.
+Set-AdminOnlyDirectoryAcl -Path $PROVIDER_DIR
+if (Get-ChildItem -LiteralPath $PROVIDER_DIR -Force) {
+    icacls "$PROVIDER_DIR\*" /reset /T /Q | Out-Null
+    if ($LASTEXITCODE -ne 0) { Write-Error "Failed to reset ACLs in $PROVIDER_DIR" }
+}
 
 icacls $PROVIDER_DIR /grant "${ASM_SERVICE_ACCOUNT}:(OI)(CI)RX" /T /Q | Out-Null
 Write-Host "  Granted Read+Execute ACL to $ASM_SERVICE_ACCOUNT on $PROVIDER_DIR"

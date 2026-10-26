@@ -230,7 +230,7 @@ try {
     $delegateExit = $LASTEXITCODE
     if ($EXIT_CONFIG_NOT_TRUSTED -and $delegateExit -eq $EXIT_CONFIG_NOT_TRUSTED) {
         $configRefused = $true
-        throw "configuration\install.ps1 did not use the existing provider folder or config; follow the steps above. The binary was not changed."
+        throw "configuration\install.ps1 did not use $(Split-Path -Parent $PROVIDER_DIR), the provider folder in it, or its config; see the message above. The binary was not changed."
     }
     if ($EXIT_CONFIG_INVALID -and $delegateExit -eq $EXIT_CONFIG_INVALID) {
         $configRefused = $true
@@ -272,7 +272,7 @@ try {
     if (-not $installed) {
         # A refusal happens before the delegate installs anything
         if ($delegateRan -and -not $configRefused) {
-            Write-Warning "configuration\install.ps1 had already started, so this host may be partially installed: re-run to finish, or run $BIN_DIR\uninstall.ps1 to remove it."
+            Write-Warning "configuration\install.ps1 had already started, so this host may be partially installed: re-run to finish, or download the v$Version source and run aws_workload_credentials_provider_common\configuration\uninstall.ps1 from it to remove it."
         }
         foreach ($name in $stoppedServices) {
             try {
