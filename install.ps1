@@ -32,7 +32,7 @@
 .EXAMPLE
     $installer = Join-Path $env:TEMP "awcp-install.ps1"
     Invoke-WebRequest -UseBasicParsing https://raw.githubusercontent.com/aws/aws-workload-credentials-provider/HEAD/install.ps1 -OutFile $installer
-    & $installer -Version 3.1.1 -Config C:\path\to\config.toml
+    & $installer -Version 3.2.0 -Config C:\path\to\config.toml
 
     Downloaded to a file rather than run from the response, because
     [scriptblock]::Create() on an empty body silently does nothing and reports
@@ -88,7 +88,7 @@ if (-not $current.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrato
 }
 
 if (-not $Version) {
-    throw "Pass -Version (or set AWCP_VERSION) to the version to install, as in -Version 3.1.1"
+    throw "Pass -Version (or set AWCP_VERSION) to the version to install, as in -Version 3.2.0"
 }
 # \z, not $: .NET's $ also matches before a trailing newline, so a version with
 # one on the end would pass and then be interpolated into the download URLs.
