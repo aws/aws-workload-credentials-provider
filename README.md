@@ -84,7 +84,7 @@ The bootstrap installers download a released binary and the matching configurati
 installer=$(mktemp) && trap 'rm -f "$installer"' EXIT &&
   curl --proto '=https' --tlsv1.2 -fsSL -o "$installer" \
     https://raw.githubusercontent.com/aws/aws-workload-credentials-provider/HEAD/install.sh &&
-  sudo AWCP_VERSION=3.2.0 bash "$installer" --config /path/to/config.toml
+  sudo AWCP_VERSION=3.1.2 bash "$installer" --config /path/to/config.toml
 ```
 
 `AWCP_VERSION` is required and must name a released, tagged version\. The script downloads the binary for your architecture from the artifact host and the service units and install scripts from the `v$AWCP_VERSION` tag, then hands off to the `install` script described in [Step 2](#workload-credentials-provider-install)\. It also accepts `--dry-run`, which downloads everything, keeps it, and prints where, without installing\.
@@ -101,20 +101,20 @@ Run the following in an Administrator PowerShell session\. If the download fails
 ```powershell
 $installer = Join-Path $env:TEMP "awcp-install.ps1"
 Invoke-WebRequest -UseBasicParsing https://raw.githubusercontent.com/aws/aws-workload-credentials-provider/HEAD/install.ps1 -OutFile $installer
-& $installer -Version 3.2.0 -Config C:\path\to\config.toml
+& $installer -Version 3.1.2 -Config C:\path\to\config.toml
 Remove-Item $installer
 ```
 
 Download to a file rather than running the response directly: `[scriptblock]::Create()` on an empty body produces a script block that does nothing and reports success, so a truncated or empty download would read as a completed install\.
 
-If your execution policy refuses to run the file, or refuses the unsigned install scripts it downloads, run it as `powershell.exe -ExecutionPolicy Bypass -File $installer -Version 3.2.0 -Config C:\path\to\config.toml`\. The script checks the policy before downloading anything and tells you the same thing\.
+If your execution policy refuses to run the file, or refuses the unsigned install scripts it downloads, run it as `powershell.exe -ExecutionPolicy Bypass -File $installer -Version 3.1.2 -Config C:\path\to\config.toml`\. The script checks the policy before downloading anything and tells you the same thing\.
 
 The script verifies the Authenticode signature on the binary and passes `-Config` and `-NoStart` through to the `install.ps1` script described in [Step 2](#workload-credentials-provider-install)\. It also accepts the following parameters:
 - `-Version <x.y.z>` — Version to install; required, and may also be given as the `AWCP_VERSION` environment variable
 - `-Force` — \(Optional\) Stop running provider services before installing
 - `-DryRun` — \(Optional\) Download and verify, then stop without installing
 
-Version 3\.2\.0 and later stop if administrators don't control the provider folder or `C:\ProgramData\AWS`, with or without `-Config`\. Without `-Config`, they also only use an existing config if administrators control it\. See the Windows EC2 tab in [Step 2](#workload-credentials-provider-install) for details and how to continue\.
+Version 3\.1\.2 and later stop if administrators don't control the provider folder or `C:\ProgramData\AWS`, with or without `-Config`\. Without `-Config`, they also only use an existing config if administrators control it\. See the Windows EC2 tab in [Step 2](#workload-credentials-provider-install) for details and how to continue\.
 
 ------
 

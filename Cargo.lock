@@ -669,7 +669,7 @@ dependencies = [
 
 [[package]]
 name = "aws_certificatemanager_provider"
-version = "3.2.0"
+version = "3.1.2"
 dependencies = [
  "aws-config",
  "aws-credential-types",
@@ -720,7 +720,7 @@ dependencies = [
 
 [[package]]
 name = "aws_secretsmanager_provider"
-version = "3.2.0"
+version = "3.1.2"
 dependencies = [
  "arc-swap",
  "aws-config",
@@ -753,7 +753,7 @@ dependencies = [
 
 [[package]]
 name = "aws_workload_credentials_provider"
-version = "3.2.0"
+version = "3.1.2"
 dependencies = [
  "aws_certificatemanager_provider",
  "aws_secretsmanager_provider",
@@ -770,7 +770,7 @@ dependencies = [
 
 [[package]]
 name = "aws_workload_credentials_provider_common"
-version = "3.2.0"
+version = "3.1.2"
 dependencies = [
  "chrono",
  "dunce",
