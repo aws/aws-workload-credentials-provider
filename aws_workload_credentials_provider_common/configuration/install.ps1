@@ -126,8 +126,9 @@ if (-not (Test-Path $providerBinary)) {
     Write-Error "Cannot read $providerBinary"
 }
 
-# Ensure provider data directory exists before config validation/copy.
-New-Item -ItemType Directory -Path $PROVIDER_DIR -Force | Out-Null
+# Ensure provider data directory exists, and is controlled by administrators,
+# before config validation/copy.
+Assert-AdminControlledProviderDir
 
 # Copy over a new config if one was provided (first install, or reinstall with
 # updated config). On reinstalls without -Config, validate the config left
@@ -139,13 +140,19 @@ if ($Config) {
     $validatedConfig = Confirm-Config -Config $Config -ProviderBinary $providerBinary
     $secretsManagerEnabled = $validatedConfig.enabledCapabilities -contains "secrets-manager"
     $acmEnabled = $validatedConfig.enabledCapabilities -contains "acm"
-    Copy-Item -Path $Config -Destination $defaultConfigPath -Force
+    $oldConfigProblem = if (Test-ExistingConfig) { Get-ExistingConfigProblem -Path $defaultConfigPath } else { $null }
+    Copy-ConfigIntoPlace -Source $Config -Destination $defaultConfigPath -ReplaceUntrusted:([bool]$oldConfigProblem)
+    if ($oldConfigProblem) {
+        Write-Warning "Replaced the old ${defaultConfigPath}, which administrators didn't control: $oldConfigProblem. Renewal tasks from it (AWSWorkloadCredentialsProvider-Reload-*) and the permissions it granted on certificate files were not removed. The tasks run as SYSTEM, so remove the ones the new config doesn't need."
+    }
 } else {
-    if (-not (Test-Path $defaultConfigPath)) {
+    if (-not (Test-ExistingConfig)) {
         $secretsManagerEnabled = $true
         $acmEnabled = $false
         Write-Host "No config found at $defaultConfigPath. Installing in default SecretsManager only mode."
     } else {
+        # Only use a config left in place if administrators control it.
+        Assert-AdminControlledConfig -Path $defaultConfigPath
         $validatedConfig = Confirm-Config -Config $defaultConfigPath -ProviderBinary $providerBinary
         $secretsManagerEnabled = $validatedConfig.enabledCapabilities -contains "secrets-manager"
         $acmEnabled = $validatedConfig.enabledCapabilities -contains "acm"
@@ -217,17 +224,18 @@ Write-Step "Configure provider directory ACLs"
 # Remove inherited ACLs (e.g., Users read access from ProgramData) so only
 # SYSTEM, Administrators, and the two service accounts can access this directory.
 # Take ownership first to neutralize pre-creation attacks via implicit owner DACL-write.
-takeown /f $PROVIDER_DIR /r /d y | Out-Null
+takeown /f $PROVIDER_DIR /a /r /d y | Out-Null
 if ($LASTEXITCODE -ne 0) { Write-Error "Failed to take ownership of $PROVIDER_DIR" }
 
-# Reset wipes all explicit ACEs and re-enables inheritance, then /inheritance:r
-# strips the inherited ones, leaving a blank DACL to rebuild from scratch.
-icacls $PROVIDER_DIR /reset /T /Q | Out-Null
-if ($LASTEXITCODE -ne 0) { Write-Error "Failed to reset ACLs on $PROVIDER_DIR" }
-icacls $PROVIDER_DIR /inheritance:r /Q | Out-Null
-if ($LASTEXITCODE -ne 0) { Write-Error "Failed to remove inherited ACLs on $PROVIDER_DIR" }
-icacls $PROVIDER_DIR /grant "SYSTEM:(OI)(CI)F" /T /Q | Out-Null
-icacls $PROVIDER_DIR /grant "BUILTIN\Administrators:(OI)(CI)F" /T /Q | Out-Null
+# Replace the folder's whole access list first, so it never inherits from
+# C:\ProgramData\AWS, where Users can add files, and no older entry is left to pass
+# down. Then reset only its contents, which wipes their explicit ACEs and lets them
+# inherit from the locked folder.
+Set-AdminOnlyDirectoryAcl -Path $PROVIDER_DIR
+if (Get-ChildItem -LiteralPath $PROVIDER_DIR -Force) {
+    icacls "$PROVIDER_DIR\*" /reset /T /Q | Out-Null
+    if ($LASTEXITCODE -ne 0) { Write-Error "Failed to reset ACLs in $PROVIDER_DIR" }
+}
 
 icacls $PROVIDER_DIR /grant "${ASM_SERVICE_ACCOUNT}:(OI)(CI)RX" /T /Q | Out-Null
 Write-Host "  Granted Read+Execute ACL to $ASM_SERVICE_ACCOUNT on $PROVIDER_DIR"
@@ -300,3 +308,5 @@ if ($secretsManagerEnabled) { $installedServices += $ASM_SERVICE }
 if ($installedServices) {
     Write-Host "  Services:   $($installedServices -join ', ')"
 }
+# A leftover native exit code must not read as a refusal to the quick installer
+exit 0

@@ -41,11 +41,24 @@ if (-not (Test-Path $providerBin)) {
     Write-Error "Provider binary not found at $providerBin. Is the provider installed?"
 }
 
+# Trust the provider folder, and without -Config the existing config, by the same
+# rule as install.ps1
+Assert-AdminControlledProviderDir -NoCreate
+$oldConfigProblem = $null
+if (Test-ExistingConfig) {
+    if ($Config) {
+        # The new config replaces it below
+        $oldConfigProblem = Get-ExistingConfigProblem -Path $configPath
+    } else {
+        Assert-AdminControlledConfig -Path $configPath
+    }
+}
+
 # --- Step 1: Parse old config to capture existing certificate state ---
 
 Write-Step "Parse current config"
 
-$oldConfig = Get-Config -Config $configPath -ProviderBinary $providerBin
+$oldConfig = if ($oldConfigProblem) { $null } else { Get-Config -Config $configPath -ProviderBinary $providerBin }
 
 # --- Step 2: Validate and load new config ---
 
@@ -57,9 +70,12 @@ if ($Config) {
     if ($newConfig.enabledCapabilities -notcontains "acm") {
         Write-Error "ACM is not enabled in the new config. This script only reloads ACM certificate configuration."
     }
-    # Copy new config into place
-    Copy-Item -Path $Config -Destination $configPath -Force
+    Copy-ConfigIntoPlace -Source $Config -Destination $configPath -ReplaceUntrusted:([bool]$oldConfigProblem)
     Write-Host "  New config copied to $configPath"
+    if ($oldConfigProblem) {
+        # Step 5 warns about its tasks
+        Write-Warning "Replaced the old ${configPath}, which administrators didn't control: $oldConfigProblem."
+    }
 } else {
     if (-not (Test-Path $configPath)) {
         Write-Error "No config found at $configPath. Pass -Config to provide one."
@@ -73,6 +89,10 @@ if ($Config) {
 Write-Step "Configure config file permissions"
 
 # Apply config file ACLs so an edited-by-hand config gets re-locked on reinstall
+# A new config is owned by whoever ran this, who may be an administrator only
+# through a domain group, which a later trust check would refuse
+icacls $configPath /setowner "*S-1-5-32-544" /Q | Out-Null
+if ($LASTEXITCODE -ne 0) { Write-Error "Failed to make Administrators the owner of $configPath" }
 icacls $configPath /inheritance:r /Q | Out-Null
 icacls $configPath /grant "SYSTEM:F" /Q | Out-Null
 icacls $configPath /grant "BUILTIN\Administrators:F" /Q | Out-Null
@@ -96,6 +116,9 @@ if (Stop-ProviderService -Name $ACM_SERVICE) {
 # --- Step 5: Remove old certificate scheduled tasks and permissions ---
 
 Remove-CertificateTasksPermissions $oldConfig
+if ($oldConfigProblem) {
+    Write-Warning "Renewal tasks from the old config (AWSWorkloadCredentialsProvider-Reload-*) and the permissions it granted on certificate files were not removed. The tasks run as SYSTEM, so remove the ones the new config doesn't need."
+}
 
 # --- Step 6: Add new certificate permissions and scheduled tasks ---
 
@@ -110,5 +133,10 @@ if ($LASTEXITCODE -ne 0) {
     Write-Error "sc.exe start failed for $ACM_SERVICE (exit $LASTEXITCODE)"
 }
 Write-Host "  Started $ACM_SERVICE"
+
+# This script only restarts ACM, so Secrets Manager may still run with the old settings
+if ($oldConfigProblem -and (Get-Service -Name $ASM_SERVICE -ErrorAction SilentlyContinue | Where-Object Status -ne 'Stopped')) {
+    Write-Warning "$ASM_SERVICE may still use settings from the old config. Restart it."
+}
 
 Write-Host "`n ACM certificate config reload complete." -ForegroundColor Green

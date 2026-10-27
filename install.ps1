@@ -117,6 +117,7 @@ $stoppedServices = @()
 $installed = $false
 $keepStaging = $false
 $delegateRan = $false
+$configRefused = $false
 try {
     & icacls $tmp.FullName /inheritance:r /grant "*S-1-5-18:(OI)(CI)F" /grant "*S-1-5-32-544:(OI)(CI)F" /Q | Out-Null
     if ($LASTEXITCODE -ne 0) {
@@ -220,12 +221,21 @@ try {
     $global:LASTEXITCODE = 0
     $delegateRan = $true
     & $installScript @installArgs
-    # Not a verdict on its own. The delegate reports a rejected config by way of
-    # Confirm-Config's `exit 1`, but it also ends with unchecked `icacls` calls,
-    # and icacls exits nonzero over a single unresolvable principal, so a
-    # completed install can leave this set. What the install did is checked on
-    # disk below; this only sharpens the message.
+    # Not a verdict on its own, except for a refused or invalid config, which
+    # have their own exit codes from tags that define them. Older tags report a
+    # rejected config by way of Confirm-Config's `exit 1`, but also end with
+    # unchecked `icacls` calls, and icacls exits nonzero over a single
+    # unresolvable principal, so a completed install can leave this set. What the
+    # install did is checked on disk below; this only sharpens the message.
     $delegateExit = $LASTEXITCODE
+    if ($EXIT_CONFIG_NOT_TRUSTED -and $delegateExit -eq $EXIT_CONFIG_NOT_TRUSTED) {
+        $configRefused = $true
+        throw "configuration\install.ps1 did not use $(Split-Path -Parent $PROVIDER_DIR), the provider folder in it, or its config; see the message above. The binary was not changed."
+    }
+    if ($EXIT_CONFIG_INVALID -and $delegateExit -eq $EXIT_CONFIG_INVALID) {
+        $configRefused = $true
+        throw "configuration\install.ps1 did not use the config because it failed validation; see the errors above. The binary was not changed."
+    }
     $detail = if ($delegateExit -ne 0) { " (it exited $delegateExit)" } else { "" }
 
     # The delegate also exits 0 when it decides not to touch a running provider,
@@ -260,8 +270,9 @@ try {
     # token before seeding it, so what starts here may be the new binary against
     # a half-configured host.
     if (-not $installed) {
-        if ($delegateRan) {
-            Write-Warning "configuration\install.ps1 had already started, so this host may be partially installed: re-run to finish, or run $BIN_DIR\uninstall.ps1 to remove it."
+        # A refusal happens before the delegate installs anything
+        if ($delegateRan -and -not $configRefused) {
+            Write-Warning "configuration\install.ps1 had already started, so this host may be partially installed: re-run to finish, or download the v$Version source and run aws_workload_credentials_provider_common\configuration\uninstall.ps1 from it to remove it."
         }
         foreach ($name in $stoppedServices) {
             try {

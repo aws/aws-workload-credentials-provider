@@ -34,7 +34,7 @@ $providerBin = "$BIN_DIR\$PROVIDER_EXE"
 # Parse config before stopping services (needs the binary which lives in the
 # install directory that gets removed later).
 $jsonOutput = $null
-if ((Test-Path $configPath) -and (Test-Path $providerBin)) {
+if ((Test-Path $configPath) -and (Test-Path $providerBin) -and (Test-AdminControlledConfig -Path $configPath)) {
     try {
         $jsonOutput = & $providerBin setup-config-based-permissions --config $configPath 2>$null
         if ($LASTEXITCODE -ne 0) {
