@@ -17,7 +17,7 @@ url = "2"
 derive_builder = "0.20"
 tempfile = "3"
 serde = { version = "1", features = ["derive"] }
-toml = "0.8"
+toml = "1.1"
 
 [target.'cfg(windows)'.dependencies]
 base64 = "0.22"
