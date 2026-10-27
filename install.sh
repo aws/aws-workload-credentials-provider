@@ -4,7 +4,7 @@
 #   installer=$(mktemp) && trap 'rm -f "$installer"' EXIT &&
 #     curl --proto '=https' --tlsv1.2 -fsSL -o "$installer" \
 #       https://raw.githubusercontent.com/aws/aws-workload-credentials-provider/HEAD/install.sh &&
-#     sudo AWCP_VERSION=3.1.1 bash "$installer" --config /path/to/config.toml
+#     sudo AWCP_VERSION=3.1.2 bash "$installer" --config /path/to/config.toml
 #
 # Downloaded to a file rather than piped into a shell, because `bash -c "$(curl
 # ...)"` exits 0 when the download fails: the substitution is empty and nothing
@@ -78,7 +78,7 @@ main() {
 
     version="${AWCP_VERSION:-}"
     [ -n "$version" ] ||
-        die "set AWCP_VERSION to the version to install, as in 'sudo AWCP_VERSION=3.1.1 ...'"
+        die "set AWCP_VERSION to the version to install, as in 'sudo AWCP_VERSION=3.1.2 ...'"
     # Pattern-matched rather than piped through grep: ^ and $ anchor each line,
     # not the whole value, and sh builtins that expand \n would let a second
     # line ride along behind a valid first one.
@@ -192,8 +192,8 @@ main() {
 
     # Run through bash rather than exec'ing the file, so a noexec staging
     # directory doesn't block the install. -e is explicit because `bash <file>`
-    # drops the shebang's flags, and releases up to 3.1.1 take errexit from the
-    # shebang alone: without it their installer runs past a rejected config and
+    # drops the shebang's flags, and released install scripts take errexit from
+    # the shebang alone: without it the installer runs past a rejected config and
     # reports success.
     bash -e "$configuration/install" "$@"
 }

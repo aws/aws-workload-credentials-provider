@@ -1,6 +1,6 @@
 [package]
 name = "aws_secretsmanager_provider"
-version = "3.1.1"
+version = "3.1.2"
 edition = "2021"
 license = "Apache-2.0"
 description = "The AWS Secrets Manager Provider is a local HTTP service that you can install and use in your compute environments to read secrets from Secrets Manager and cache them in memory."
@@ -38,7 +38,7 @@ log4rs = { version = "1.2.0", features = ["gzip"] }
 tokio-util = "0.7.18"
 url = "2"
 aws_secretsmanager_caching = { version = "2.1.0", path = "../aws_secretsmanager_caching" }
-aws_workload_credentials_provider_common = { version = "3.1.1", path = "../aws_workload_credentials_provider_common" }
+aws_workload_credentials_provider_common = { version = "3.1.2", path = "../aws_workload_credentials_provider_common" }
 regex = "1"
 rand = "0.10"
 
