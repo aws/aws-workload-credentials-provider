@@ -2,7 +2,10 @@
 
 use std::sync::Arc;
 
+use std::time::Duration;
+
 use aws_config::BehaviorVersion;
+use aws_workload_credentials_provider_common::sdk_timeout::with_op_timeout;
 use log::info;
 use tokio_util::sync::CancellationToken;
 
@@ -14,6 +17,11 @@ use aws_workload_credentials_provider_common::config::types::AcmConfig;
 use aws_workload_credentials_provider_common::filesystem::RealFileSystem;
 #[cfg(unix)]
 use aws_workload_credentials_provider_common::shutdown_signal;
+
+/// Per-attempt SDK operation timeout for ACM `ExportCertificate` / inline
+/// STS AssumeRole calls. Slow tier: well above cross-region ExportCertificate
+/// latency. The SDK's 3.1s default connect timeout still bounds TCP connect.
+pub(crate) const ACM_SDK_OP_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Runs the ACM certificate refresh loop until SIGINT/SIGTERM.
 ///
@@ -48,7 +56,13 @@ pub async fn acm_workload(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!("Initializing ACM provider");
 
-    let sdk_config = aws_config::defaults(BehaviorVersion::latest()).load().await;
+    // Bound every ACM/STS call with a per-attempt operation timeout so a hung
+    // service response can't stall a certificate refresh (→ cert expiry).
+    // Applies to every client built from this config.
+    let sdk_config = with_op_timeout(
+        aws_config::load_defaults(BehaviorVersion::latest()).await,
+        ACM_SDK_OP_ATTEMPT_TIMEOUT,
+    );
 
     let role_arns = acm_config
         .certificates

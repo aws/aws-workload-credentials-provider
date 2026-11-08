@@ -60,7 +60,10 @@ fn summarize_sdk_error(e: &SdkError<ExportCertificateError, HttpResponse>) -> St
                 msg
             )
         }
-        SdkError::TimeoutError(_) => "Timeout".to_string(),
+        SdkError::TimeoutError(_) => format!(
+            "{}s per-attempt SDK operation timeout exceeded",
+            crate::run::ACM_SDK_OP_ATTEMPT_TIMEOUT.as_secs()
+        ),
         SdkError::DispatchFailure(e) => {
             let detail = e
                 .as_connector_error()
@@ -234,7 +237,26 @@ mod tests {
         let err: SdkError<ExportCertificateError, HttpResponse> =
             SdkError::timeout_error("request timed out");
         let summary = summarize_sdk_error(&err);
-        assert_eq!(summary, "Timeout");
+        assert_eq!(
+            summary,
+            format!(
+                "{}s per-attempt SDK operation timeout exceeded",
+                crate::run::ACM_SDK_OP_ATTEMPT_TIMEOUT.as_secs()
+            )
+        );
+    }
+
+    #[test]
+    fn classify_timeout_error_is_transient() {
+        // A per-attempt SDK timeout must classify as Transient and carry the
+        // timeout detail in its summary (so the task-level log names the cause).
+        let err: SdkError<ExportCertificateError, HttpResponse> =
+            SdkError::timeout_error("timed out");
+        let classified = classify_export_error(err);
+        assert!(classified.is_transient());
+        assert!(classified
+            .to_string()
+            .contains("per-attempt SDK operation timeout"));
     }
 
     #[test]
