@@ -33,16 +33,24 @@ jobs:
     runs-on: ubuntu-latest
     needs: authorize
 
-    # Run if:
-    # 1. Manual trigger, call from another workflow or push to main, OR
-    # 2. PR whose run a required reviewer approved
-    if: ${{ !cancelled() && (github.event_name != 'pull_request_target' || needs.authorize.result == 'success') }}
+    # Starts on every event. On a pull request it fails in its first step unless
+    # a required reviewer approved this run, so a skipped job cannot satisfy the
+    # required check.
+    if: ${{ !cancelled() }}
 
     permissions:
       id-token: write
       contents: read
 
     steps:
+    - name: Require approval for pull request runs
+      if: ${{ github.event_name == 'pull_request_target' && needs.authorize.result != 'success' }}
+      run: |
+        echo "::error::Integration tests did not run: approval on the integ environment ended as $AUTHORIZE_RESULT."
+        exit 1
+      env:
+        AUTHORIZE_RESULT: ${{ needs.authorize.result }}
+
     - name: Harden Runner
       uses: step-security/harden-runner@v2.19.4
       with:
