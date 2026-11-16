@@ -6,49 +6,48 @@ on:
   push:
     branches: ["main"]
   pull_request_target:
-    types: [labeled]
+    types: [opened, synchronize, reopened]
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # A pull request's code runs with AWS credentials only after a required
+  # reviewer of the `integ` environment approves this run.
+  authorize:
+    name: Approve pull request run
+    if: github.event_name == 'pull_request_target'
+    runs-on: ubuntu-latest
+    environment: integ
+    permissions: {}
+    concurrency:
+      group: integ-approval-${{ github.event.pull_request.number || github.run_id }}
+      cancel-in-progress: true
+    steps:
+    - name: Record the approved commit
+      run: echo "Approved integration tests for $HEAD_SHA"
+      env:
+        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+
   integration-tests:
     runs-on: ubuntu-latest
-    
+    needs: authorize
+
     # Run if:
-    # 1. Manual trigger or push to main, OR
-    # 2. PR with "safe-to-test" label
-    if: |
-      github.event_name != 'pull_request_target' ||
-      contains(github.event.pull_request.labels.*.name, 'safe-to-test')
-    
+    # 1. Manual trigger, call from another workflow or push to main, OR
+    # 2. PR whose run a required reviewer approved
+    if: ${{ !cancelled() && (github.event_name != 'pull_request_target' || needs.authorize.result == 'success') }}
+
     permissions:
       id-token: write
       contents: read
-      pull-requests: write
 
-    env:
-      LABEL_NAME: safe-to-test
-      REPO: ${{ github.event.pull_request.base.repo.full_name }}
-      PR_NUMBER: ${{ github.event.pull_request.number }}
-    
     steps:
     - name: Harden Runner
       uses: step-security/harden-runner@v2.19.4
       with:
         egress-policy: audit
 
-    - name: Remove label
-      run: |
-        echo "Removing label '$LABEL_NAME' from PR #$PR_NUMBER on repo $REPO" 
-        gh_status=$(gh api "repos/$REPO/issues/$PR_NUMBER/labels/$LABEL_NAME" -X DELETE | jq 'if type == "object" then .status else empty end' --raw-output)
-        case $gh_status in
-          "") echo "Label removed" ;;
-          404) echo "Label not found — ignoring" ;;
-          *) echo "unexpected HTTP $gh_status" && exit 1 ;;
-        esac
-      env:
-        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     - name: Checkout
       uses: actions/checkout@v6
       with:
