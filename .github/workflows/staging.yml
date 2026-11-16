@@ -17,8 +17,6 @@ env:
 permissions:
   contents: read
   id-token: write
-  # Needed for integ tests
-  pull-requests: write
 
 jobs:
   integ:
