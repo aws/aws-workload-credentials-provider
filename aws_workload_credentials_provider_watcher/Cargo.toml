@@ -1,6 +1,6 @@
 [package]
 name = "aws_workload_credentials_provider_watcher"
-version = "3.1.2"
+version = "3.2.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "In-container watcher that runs a TLS reload command when the AWS Workload Credentials Provider renews a certificate."
@@ -13,7 +13,7 @@ path = "src/main.rs"
 # Only the common crate. Depending on `aws_certificatemanager_provider` would
 # ship the ACM SDK and the private-key handling stack into a customer's
 # internet-facing TLS container; everything the watcher needs is in `common`.
-aws_workload_credentials_provider_common = { version = "3.1.2", path = "../aws_workload_credentials_provider_common" }
+aws_workload_credentials_provider_common = { version = "3.2.0", path = "../aws_workload_credentials_provider_common" }
 # Windows reloads run through `powershell.exe -EncodedCommand`, as `common.ps1`
 # does. Not target-gated, so the encoder is unit-tested on Linux. Pinned to the
 # version already in Cargo.lock (integration-tests).
