@@ -1,0 +1,74 @@
+[package]
+name = "aws_workload_credentials_provider_watcher"
+version = "3.1.2"
+edition = "2021"
+license = "Apache-2.0"
+description = "In-container watcher that runs a TLS reload command when the AWS Workload Credentials Provider renews a certificate."
+
+[[bin]]
+name = "wcp-watcher"
+path = "src/main.rs"
+
+[dependencies]
+# Only the common crate. Depending on `aws_certificatemanager_provider` would
+# ship the ACM SDK and the private-key handling stack into a customer's
+# internet-facing TLS container; everything the watcher needs is in `common`.
+aws_workload_credentials_provider_common = { version = "3.1.2", path = "../aws_workload_credentials_provider_common" }
+# Windows reloads run through `powershell.exe -EncodedCommand`, as `common.ps1`
+# does. Not target-gated, so the encoder is unit-tested on Linux. Pinned to the
+# version already in Cargo.lock (integration-tests).
+base64 = "=0.22.1"
+log = "0.4"
+# Not target-gated: the watcher needs a filesystem watch on both platforms
+# (inotify on Linux, ReadDirectoryChangesW on Windows).
+notify = "=8.2.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Not target-gated, unlike `common`, and it needs the `sync` feature that
+# `common`'s Unix table does not enable: the notify callback bridges to the
+# async loop over a `tokio::sync::mpsc` channel.
+tokio = { version = "1", features = [
+    "macros",
+    "rt-multi-thread",
+    "signal",
+    "process",
+    "time",
+    "sync",
+] }
+
+[target.'cfg(unix)'.dependencies]
+# Opens without following symlinks: `fchmod` on a request directory just
+# created, so its mode is exactly the one asked for whatever the umask, and
+# the non-blocking `O_NOFOLLOW` open of a request file. Already linked through
+# `common`; pinned to the same version.
+rustix = { version = "=1.1.4", features = ["fs"] }
+
+[target.'cfg(windows)'.dependencies]
+# `FILE_FLAG_OPEN_REPARSE_POINT` and `FILE_ATTRIBUTE_REPARSE_POINT`, so a
+# request file is opened as itself rather than what a symlink names. Already
+# linked through `common`, with this feature.
+windows = { version = "0.62", features = ["Win32_Storage_FileSystem"] }
+
+[dev-dependencies]
+tempfile = "3"
+# Test-only: `plan`'s tests render TOML strings. Parsing goes through
+# `common::config::watcher_config`.
+toml = "1.1.2"
+tokio = { version = "1", features = [
+    "test-util",
+] }
+
+[target.'cfg(unix)'.dev-dependencies]
+# Safe process-signal delivery for the Unix wait_for_shutdown unit test.
+# This crate is already a workspace dependency of aws_certificatemanager_provider.
+rustix = { version = "1", features = ["process"] }
+
+[target.'cfg(windows)'.dev-dependencies]
+# `GenerateConsoleCtrlEvent` and `SetConsoleCtrlHandler`, for the Windows
+# wait_for_shutdown unit test's real `CTRL_C_EVENT`. Same crate and version as
+# the Windows dependency above; Cargo merges the features.
+windows = { version = "0.62", features = ["Win32_System_Console"] }
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+# Raw syscalls for tests/support/namespace.rs: unshare(2) and mount(2) in a
+# `pre_exec` hook. Pinned to the version already in Cargo.lock.
+libc = "=0.2.189"

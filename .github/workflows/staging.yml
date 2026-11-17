@@ -9,10 +9,18 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # Linux binaries are built inside Amazon Linux 2 so they link against its
-  # glibc and stay runnable on AL2 and anything newer
-  AL2_IMAGE: public.ecr.aws/amazonlinux/amazonlinux:2
+  # Build images come from ECR Public and are pinned by digest, and the Rust
+  # toolchain by version, so the same commit always builds the same binaries.
+  # Update the tag, the digest and RUST_TOOLCHAIN together.
+  # The provider is built inside Amazon Linux 2 so it links against AL2's glibc
+  # and runs on AL2 and newer hosts.
+  AL2_IMAGE: public.ecr.aws/amazonlinux/amazonlinux:2.0.20261112.0@sha256:a9d02ad98817e67c4e0663d25317db3e389784c268841d883051c7281a189c4a
   AL2_GLIBC_VERSION: "2.26"
+  # wcp-watcher is built statically against musl so it runs in any Linux TLS
+  # container image, including Alpine (musl) and older glibc images.
+  WATCHER_BUILD_IMAGE: public.ecr.aws/docker/library/rust:1.100.0-alpine3.24@sha256:de1e0058543a81ed7b046629167db587c67a94bdf37cce14eb27f0ec83baaffb
+  # The toolchain WATCHER_BUILD_IMAGE ships, used for the other builds too
+  RUST_TOOLCHAIN: "1.100.0"
 
 permissions:
   contents: read
@@ -46,16 +54,23 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # `watcher_target` is the target wcp-watcher is built for: static musl
+        # on Linux, and the provider's MSVC target with a static C runtime on
+        # Windows. Either way the watcher needs nothing from the TLS container
+        # image it is copied into.
         include:
           - runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             ext: ""
+            watcher_target: x86_64-unknown-linux-musl
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             ext: ""
+            watcher_target: aarch64-unknown-linux-musl
           - runner: windows-latest
             target: x86_64-pc-windows-msvc
             ext: ".exe"
+            watcher_target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Harden Runner
@@ -68,42 +83,79 @@ jobs:
         with:
           fetch-depth: 1
 
-      # The runner's own glibc is far newer than AL2's, so Linux targets are
+      # The runner's own glibc is far newer than AL2's, so the Linux provider is
       # built in an AL2 container instead. The container is driven with
       # `docker run` rather than the job-level `container:` key because the
       # Node.js used by JavaScript actions needs a newer glibc than AL2 has.
-      - name: Build release binary (Amazon Linux 2)
+      # Anonymous ECR Public pulls are rate limited, so both build images are
+      # pulled with retries first.
+      - name: Pull build images
         if: runner.os == 'Linux'
+        run: |
+          for image in "$AL2_IMAGE" "$WATCHER_BUILD_IMAGE"; do
+            for attempt in 1 2 3 4 5; do
+              docker pull --quiet "$image" && break
+              [[ $attempt -lt 5 ]] || { echo "::error::could not pull $image"; exit 1; }
+              echo "pull of $image failed (attempt $attempt); retrying in $((attempt * 15)) s"
+              sleep $((attempt * 15))
+            done
+          done
+
+      - name: Build provider (Amazon Linux 2)
+        if: runner.os == 'Linux'
+        env:
+          TARGET: ${{ matrix.target }}
         run: |
           docker run --rm \
             --volume "$PWD:/src" \
             --workdir /src \
             --env CARGO_TERM_COLOR \
-            --env TARGET=${{ matrix.target }} \
+            --env TARGET \
+            --env RUST_TOOLCHAIN \
             "$AL2_IMAGE" \
             bash -euo pipefail -c '
               # aws-lc-sys compiles C with cmake; AL2 ships cmake 3 as "cmake3"
               yum install -y gcc gcc-c++ make cmake3 tar gzip
               ln -s /usr/bin/cmake3 /usr/local/bin/cmake
               curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
-                | sh -s -- -y --profile minimal --default-toolchain stable
+                | sh -s -- -y --profile minimal --default-toolchain "$RUST_TOOLCHAIN"
               source "$HOME/.cargo/env"
-              cargo build --release --target "$TARGET"
+              cargo build --release --target "$TARGET" -p aws_workload_credentials_provider
             '
           # The container builds as root, so hand the outputs back to the runner
           sudo chown -R "$(id -u):$(id -g)" target
 
-      - name: Build release binary
+      # The runner's preinstalled Rust changes with the runner image
+      - name: Install Rust toolchain
         if: runner.os == 'Windows'
-        run: cargo build --release --target ${{ matrix.target }}
+        run: |
+          rustup toolchain install $env:RUST_TOOLCHAIN --profile minimal
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup default $env:RUST_TOOLCHAIN
+
+      # Cargo 1.100 writes intermediate rlibs to
+      # <build-dir>\<target>\release\build\<crate>\<hash>\out\. Under the
+      # default build dir (target\ in the checkout) the common crate's rlib
+      # path is 260 characters, over the Windows path limit, and link.exe fails
+      # with LNK1104. A short build dir keeps it under the limit; the final
+      # binaries still go to target\<target>\release\.
+      - name: Build provider
+        if: runner.os == 'Windows'
+        env:
+          TARGET: ${{ matrix.target }}
+          CARGO_BUILD_BUILD_DIR: C:\cb
+        run: cargo build --release --target $env:TARGET -p aws_workload_credentials_provider
 
       # Guards against the build image drifting to a newer glibc than AL2's
-      - name: Verify glibc requirement
+      - name: Verify the provider's glibc requirement
         if: runner.os == 'Linux'
+        env:
+          BIN: target/${{ matrix.target }}/release/aws-workload-credentials-provider
         run: |
-          BIN=target/${{ matrix.target }}/release/aws-workload-credentials-provider
           required=$(readelf --dyn-syms --wide "$BIN" \
             | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sed 's/GLIBC_//' | sort -uV)
+          # An empty list would pass the comparison below without checking anything
+          [[ -n "$required" ]] || { echo "::error::no GLIBC symbol versions found in $BIN"; exit 1; }
           echo "Required glibc versions: $(echo $required)"
           highest=$(echo "$required" | tail -n1)
           if [[ "$(printf '%s\n%s\n' "$highest" "$AL2_GLIBC_VERSION" | sort -V | tail -n1)" \
@@ -112,11 +164,156 @@ jobs:
             exit 1
           fi
 
+      # The Alpine image is musl-native for the runner's architecture, so this
+      # is a native build on both Linux runners.
+      - name: Build wcp-watcher (static musl)
+        if: runner.os == 'Linux'
+        env:
+          WATCHER_TARGET: ${{ matrix.watcher_target }}
+        run: |
+          docker run --rm \
+            --volume "$PWD:/src" \
+            --workdir /src \
+            --env CARGO_TERM_COLOR \
+            --env WATCHER_TARGET \
+            "$WATCHER_BUILD_IMAGE" \
+            sh -euc '
+              apk add --no-cache build-base cmake perl > /dev/null
+              cargo build --release --target "$WATCHER_TARGET" -p aws_workload_credentials_provider_watcher
+              strip "target/$WATCHER_TARGET/release/wcp-watcher"
+            '
+          sudo chown -R "$(id -u):$(id -g)" target
+
+      # A static binary has no program interpreter and no shared libraries, so
+      # it runs regardless of the image's libc
+      - name: Verify wcp-watcher is static
+        if: runner.os == 'Linux'
+        env:
+          BIN: target/${{ matrix.watcher_target }}/release/wcp-watcher
+        run: |
+          # readelf fails on a missing file, which would leave both checks false
+          [[ -f "$BIN" ]] || { echo "::error::$BIN not found"; exit 1; }
+          if readelf --program-headers --wide "$BIN" | grep -q INTERP \
+              || readelf --dynamic --wide "$BIN" | grep -q NEEDED; then
+            echo "::error::$BIN is not statically linked"
+            readelf --dynamic --wide "$BIN" | grep NEEDED || true
+            exit 1
+          fi
+          echo "$BIN is statically linked"
+
+      # `+crt-static` links the C runtime into the binary, so the watcher does
+      # not need the Visual C++ redistributable (VCRUNTIME140.dll), which Nano
+      # Server images do not include and Server Core images do not guarantee.
+      # The target-specific variable is set on this step only, so the provider
+      # build above and build scripts are unaffected.
+      - name: Build wcp-watcher (static C runtime)
+        if: runner.os == 'Windows'
+        env:
+          WATCHER_TARGET: ${{ matrix.watcher_target }}
+          CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: -C target-feature=+crt-static
+          # Same short build dir as the provider build, for the Windows path limit
+          CARGO_BUILD_BUILD_DIR: C:\cb
+        run: cargo build --release --target $env:WATCHER_TARGET -p aws_workload_credentials_provider_watcher
+
+      # Fails if the watcher imports a C runtime DLL. Only Windows system DLLs,
+      # such as KERNEL32.dll, may remain.
+      - name: Verify wcp-watcher links the C runtime statically
+        if: runner.os == 'Windows'
+        env:
+          BIN: target/${{ matrix.watcher_target }}/release/wcp-watcher.exe
+        run: |
+          if (-not (Test-Path $env:BIN)) { Write-Output "::error::$env:BIN not found"; exit 1 }
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $dumpbin = & $vswhere -latest -products * -find 'VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe' |
+            Select-Object -First 1
+          if (-not $dumpbin) { Write-Output "::error::dumpbin.exe not found"; exit 1 }
+          $out = & $dumpbin /nologo /dependents $env:BIN
+          if ($LASTEXITCODE -ne 0) { Write-Output "::error::dumpbin failed on $env:BIN"; exit 1 }
+          $deps = @($out | ForEach-Object { $_.Trim() } | Where-Object { $_ -match '(?i)\.dll$' })
+          # An empty list would pass the check below without checking anything
+          if ($deps.Count -eq 0) { Write-Output "::error::no DLL imports found in $env:BIN"; exit 1 }
+          Write-Output "Imported DLLs: $($deps -join ', ')"
+          $crt = @($deps | Where-Object { $_ -match '(?i)^(vcruntime|msvcp|ucrtbase|api-ms-win-crt-)' })
+          if ($crt.Count -gt 0) {
+            Write-Output "::error::$env:BIN imports C runtime DLLs: $($crt -join ', ')"
+            exit 1
+          }
+          Write-Output "$env:BIN links the C runtime statically"
+
+      # Lays the binaries out as they are published:
+      #   dist/aws-workload-credentials-provider[.exe]
+      #   dist/watcher/wcp-watcher[.exe]
+      - name: Stage binaries
+        env:
+          TARGET: ${{ matrix.target }}
+          EXT: ${{ matrix.ext }}
+          WATCHER_TARGET: ${{ matrix.watcher_target }}
+        shell: bash
+        run: |
+          mkdir -p dist/watcher
+          cp "target/$TARGET/release/aws-workload-credentials-provider$EXT" dist/
+          cp "target/$WATCHER_TARGET/release/wcp-watcher$EXT" dist/watcher/
+
+      # Starts the staged watcher in Nano Server and Server Core containers.
+      # With no shared directories it logs its startup line and exits 1. A
+      # missing DLL stops it before `main` instead, with no output.
+      # Process isolation needs the image's OS build to equal the runner's and
+      # its revision to be no newer, so the image tag is the runner's exact
+      # version. The LTSC tag is the fallback when MCR has no such tag.
+      - name: Smoke test wcp-watcher in Windows containers
+        if: runner.os == 'Windows'
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $v = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+          $exact = "10.0.$($v.CurrentBuildNumber).$($v.UBR)"
+          # The LTSC tag is only the fallback, so an unknown build fails only
+          # when the exact tag can't be pulled either
+          $ltsc = @{ '20348' = 'ltsc2022'; '26100' = 'ltsc2025' }[$v.CurrentBuildNumber]
+          $watcherDir = (Resolve-Path dist\watcher).Path
+          foreach ($repo in 'mcr.microsoft.com/windows/nanoserver', 'mcr.microsoft.com/windows/servercore') {
+            $image = $null
+            for ($attempt = 1; $attempt -le 3; $attempt++) {
+              docker pull --quiet "${repo}:$exact"
+              if ($LASTEXITCODE -eq 0) { $image = "${repo}:$exact"; break }
+              Start-Sleep -Seconds (15 * $attempt)
+            }
+            if (-not $image) {
+              if (-not $ltsc) {
+                Write-Output "::error::could not pull ${repo}:$exact, and no LTSC tag is known for runner build $($v.CurrentBuildNumber)"
+                exit 1
+              }
+              Write-Output "::warning::could not pull ${repo}:$exact; falling back to ${repo}:$ltsc"
+              for ($attempt = 1; $attempt -le 3; $attempt++) {
+                docker pull --quiet "${repo}:$ltsc"
+                if ($LASTEXITCODE -eq 0) { $image = "${repo}:$ltsc"; break }
+                Start-Sleep -Seconds (15 * $attempt)
+              }
+            }
+            if (-not $image) { Write-Output "::error::could not pull $repo"; exit 1 }
+
+            # Read-only, so the container can't change the binary that is published
+            $out = docker run --rm --isolation=process `
+              --volume "${watcherDir}:C:\wcp:ro" `
+              --env WCP_WATCHER_ID=smoke `
+              $image 'C:\wcp\wcp-watcher.exe' 2>&1 | Out-String
+            $code = $LASTEXITCODE
+            Write-Output "--- $image (exit $code) ---"
+            Write-Output $out
+            if ($code -ne 1 -or $out -notmatch "Starting wcp-watcher for 'smoke'") {
+              Write-Output "::error::wcp-watcher did not start in $image (exit $code)"
+              exit 1
+            }
+          }
+          # The expected exit 1 from `docker run` is still in $LASTEXITCODE,
+          # which pwsh would otherwise return as the step's exit code
+          exit 0
+
       - name: Upload binary artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: aws-wcp-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/aws-workload-credentials-provider${{ matrix.ext }}
+          path: dist/
           if-no-files-found: error
           retention-days: 1
 
@@ -132,6 +329,11 @@ jobs:
           BUCKET: ${{ runner.os == 'Windows' && secrets.STAGING_WINDOWS_BUCKET || secrets.STAGING_BUCKET }}
           KEY_PREFIX: ${{ runner.os == 'Windows' && format('{0}/', secrets.STAGING_WINDOWS_BIN_PATH) || '' }}
           BIN: aws-workload-credentials-provider${{ matrix.ext }}
+          WATCHER_BIN: wcp-watcher${{ matrix.ext }}
+          TARGET: ${{ matrix.target }}
+          RUN_ID: ${{ github.run_id }}
         shell: bash
         run: |
-          aws s3 cp "target/${{ matrix.target }}/release/$BIN" "s3://$BUCKET/${KEY_PREFIX}${{ github.run_id }}/${{ matrix.target }}/$BIN"
+          prefix="s3://$BUCKET/$KEY_PREFIX$RUN_ID/$TARGET"
+          aws s3 cp "dist/$BIN" "$prefix/$BIN"
+          aws s3 cp "dist/watcher/$WATCHER_BIN" "$prefix/watcher/$WATCHER_BIN"

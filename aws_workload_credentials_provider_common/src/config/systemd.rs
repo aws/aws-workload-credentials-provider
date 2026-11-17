@@ -91,12 +91,14 @@ mod tests {
                     role_arn: "arn:aws:iam::123456789012:role/Test".to_string(),
                     cert_and_chain_permission: None,
                     key_permission: None,
+                    watcher_id: None,
                 },
             );
         }
         AcmConfig {
             enabled: true,
             certificates,
+            ..Default::default()
         }
     }
 

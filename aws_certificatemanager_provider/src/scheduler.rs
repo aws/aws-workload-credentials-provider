@@ -14,8 +14,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::certificate_file_store::certificate_store::UpdateStoreFile;
 use crate::certificate_task::CertificateTask;
-use crate::traits::{AcmCertificateExporter, RefreshExecutor};
+use crate::traits::AcmCertificateExporter;
 use aws_workload_credentials_provider_common::config::types::{AcmConfig, CertificateConfig};
+use aws_workload_credentials_provider_common::refresh_executor::RefreshExecutor;
+use aws_workload_credentials_provider_common::watcher_request::RequestsRoot;
 
 /// Default refresh interval (24 hours).
 const DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_hours(24);
@@ -38,6 +40,8 @@ pub struct AcmScheduler<Exporter, Store, Executor> {
     acm_exporter: Arc<Exporter>,
     cert_store: Arc<Store>,
     refresh_executor: Arc<Executor>,
+    /// The watcher requests directory, shared by every watcher cert's task.
+    requests_root: Option<Arc<RequestsRoot>>,
 }
 
 impl<Exporter, Store, Executor> AcmScheduler<Exporter, Store, Executor>
@@ -46,18 +50,21 @@ where
     Store: UpdateStoreFile + Send + Sync + 'static,
     Executor: RefreshExecutor + 'static,
 {
-    /// Creates a new scheduler with default refresh intervals.
+    /// Creates a new scheduler with default refresh intervals. Watcher certs
+    /// queue their requests under `requests_root`; without it they fail.
     pub fn new(
         config: AcmConfig,
         acm_exporter: Arc<Exporter>,
         cert_store: Arc<Store>,
         refresh_executor: Arc<Executor>,
+        requests_root: Option<Arc<RequestsRoot>>,
     ) -> Self {
         Self::with_intervals(
             config,
             acm_exporter,
             cert_store,
             refresh_executor,
+            requests_root,
             DEFAULT_REFRESH_INTERVAL,
             DEFAULT_MAX_REFRESH_JITTER,
         )
@@ -69,11 +76,13 @@ where
         acm_exporter: Arc<Exporter>,
         cert_store: Arc<Store>,
         refresh_executor: Arc<Executor>,
+        requests_root: Option<Arc<RequestsRoot>>,
         refresh_interval: Duration,
         max_jitter: Duration,
     ) -> Self {
         Self {
             certificates: config.certificates,
+            requests_root,
             refresh_interval,
             max_jitter,
             acm_exporter,
@@ -114,7 +123,8 @@ where
     ) -> JoinHandle<()> {
         let initial_delay = crate::utils::random_jitter(DEFAULT_MAX_STARTUP_JITTER);
 
-        let task = CertificateTask::new(
+        let is_watcher_cert = config.watcher_id.is_some();
+        let mut task = CertificateTask::new(
             config,
             Arc::clone(&self.acm_exporter),
             Arc::clone(&self.cert_store),
@@ -123,6 +133,9 @@ where
             self.max_jitter,
             initial_delay,
         );
+        if let Some(root) = self.requests_root.as_ref().filter(|_| is_watcher_cert) {
+            task = task.with_requests_root(Arc::clone(root));
+        }
 
         tokio::spawn(async move {
             let mut task = task;
@@ -141,6 +154,7 @@ mod tests {
     use crate::certificate_file_store::error::StoreError;
     use crate::error::AcmManagerError;
     use aws_workload_credentials_provider_common::fs_permissions::PathPermission;
+    use aws_workload_credentials_provider_common::watcher_request;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, Ordering};
     use zeroize::Zeroizing;
@@ -219,6 +233,7 @@ mod tests {
             role_arn: "arn:aws:iam::123456789012:role/TestRole".into(),
             cert_and_chain_permission: None,
             key_permission: None,
+            watcher_id: None,
         }
     }
 
@@ -229,6 +244,7 @@ mod tests {
                 .into_iter()
                 .map(|c| (c.certificate_arn.clone(), c))
                 .collect(),
+            ..Default::default()
         }
     }
 
@@ -240,6 +256,7 @@ mod tests {
             Arc::new(MockExporter::new(false)),
             Arc::new(MockStore),
             Arc::new(MockExecutor),
+            None,
             Duration::from_secs(60),
             Duration::from_secs(5),
         )
@@ -280,5 +297,103 @@ mod tests {
 
         cancel.cancel();
         handle.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watcher_cert_requests_go_to_its_inbox() {
+        let requests = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(requests.path().join("nginx").join("inbox")).unwrap();
+        let config = test_acm_config(vec![CertificateConfig {
+            watcher_id: Some("nginx".into()),
+            ..test_cert(TEST_ARN)
+        }]);
+        let mut scheduler = AcmScheduler::with_intervals(
+            config,
+            Arc::new(MockExporter::new(false)),
+            Arc::new(MockStore),
+            Arc::new(MockExecutor),
+            Some(Arc::new(RequestsRoot::open(requests.path()).unwrap())),
+            Duration::from_secs(60),
+            Duration::from_secs(5),
+        );
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+        let handle = tokio::spawn(async move {
+            scheduler.run(cancel_clone).await;
+        });
+
+        let inbox = requests.path().join("nginx").join("inbox");
+        for _ in 0..20 {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
+            if std::fs::read_dir(&inbox).is_ok_and(|mut d| d.next().is_some()) {
+                break;
+            }
+        }
+        cancel.cancel();
+        handle.await.unwrap();
+
+        assert_eq!(std::fs::read_dir(&inbox).unwrap().count(), 1);
+    }
+
+    /// Records the certificate of each command it runs.
+    #[derive(Default)]
+    struct RecordingExecutor(std::sync::Mutex<Vec<String>>);
+
+    impl RefreshExecutor for RecordingExecutor {
+        async fn execute(&self, _cmd: &str, arn: &str) -> Result<(), std::io::Error> {
+            self.0.lock().unwrap().push(arn.to_string());
+            Ok(())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watcher_and_direct_certs_refresh_their_own_way() {
+        const WATCHED: &str = "arn:aws:acm:us-east-1:123456789012:certificate/watched";
+        const DIRECT: &str = "arn:aws:acm:us-east-1:123456789012:certificate/direct";
+        let requests = tempfile::tempdir().unwrap();
+        let inbox = requests.path().join("nginx").join("inbox");
+        std::fs::create_dir_all(&inbox).unwrap();
+        let config = test_acm_config(vec![
+            CertificateConfig {
+                watcher_id: Some("nginx".into()),
+                ..test_cert(WATCHED)
+            },
+            test_cert(DIRECT),
+        ]);
+        let executor = Arc::new(RecordingExecutor::default());
+        let mut scheduler = AcmScheduler::with_intervals(
+            config,
+            Arc::new(MockExporter::new(false)),
+            Arc::new(MockStore),
+            executor.clone(),
+            Some(Arc::new(RequestsRoot::open(requests.path()).unwrap())),
+            Duration::from_secs(60),
+            Duration::from_secs(5),
+        );
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+        let handle = tokio::spawn(async move {
+            scheduler.run(cancel_clone).await;
+        });
+
+        for _ in 0..20 {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
+            let queued = std::fs::read_dir(&inbox).is_ok_and(|mut d| d.next().is_some());
+            if queued && !executor.0.lock().unwrap().is_empty() {
+                break;
+            }
+        }
+        cancel.cancel();
+        handle.await.unwrap();
+
+        let requests: Vec<watcher_request::RefreshRequest> = std::fs::read_dir(&inbox)
+            .unwrap()
+            .map(|e| serde_json::from_slice(&std::fs::read(e.unwrap().path()).unwrap()).unwrap())
+            .collect();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].certificate_arn, WATCHED);
+        assert_eq!(*executor.0.lock().unwrap(), vec![DIRECT.to_string()]);
     }
 }

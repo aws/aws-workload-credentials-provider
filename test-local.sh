@@ -17,7 +17,9 @@ set -e
 #
 # Cargo writes to target/ during both build and test, so post-re-exec runs
 # leave root-owned artifacts. We restore ownership on exit via a trap so the
-# next non-root cargo invocation isn't blocked by permission errors.
+# next non-root cargo invocation isn't blocked by permission errors. The trap
+# also covers $CARGO_TARGET_DIR when set, since that redirects where cargo
+# writes.
 
 echo "Setting up local integration test environment..."
 
@@ -30,7 +32,7 @@ echo "Using region: $AWS_REGION"
 # got an undoing `cd ..` because `cargo test` failed under `set -e`).
 ORIG_USER="${SUDO_USER:-$(whoami)}"
 ROOT_DIR="$(pwd)"
-trap '[[ "$EUID" -eq 0 ]] && chown -R "$ORIG_USER" "$ROOT_DIR/target/" "$ROOT_DIR/integration-tests/target/" 2>/dev/null || true' EXIT
+trap '[[ "$EUID" -eq 0 ]] && chown -R "$ORIG_USER" "$ROOT_DIR/target/" "$ROOT_DIR/integration-tests/target/" ${CARGO_TARGET_DIR:+"$CARGO_TARGET_DIR/"} 2>/dev/null || true' EXIT
 
 ACM_ENABLED=false
 if [[ -n "${ACM_TEST_CERTIFICATE_ARN:-}" && -n "${ACM_TEST_ROLE_ARN:-}" ]]; then
@@ -62,7 +64,7 @@ if [[ "$ACM_ENABLED" == "true" ]]; then
     cargo test -- --test-threads=1
 else
     echo "ACM tests skipped (set ACM_TEST_CERTIFICATE_ARN and ACM_TEST_ROLE_ARN to enable)"
-    cargo test -- --test-threads=1 --skip certificate_provider
+    cargo test -- --test-threads=1 --skip certificate_provider --skip requests::
 fi
 cd ..
 

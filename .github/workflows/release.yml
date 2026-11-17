@@ -76,31 +76,58 @@ jobs:
           RELEASE_WINDOWS_BIN_PATH: ${{ secrets.RELEASE_WINDOWS_BIN_PATH }}
         run: |
           # Each downloaded artifact is a directory named "aws-wcp-<target>"
-          # (e.g. artifacts/aws-wcp-x86_64-unknown-linux-gnu/) containing a
-          # single binary: aws-workload-credentials-provider, or .exe on
-          # Windows. Strip the "artifacts/aws-wcp-" prefix and trailing slash
+          # (e.g. artifacts/aws-wcp-x86_64-unknown-linux-gnu/) laid out as
+          # staging.yml publishes it:
+          #   aws-workload-credentials-provider[.exe]
+          #   watcher/wcp-watcher[.exe]
+          # Strip the "artifacts/aws-wcp-" prefix and trailing slash
+          # Every target is checked before anything is uploaded: put-object
+          # uses --if-none-match, so a release that stopped partway could not
+          # be rerun with the same version.
           for dir in artifacts/aws-wcp-*/; do
             target="${dir#artifacts/aws-wcp-}"
             target="${target%/}"
-            count=$(find "$dir" -type f -name 'aws-workload-credentials-provider*' | wc -l)
+            count=$(find "$dir" -maxdepth 1 -type f -name 'aws-workload-credentials-provider*' | wc -l)
             if [[ "$count" -ne 1 ]]; then
-              echo "::error::Expected exactly one binary for target $target in $dir, found $count"
+              echo "::error::Expected exactly one provider binary for target $target in $dir, found $count"
               exit 1
             fi
-            binary=$(find "$dir" -type f -name 'aws-workload-credentials-provider*')
+            if [[ "$target" == *windows* ]]; then
+              watcher="${dir}watcher/wcp-watcher.exe"
+            else
+              watcher="${dir}watcher/wcp-watcher"
+            fi
+            if [[ ! -f "$watcher" ]]; then
+              echo "::error::Expected the watcher binary for target $target at $watcher"
+              exit 1
+            fi
+          done
+
+          for dir in artifacts/aws-wcp-*/; do
+            target="${dir#artifacts/aws-wcp-}"
+            target="${target%/}"
+            binary=$(find "$dir" -maxdepth 1 -type f -name 'aws-workload-credentials-provider*')
 
             # Windows targets go to a separate bucket under a key prefix
             if [[ "$target" == *windows* ]]; then
               bucket="$RELEASE_WINDOWS_BUCKET"
               key_prefix="${RELEASE_WINDOWS_BIN_PATH}/"
+              watcher="${dir}watcher/wcp-watcher.exe"
             else
               bucket="$RELEASE_BUCKET"
               key_prefix=""
+              watcher="${dir}watcher/wcp-watcher"
             fi
 
             aws s3api put-object \
               --bucket "$bucket" \
               --key "${key_prefix}${{ inputs.version }}/${target}/$(basename "$binary")" \
               --body "$binary" \
+              --if-none-match "*"
+
+            aws s3api put-object \
+              --bucket "$bucket" \
+              --key "${key_prefix}${{ inputs.version }}/${target}/watcher/$(basename "$watcher")" \
+              --body "$watcher" \
               --if-none-match "*"
           done

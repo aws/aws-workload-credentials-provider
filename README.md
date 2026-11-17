@@ -3,7 +3,7 @@
 The AWS Workload Credentials Provider (formerly the AWS Secrets Manager Agent) is a client\-side solution that helps you standardize how you consume credentials from AWS services across your compute environments\. It includes the following capabilities:
 
 - **Secrets Manager** — An HTTP interface for retrieving and caching secrets from AWS Secrets Manager\. Supported on AWS Lambda, Amazon ECS, Amazon EKS, and Amazon EC2\. Enabled by default\.
-- **Certificate Management** — Automatic export and refresh of certificates from AWS Certificate Manager to the local filesystem\. Supported on Amazon EC2 and on\-premise hosts\. Opt\-in via [configuration](#certificate-management-configuration)\.
+- **Certificate Management** — Automatic export and refresh of certificates from AWS Certificate Manager to the local filesystem\. Supported on Amazon EC2, on\-premise hosts, and container environments \(Docker on Amazon EC2, Amazon ECS, Amazon EKS\)\. Opt\-in via [configuration](#certificate-management-configuration)\.
 
 ## Secrets Manager capability
 
@@ -24,7 +24,7 @@ The Certificate Management capability supports Linux and Windows, and works with
 The Workload Credentials Provider uses the AWS credentials you provide in your environment to assume the role you have configured for each certificate, and then calls ACM to export the certificate\.
 
 **Important**  
-The Certificate Management capability requires elevated permissions for the provider to write certificate files and execute refresh commands\. The `install` script (Linux) or `install.ps1` script (Windows) configures these permissions automatically and is the recommended setup path\. On Linux, if you need to manage specific permissions yourself, use the `--no-privileges` or `--no-sudoers` flags rather than bypassing the install script entirely\. For details on what permissions are configured, see [Security considerations](#workload-credentials-provider-security)\.
+The Certificate Management capability requires elevated permissions for the provider to write certificate files and execute refresh commands\. The `install` script (Linux) or `install.ps1` script (Windows) configures these permissions automatically and is the recommended setup path for Amazon EC2 and on\-premise hosts; container deployments are the exception and do not use the `install` / `install.ps1` script \(see [Running as a Certificate Manager Sidecar](#-running-as-a-certificate-manager-sidecar-)\)\. On Linux, if you need to manage specific permissions yourself, use the `--no-privileges` or `--no-sudoers` flags rather than bypassing the install script entirely\. For details on what permissions are configured, see [Security considerations](#workload-credentials-provider-security)\.
 
 You can provide a custom configuration by passing `--config /path/to/config.toml` on startup or on reload while the provider is running\. On Windows, use `-Config C:\path\to\config.toml` when invoking the PowerShell scripts and `--Config C:\path\to\config.toml` when executing the binary command\. The reload re\-applies permissions and restarts the ACM service\.
 
@@ -47,20 +47,22 @@ To download the source code, see [https://github\.com/aws/aws\-workload\-credent
   - [Step 2: Install the Workload Credentials Provider](#step-2-install-the-workload-credentials-provider)
       - [\[ Amazon EC2 (Linux) \]](#-amazon-ec2-linux-)
       - [\[ Windows EC2 \]](#-windows-ec2-)
-      - [\[ Running as a Container Sidecar \]](#-running-as-a-container-sidecar-)
+      - [\[ Running as a Secrets Manager Sidecar \]](#-running-as-a-secrets-manager-sidecar-)
+      - [\[ Running as a Certificate Manager Sidecar \]](#-running-as-a-certificate-manager-sidecar-)
       - [\[ AWS Lambda \]](#-aws-lambda-)
   - [Step 3: Retrieve secrets with the Workload Credentials Provider](#step-3-retrieve-secrets-with-the-workload-credentials-provider)
       - [\[ curl \]](#-curl-)
       - [\[ Python \]](#-python-)
   - [`refreshNow` parameter behavior](#refreshnow-parameter-behavior)
   - [Using the refreshNow parameter](#using-the-refreshnow-parameter)
-    - [Example - GET request with refreshNow parameter](#example---get-request-with-refreshnow-parameter)
+    - [Example - Workload Credentials Provider GET request with refreshNow parameter](#example---workload-credentials-provider-get-request-with-refreshnow-parameter)
       - [\[ curl \]](#-curl--1)
       - [\[ Python \]](#-python--1)
   - [Role chaining (cross-account access)](#role-chaining-cross-account-access)
   - [Pre-fetching](#pre-fetching)
   - [Step 4: Retrieve certificates with the Workload Credentials Provider](#step-4-retrieve-certificates-with-the-workload-credentials-provider)
   - [Configure the Workload Credentials Provider](#configure-the-workload-credentials-provider)
+  - [File-based credentials](#file-based-credentials)
   - [Optional features](#optional-features)
   - [Logging](#logging)
   - [Security considerations](#security-considerations)
@@ -274,11 +276,9 @@ Based on the type of compute, you have several options for installing the Worklo
    **Note:** When using the install script, the provider reads the SSRF token from file via `AWS_TOKEN=file://C:\ProgramData\AWS\WorkloadCredentialsProvider\awssmatoken` set on the service\. Your application must also read the token from this path and pass it in the `X-Aws-Parameters-Secrets-Token` header\. If you were previously setting `AWS_TOKEN` as an environment variable with a literal token value or a custom file path, update your application to read from the new token file path instead\.
 
 ------
-#### [ Running as a Container Sidecar ]
+#### [ Running as a Secrets Manager Sidecar ]
 
 You can run the Workload Credentials Provider as a sidecar container alongside your application by using Docker\. Then your application can retrieve secrets from the local HTTP server the Workload Credentials Provider provides\. For information about Docker, see the [Docker documentation](https://docs.docker.com)\. 
-
-**Note:** The Certificate Management capability is not supported in container environments\.
 
 **To create a sidecar container for the Workload Credentials Provider with Docker**
 
@@ -301,6 +301,17 @@ You can run the Workload Credentials Provider as a sidecar container alongside y
    ENTRYPOINT ["./aws-workload-credentials-provider", "sm", "start"]
    ```
 
+   Windows: `Dockerfile.provider` must import current root CA certificates from Windows Update, or the provider can't make TLS connections to AWS. The `# escape` parser directive must be the first line of the Dockerfile, and the `RUN` step needs a PowerShell `SHELL`:
+
+   ```dockerfile
+   # escape=`
+   SHELL ["powershell", "-NoProfile", "-Command", "$ErrorActionPreference = 'Stop';"]
+   RUN certutil -generateSSTFromWU C:\roots.sst | Out-Null; `
+       $certs = Import-Certificate -FilePath C:\roots.sst -CertStoreLocation Cert:\LocalMachine\Root; `
+       Remove-Item -Force C:\roots.sst; `
+       Write-Host ('[trust] imported ' + $certs.Count + ' root CA certificate(s)')
+   ```
+
 1. Create a Dockerfile for your client application\.
 
 1. Create a Docker Compose file to run both containers, being sure that they use the same network interface\. This is necessary because the Workload Credentials Provider does not accept requests from outside the localhost interface\. The following example shows a Docker Compose file where the `network_mode` key attaches the `workload-credentials-provider` container to the network namespace of the `client-application` container, which allows them to share the same network interface\.
@@ -313,24 +324,22 @@ You can run the Workload Credentials Provider as a sidecar container alongside y
 
 
    ```yaml
-   version: '3'
    services:
-       client-application:
+     client-application:
        container_name: client-application
        build:
-           context: .
-           dockerfile: Dockerfile.client
+         context: .
+         dockerfile: Dockerfile.client
        command: tail -f /dev/null  # Keep the container running
-       
-   
-       workload-credentials-provider:
+
+     workload-credentials-provider:
        container_name: workload-credentials-provider
        build:
-           context: .
-           dockerfile: Dockerfile.provider
+         context: .
+         dockerfile: Dockerfile.provider
        network_mode: "container:client-application"  # Attach to the client-application container's network
        depends_on:
-           - client-application
+         - client-application
    ```
 
 1. Copy the `aws-workload-credentials-provider` binary to the same directory that contains your Dockerfiles and Docker Compose file\.
@@ -338,10 +347,368 @@ You can run the Workload Credentials Provider as a sidecar container alongside y
 1. Build and run the containers based on the provided Dockerfiles by using the following [https://docs.docker.com/reference/cli/docker/compose/](https://docs.docker.com/reference/cli/docker/compose/) command\.
 
    ```sh
-   docker-compose up --build
+   docker compose up --build
    ```
 
 1. In your client container, you can now use the Workload Credentials Provider to retrieve secrets\. For more information, see [Step 3: Retrieve secrets with the Workload Credentials Provider](#workload-credentials-provider-call)\.
+
+------
+#### [ Running as a Certificate Manager Sidecar ]
+
+You can run the Workload Credentials Provider as a sidecar container that runs `acm start`, exports your ACM certificates to a shared volume, and (optionally) drives a reload of your TLS server when a certificate rotates. Linux and Windows containers are supported on Docker on Amazon EC2 (Compose), Amazon ECS, and Amazon EKS. The steps are the same across platforms. Only the volume and identity wiring differs, and Windows differences are noted inline.
+
+**How it works.** The provider runs in its own container and exports each certificate's PEM files to a shared volume. For a TLS server that does not reload its certificate files on its own, `wcp-watcher` — a small companion binary that runs inside the TLS container, reads only local files, and needs no AWS credentials or SDK — performs the reload. For each certificate that sets `watcher_id`, the provider writes a per-watcher config (`<watcher_config_dir>/<watcher_id>/watcher.config.toml`) mapping the certificate ARN to its `refresh_command`. After writing a renewed certificate and key, the provider drops a refresh request naming that ARN into the watcher's request directory, and the watcher runs the configured command.
+
+**Choose your path.** Pick one before you start; each is followable on its own.
+- **Self-reloading TLS server** — Envoy, Traefik, Caddy, or any server that reloads its certificate and key files on its own. Omit `watcher_id` and `refresh_command` from the config, mount only the certificate-and-key volume into the TLS container, and skip the watcher entirely: no `wcp-watcher` in `Dockerfile.tls`, no `WCP_WATCHER_ID` env var, no watcher-requests volume, and no watcher line in the TLS entrypoint. You deploy only the provider container writing the cert volume (Certificate Management Sidecar step 1 without the watcher keys, and step 2).
+- **Non-reloading TLS server** — nginx, Apache, HAProxy, or similar. Follow Certificate Management Sidecar steps 1–4 to run `wcp-watcher` in the TLS container so it reloads the server when a certificate rotates.
+
+**Note:** The container path does not use the `install` / `install.ps1` script or sudoers; the provider runs its binary directly as its container's user and the reload runs inside the TLS container via `wcp-watcher`.
+
+**Obtaining the binaries.** The release bundle contains the watcher at `watcher/wcp-watcher` for Linux and `watcher\wcp-watcher.exe` for Windows. Copy both binaries into the Docker build directory before `docker build`. Alternatively, a single `cargo build --release` compiles both executables to `target/release/` (cross-compiled builds under `target/<target-triple>/release/`, e.g. `wcp-watcher.exe` on Windows).
+
+**Shared volumes** (three mounts; at startup on Linux, the provider and watcher check the modes of the two watcher mounts):
+
+- **Certificate and key** — Linux `/shared/certs`, Windows `C:\shared\certs`. Provider RW, watcher RO.
+- **Watcher config** — Linux `/shared/wcp-watchers/config`, Windows `C:\shared\wcp-watchers\config`. Provider RW, watcher RO (Linux watcher refuses to start if not RO; Windows check skipped but RO still required).
+- **Watcher requests** — Linux `/shared/wcp-watchers/requests`, Windows `C:\shared\wcp-watchers\requests`. Provider RW, watcher RW.
+
+Override with the `watcher_config_dir` / `watcher_requests_dir` config keys for the provider config, and the `WCP_WATCHER_CONFIG_DIR` / `WCP_WATCHER_REQUESTS_DIR` env vars for the watcher.
+
+<a name="acm-sidecar-region"></a>**AWS Region (required).** The ACM capability has no region setting in `config.toml`. The provider calls ACM and AWS STS in the Region it gets from the AWS SDK default chain: the `AWS_REGION` environment variable, then `AWS_DEFAULT_REGION`, then the shared config file, then Amazon EC2 instance metadata (IMDS). That Region must be the Region in each `certificate_arn`. One provider exports certificates from one Region; to export certificates from another Region, run another provider.
+
+| Platform | Region set automatically? | What to do |
+| --- | --- | --- |
+| Docker on Amazon EC2 | Only from IMDS, if the container can reach it (IMDSv2 needs a hop limit of 2 or more) | Set `AWS_REGION` (recommended) |
+| Amazon ECS on AWS Fargate | Yes, Fargate sets `AWS_REGION` to the task's Region | Set `AWS_REGION` only if the certificate is in another Region |
+| Amazon ECS on Amazon EC2 | No; only from IMDS, if the task can reach it | Set `AWS_REGION` |
+| Amazon EKS with IRSA (EC2 nodes or Fargate) | Yes, the pod identity webhook sets `AWS_REGION` | Set `AWS_REGION` only if the certificate is in another Region |
+| Amazon EKS Pod Identity (EC2 nodes only) | No; only from IMDS (hop limit 2 or more) | Set `AWS_REGION` |
+
+We recommend setting `AWS_REGION` explicitly on the provider container in every deployment, to the Region in your `certificate_arn`.
+
+If the Region is missing, the provider writes no certificate files and logs `Certificate export failed for <arn>: failed to construct request`. If it doesn't match the certificate's Region, ACM rejects the export with an error such as `ResourceNotFoundException`. In both cases the provider logs `This may require configuration changes to resolve. Will retry next cycle.`, keeps running, and retries only on the next 24-hour cycle. On a first deployment, the TLS container in these examples waits for the certificate files and doesn't start serving. If the certificate volume already holds files from an earlier export (for example, a Docker Compose named volume), the server keeps serving that certificate until it expires. After you fix the Region, restart the provider container to export immediately.
+
+**Certificate Management Sidecar step 1 — `config.toml`:**
+
+```toml
+[logging]
+log_to_file = false
+
+[capabilities.acm]
+enabled = true
+
+[[capabilities.acm.certificates]]
+certificate_arn = "arn:aws:acm:us-east-1:123456789012:certificate/EXAMPLE"
+certificate_path = "/shared/certs/fullchain.pem"   # chain appended when chain_path omitted
+private_key_path = "/shared/certs/privkey.pem"
+role_arn = "arn:aws:iam::123456789012:role/EXAMPLE-ExportRole"
+watcher_id = "nginx"
+refresh_command = "/usr/sbin/nginx -s reload"
+```
+
+Set `log_to_file = false` so provider logs go to stdout, where `docker logs` and `kubectl logs` show them (and CloudWatch Logs, if the ECS task uses the `awslogs` log driver). The default is `true`; see [Common configuration](#common-configuration).
+
+**Important**
+
+`refresh_command` validation. On Linux `refresh_command` must be an absolute path (element 0 begins with `/`), may use only `a-z A-Z 0-9 / _ - . = + @` and space, and runs with no shell (no `$(...)`, pipes, `;`, `&`, bare names) — enforced at `acm start` and again when the watcher loads its config. In a container on Windows, `wcp-watcher` runs `refresh_command` through PowerShell, so a PowerShell refresh command for your server can be used; shell combinators/redirects/variable expansion/globs are rejected. Host installs on Windows reload differently — see `refresh_command` under [Certificate Management configuration](#certificate-management-configuration).
+
+Passing examples:
+
+- **nginx** — `/usr/sbin/nginx -s reload`
+- **Apache (official `httpd` image)** — `/usr/local/apache2/bin/apachectl -k graceful`
+- **Apache (distro package)** — `/usr/sbin/apachectl -k graceful`
+- **HAProxy** — an absolute-path reload script you provide, e.g. `/usr/local/bin/haproxy-reload`
+
+`watcher_id` format: `^[a-z0-9][a-z0-9._-]{0,63}$` (single path segment; Windows forbids reserved device names or a trailing period).
+
+**Certificate Management Sidecar step 2 — `Dockerfile.provider`:**
+
+```dockerfile
+FROM debian:latest
+
+RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+
+COPY --chmod=0755 aws-workload-credentials-provider /usr/local/bin/aws-workload-credentials-provider
+COPY config.toml /etc/aws-workload-credentials-provider/config.toml
+
+ENTRYPOINT ["aws-workload-credentials-provider", "acm", "start", "--config", "/etc/aws-workload-credentials-provider/config.toml"]
+```
+
+This example copies a prebuilt release binary into a Debian image and runs as root, so it works as written with the release bundle. It differs from the `Dockerfile.acm` in the repository, which builds the provider from source, runs on a `scratch` image as the non-root user 65532 so it works with `runAsNonRoot`, and takes the configuration file at build time with `--build-arg CONFIG=<path-to-config.toml>`. To run as non-root with this example, see the non-root note under the ECS and EKS deployments.
+
+Windows: `Dockerfile.provider` must import current root CA certificates from Windows Update, or the provider can't make TLS connections to AWS. The `# escape` parser directive must be the first line of the Dockerfile, and the `RUN` step needs a PowerShell `SHELL`:
+
+```dockerfile
+# escape=`
+SHELL ["powershell", "-NoProfile", "-Command", "$ErrorActionPreference = 'Stop';"]
+RUN certutil -generateSSTFromWU C:\roots.sst | Out-Null; `
+    $certs = Import-Certificate -FilePath C:\roots.sst -CertStoreLocation Cert:\LocalMachine\Root; `
+    Remove-Item -Force C:\roots.sst; `
+    Write-Host ('[trust] imported ' + $certs.Count + ' root CA certificate(s)')
+```
+
+**Certificate Management Sidecar step 3 — `Dockerfile.tls`:**
+
+```dockerfile
+FROM <your-tls-server-base-image>
+
+COPY --chmod=0755 wcp-watcher /usr/local/bin/wcp-watcher
+# nginx only — for another TLS server, copy its config instead
+COPY tls.conf /etc/nginx/conf.d/tls.conf
+
+# Required, no default — must match the certificate's watcher_id in config.toml
+ENV WCP_WATCHER_ID=nginx
+
+COPY tls-entrypoint.sh /entrypoint.sh
+ENTRYPOINT ["bash", "/entrypoint.sh"]
+```
+
+`COPY --chmod` requires BuildKit (the default builder in Docker Engine 23.0 and later; set `DOCKER_BUILDKIT=1` on older versions). On Windows images, omit `--chmod`.
+
+On Linux, the entrypoint runs under `bash` and uses `wait -n`, so the TLS base image needs bash: the official Debian-based `nginx` image has it, but `nginx:alpine` does not, so install bash or use a Debian-based image.
+
+For nginx, add this `tls.conf` file:
+
+```nginx
+server {
+    listen 443 ssl;
+    ssl_certificate     /shared/certs/fullchain.pem;
+    ssl_certificate_key /shared/certs/privkey.pem;
+}
+```
+
+For another TLS server, configure it to serve those two files on the mapped port.
+
+Windows: set `WCP_WATCHER_ID` to the certificate's `watcher_id`, copy `wcp-watcher.exe`, use a PowerShell entrypoint, and the `C:\` default directories.
+
+Windows note: The watcher runs the refresh command under PowerShell, which is not included in the Windows Nano Server image but is included in Server Core.
+
+**Certificate Management Sidecar step 4 — `tls-entrypoint.sh`:**
+
+```bash
+#!/usr/bin/env bash
+set -eu
+
+until [ -f "/shared/wcp-watchers/config/${WCP_WATCHER_ID}/watcher.config.toml" ]; do
+  sleep 1
+done
+
+wcp-watcher &
+
+until [ -f /shared/certs/fullchain.pem ] && [ -f /shared/certs/privkey.pem ]; do
+  sleep 1
+done
+
+nginx -g 'daemon off;' &
+
+wait -n
+```
+
+**Note:** the watcher holds refresh requests for a 30-second startup window (`WCP_WATCHER_STARTUP_HOLD_MS`, default `30000`) so a reload is not issued before the TLS server is listening. Windows: PowerShell equivalent.
+
+**Note:** The TLS container runs two processes (the watcher and your TLS server). For background on running multiple processes in one container, see Docker's guide: https://docs.docker.com/engine/containers/multi-service_container/
+
+**Deploy with Docker Compose (Amazon EC2):**
+
+```yaml
+services:
+  tls:
+    build:
+      context: .
+      dockerfile: Dockerfile.tls
+    init: true
+    restart: unless-stopped
+    volumes:
+      - certs:/shared/certs:ro
+      - watcher-config:/shared/wcp-watchers/config:ro
+      - watcher-requests:/shared/wcp-watchers/requests
+    ports:
+      - "443:443"
+    healthcheck:
+      test: ["CMD", "sh", "-c", "test -f /shared/certs/fullchain.pem && test -f /shared/certs/privkey.pem"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  workload-credentials-provider:
+    build:
+      context: .
+      dockerfile: Dockerfile.provider
+    volumes:
+      - certs:/shared/certs
+      - watcher-config:/shared/wcp-watchers/config
+      - watcher-requests:/shared/wcp-watchers/requests
+    environment:
+      # Required: the Region in certificate_arn (see "AWS Region (required)")
+      - AWS_REGION=us-east-1
+    # ACM needs no shared network namespace with the TLS container: the provider
+    # binds no socket, and provider<->watcher coordination is via the shared
+    # volumes above. (network_mode: "service:tls" is only needed for the
+    # Secrets Manager localhost HTTP server model, not for ACM.)
+
+volumes:
+  certs:
+  watcher-config:
+  watcher-requests:
+```
+
+Provide AWS credentials via the standard SDK credential chain. Then run `docker compose up --build`.
+
+**Deploy on Amazon ECS:**
+
+First build the `Dockerfile.provider` and `Dockerfile.tls` images (Certificate Management Sidecar steps 2–3) and push them to a registry your task can pull (for example Amazon ECR); the `image` fields below reference those pushed images.
+
+Both containers run in one task definition sharing the three volumes.
+
+```json
+{
+  "family": "wcp-acm-sidecar",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "256",
+  "memory": "512",
+  "taskRoleArn": "arn:aws:iam::123456789012:role/wcp-acm-task-role",
+  "executionRoleArn": "arn:aws:iam::123456789012:role/wcp-acm-execution-role",
+  "volumes": [
+    { "name": "certs", "host": {} },
+    { "name": "watcher-config", "host": {} },
+    { "name": "watcher-requests", "host": {} }
+  ],
+  "containerDefinitions": [
+    {
+      "name": "workload-credentials-provider",
+      "image": "123456789012.dkr.ecr.us-east-1.amazonaws.com/wcp-provider:latest",
+      "essential": true,
+      "environment": [{ "name": "AWS_REGION", "value": "us-east-1" }],
+      "mountPoints": [
+        { "sourceVolume": "certs", "containerPath": "/shared/certs", "readOnly": false },
+        { "sourceVolume": "watcher-config", "containerPath": "/shared/wcp-watchers/config", "readOnly": false },
+        { "sourceVolume": "watcher-requests", "containerPath": "/shared/wcp-watchers/requests", "readOnly": false }
+      ]
+    },
+    {
+      "name": "tls",
+      "image": "123456789012.dkr.ecr.us-east-1.amazonaws.com/wcp-tls:latest",
+      "essential": true,
+      "environment": [{ "name": "WCP_WATCHER_ID", "value": "nginx" }],
+      "portMappings": [{ "containerPort": 443, "protocol": "tcp" }],
+      "mountPoints": [
+        { "sourceVolume": "certs", "containerPath": "/shared/certs", "readOnly": true },
+        { "sourceVolume": "watcher-config", "containerPath": "/shared/wcp-watchers/config", "readOnly": true },
+        { "sourceVolume": "watcher-requests", "containerPath": "/shared/wcp-watchers/requests", "readOnly": false }
+      ]
+    }
+  ]
+}
+```
+
+Notes:
+- `AWS_REGION` must be the Region in each `certificate_arn`. Fargate sets it automatically to the task's Region; the EC2 launch type doesn't, so keep it in the task definition. See [AWS Region (required)](#acm-sidecar-region).
+- `taskRoleArn` is shared by every container in the task. Grant the task role `sts:AssumeRole` on each certificate's `role_arn`, and add the task role's ARN as a principal in each export role's trust policy; see the trust-policy example below. `acm:ExportCertificate` belongs on the `role_arn`'s own policy (the assumed role), not on `taskRoleArn`. Scope each export role to one workload.
+- `readOnly` on the cert and watcher-config mounts preserves the mount boundary described above.
+- `essential: true` on the provider: if the provider exits, ECS stops the whole task, including the TLS container, so the TLS server can't keep running with a certificate that is no longer renewed. ECS doesn't restart a standalone task; run the task in an ECS service so ECS starts a replacement.
+- To run the containers as a non-root user, see the note below.
+- Network mode: this example uses Fargate, which requires `awsvpc`. On the EC2 launch type you can use other network modes, as long as the provider can reach the ACM and STS endpoints and get its task role. See [Amazon ECS task networking](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task-networking.html) and [Amazon ECS task IAM role](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task-iam-roles.html).
+- Windows ECS: use the `C:\` default paths and a PowerShell `refresh_command` for your server.
+
+**Deploy on Amazon EKS:**
+
+As with ECS, first build the `Dockerfile.provider` and `Dockerfile.tls` images (Certificate Management Sidecar steps 2–3) and push them to a registry your Pod can pull (for example Amazon ECR); the `image` fields below reference those pushed images.
+
+Both containers run in one Pod sharing `emptyDir` volumes.
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wcp-acm-sidecar
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: wcp-acm-sidecar
+  template:
+    metadata:
+      labels:
+        app: wcp-acm-sidecar
+    spec:
+      serviceAccountName: wcp-acm
+      volumes:
+        - name: certs
+          emptyDir: {}
+        - name: watcher-config
+          emptyDir: {}
+        - name: watcher-requests
+          emptyDir: {}
+      containers:
+        - name: workload-credentials-provider
+          image: 123456789012.dkr.ecr.us-east-1.amazonaws.com/wcp-provider:latest
+          env:
+            # Required: the Region in certificate_arn (see "AWS Region (required)")
+            - name: AWS_REGION
+              value: us-east-1
+          volumeMounts:
+            - name: certs
+              mountPath: /shared/certs
+            - name: watcher-config
+              mountPath: /shared/wcp-watchers/config
+            - name: watcher-requests
+              mountPath: /shared/wcp-watchers/requests
+        - name: tls
+          image: 123456789012.dkr.ecr.us-east-1.amazonaws.com/wcp-tls:latest
+          env:
+            - name: WCP_WATCHER_ID
+              value: nginx
+          ports:
+            - containerPort: 443
+          volumeMounts:
+            - name: certs
+              mountPath: /shared/certs
+              readOnly: true
+            - name: watcher-config
+              mountPath: /shared/wcp-watchers/config
+              readOnly: true
+            - name: watcher-requests
+              mountPath: /shared/wcp-watchers/requests
+```
+
+Notes:
+- The `wcp-acm` service account must exist and be linked to an IAM role through [IAM roles for service accounts (IRSA)](https://docs.aws.amazon.com/eks/latest/userguide/iam-roles-for-service-accounts.html) or [EKS Pod Identity](https://docs.aws.amazon.com/eks/latest/userguide/pod-identities.html). For IRSA, grant the service-account role `sts:AssumeRole` on each certificate's `role_arn`, and add that role's ARN as a principal in each export role's trust policy; for EKS Pod Identity, grant the pod role both `sts:AssumeRole` and `sts:TagSession` on each `role_arn`, add the pod role's ARN as a principal in each export role's trust policy, and allow both actions there because Pod Identity credentials carry session tags. See the trust-policy example below. `acm:ExportCertificate` belongs on the `role_arn`'s own policy (the assumed role), not on the service-account role.
+- With IRSA, on EC2 nodes or Fargate, the pod identity webhook sets `AWS_REGION` to the cluster's Region. EKS Pod Identity doesn't set it and runs only on EC2 nodes, where the only fallback is IMDS, so set `AWS_REGION` in the pod spec. In every case it must be the Region in each `certificate_arn`. See [AWS Region (required)](#acm-sidecar-region).
+- `readOnly: true` on the cert and watcher-config mounts preserves the mount boundary.
+- To run the containers as a non-root user, see the note below.
+
+**Note:** These examples run both containers as the image's default user (root in most images) so they work as written. AWS recommends running containers as a non-root user ([Amazon ECS best practices](https://docs.aws.amazon.com/AmazonECS/latest/bestpracticesguide/security-tasks-containers.html), [Amazon EKS best practices](https://docs.aws.amazon.com/eks/latest/best-practices/pod-security.html)), and clusters that enforce the Kubernetes restricted Pod Security Standard reject pods that run as root. You can run the containers as any user that fits your requirements. If you do:
+- Run both containers with the same UID, because the provider writes the certificate and private key readable only by their owner. Otherwise use the permission fallback below.
+- Make sure the provider can write the shared volumes. On Amazon EKS, set `fsGroup` in the pod `securityContext`. On Amazon ECS, task volumes start out owned by root, so change their ownership first, for example with a short init container that the other containers wait on through `dependsOn`.
+- Make sure the TLS server can listen on its port. A non-root process usually can't bind ports below 1024, so have the server listen on a high port such as `8443` and map `443` to it, or use an image built for non-root such as `nginxinc/nginx-unprivileged`.
+
+**IAM permissions:** The provider identity needs `sts:AssumeRole` on each `role_arn`; each `role_arn` needs `acm:ExportCertificate` and a trust policy allowing the provider identity. With EKS Pod Identity, the provider identity also needs `sts:TagSession` on each `role_arn`, and the export role's trust policy must allow `sts:TagSession`, because Pod Identity credentials carry session tags. The watcher needs no AWS permissions. Apply this trust policy to each export role, replacing the placeholder with the ECS task role, the EKS service-account role, or (Docker Compose on Amazon EC2) the instance profile role ARN:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": { "AWS": "arn:aws:iam::123456789012:role/<task-or-service-account-role>" },
+    "Action": "sts:AssumeRole"
+  }]
+}
+```
+
+For EKS Pod Identity, use `"Action": ["sts:AssumeRole", "sts:TagSession"]`.
+
+**Permission fallback.** Where a same-UID setup isn't practical, certificate and key files default to `0600`. Add these two keys inside the existing `[[capabilities.acm.certificates]]` entry from Certificate Management Sidecar step 1, after `private_key_path` (do not add a second `[[capabilities.acm.certificates]]` header):
+
+```toml
+certificate_and_chain_permission = { mode = "0644" }
+key_permission = { mode = "0640" }
+```
+
+The key file takes the provider's group, so run the provider with the shared group as its primary GID (on Amazon EKS, `fsGroup` sets this on the shared volume) and add the TLS server user to that group. Prefer the same-UID path above when you can — it keeps the key owner-only (`0600`). If you use the `0640` fallback, the shared group **must be a dedicated group** created for this purpose: any process in that group, now or later, can read the private key.
+
+**Note:** In this release the watcher runs the reload command only; it does not report reload status back to the provider. A failed reload surfaces only in the watcher's logs while the server keeps serving the previous certificate, so verify your `refresh_command` during setup.
 
 ------
 #### [ AWS Lambda ]
@@ -727,7 +1094,7 @@ For full configuration details, see [Configure the Workload Credentials Provider
 
 ## Configure the Workload Credentials Provider<a name="workload-credentials-provider-config"></a>
 
-To start the Workload Credentials Provider with a custom configuration, create a [TOML](https://toml.io/en/) config file, and then run `./aws-workload-credentials-provider sm start --config /path/to/config.toml`\.
+To start the Workload Credentials Provider with a custom configuration, create a [TOML](https://toml.io/en/) config file, and then run `./aws-workload-credentials-provider sm start --config /path/to/config.toml` for Secrets Manager or `./aws-workload-credentials-provider acm start --config /path/to/config.toml` for Certificate Management\.
 
 The following sections describe the configuration options available for the Workload Credentials Provider\.
 
@@ -840,14 +1207,17 @@ key_permission = { trustee_type = "User", trustee_name = "NT SERVICE\\MyWebServe
 **Note:** On Windows, certificate and key file permissions are inherited from parent directories\. Even when `certificate_and_chain_permission` or `key_permission` is specified, the configured permission is added on top of inherited permissions\. Ensure parent directories are appropriately locked down\.
 
 + **enabled** – Whether the Certificate Management capability is active: `true` or `false`\. The default is `false`\.
-+ **certificate\_arn** – The ARN of the ACM certificate to export\.
++ **certificate\_arn** – The ARN of the ACM certificate to export\. The provider exports it in the AWS Region resolved by the AWS SDK default chain (`AWS_REGION`, `AWS_DEFAULT_REGION`, shared config file, or IMDS), not the Region in the ARN, so that Region must match the ARN's Region\. There is no region setting for this capability\. See [AWS Region (required)](#acm-sidecar-region)\.
 + **certificate\_path** – Absolute path where the certificate PEM file will be written\.
 + **private\_key\_path** – Absolute path where the private key PEM file will be written\.
 + **chain\_path** – (Optional) Absolute path where the certificate chain will be written\. If omitted, the chain is appended to the certificate file (fullchain mode)\.
 + **role\_arn** – IAM role to assume when exporting the certificate\.
-+ **refresh\_command** – (Optional) Command to run after a successful certificate refresh\. On Windows, use the `scheduled-task:` prefix to trigger a pre\-registered scheduled task\.
++ **refresh\_command** – (Optional) Command to run after a successful certificate refresh\. On a Linux host the provider runs it directly via `sudo`\. On a Windows host, the install scripts register it as a per\-certificate scheduled task (named from the certificate ARN, run as SYSTEM via PowerShell) and on refresh the provider triggers that task by its ARN\-derived name rather than running the string itself — put the reload command itself here, not a `scheduled-task:` prefix\. In a container it runs via `wcp-watcher` (see [Running as a Certificate Manager Sidecar](#-running-as-a-certificate-manager-sidecar-))\.
 + **certificate\_and\_chain\_permission** – (Optional) File permissions for the certificate and chain files\. On Linux, specify as `{ mode = "<octal>" }` (e.g., `{ mode = "0644" }`)\. On Windows, specify as `{ trustee_type, trustee_name, rights }`\. Default: `0600` on Linux\. On Windows, creating user, Administrators, and SYSTEM, plus any permissions inherited from the parent directory\.
 + **key\_permission** – (Optional) File permissions for the private key file\. Same format and defaults as `certificate_and_chain_permission`\.
++ **watcher\_id** – (Optional) ID of the `wcp-watcher` that runs this certificate's `refresh_command` in a container deployment\. When set, `refresh_command` is required and is carried into that watcher's config rather than run by the provider\. Must match `^[a-z0-9][a-z0-9._-]{0,63}$`\. On Windows it can't be a reserved device name (such as `con`, `nul`, or `com1`) or end with a period\. See [Running as a Certificate Manager Sidecar](#-running-as-a-certificate-manager-sidecar-)\.
++ **watcher\_config\_dir** – (Optional, ACM\-level under `[capabilities.acm]`) Directory the provider writes generated per\-watcher `watcher.config.toml` files to, shared read\-only with the watcher's container\. Default `/shared/wcp-watchers/config` (Linux), `C:\shared\wcp-watchers\config` (Windows)\.
++ **watcher\_requests\_dir** – (Optional, ACM\-level) Directory holding the per\-watcher refresh\-request queue, shared read\-write with the watcher's container\. Default `/shared/wcp-watchers/requests` (Linux), `C:\shared\wcp-watchers\requests` (Windows)\.
 
 ### Configuration reload (Certificate Management)
 
@@ -951,7 +1321,7 @@ When your application calls the Workload Credentials Provider to get a secret, t
 
 The Workload Credentials Provider creates a new log file when the file reaches 10 MB, and it stores up to five log files per capability\. 
 
-The log does not go to Secrets Manager, ACM, CloudTrail, or CloudWatch\. When the Workload Credentials Provider makes a call to Secrets Manager or ACM, that call is recorded in CloudTrail with a user agent string containing `aws-workload-credentials-provider`\. 
+The provider itself doesn't send logs to Secrets Manager, ACM, CloudTrail, or CloudWatch\. In a container with `log_to_file = false`, logs go to stdout and follow your container's log driver; for example, they reach CloudWatch Logs when an ECS task uses the `awslogs` driver\. When the Workload Credentials Provider makes a call to Secrets Manager or ACM, that call is recorded in CloudTrail with a user agent string containing `aws-workload-credentials-provider`\. 
 
 You can configure logging in the [Configuration file](#workload-credentials-provider-config)\. 
 
@@ -962,6 +1332,8 @@ For a local provider architecture, the domain of trust is where the provider end
 Security conscious applications that are not already using a similar solution with the Secrets Manager credentials locked down to the application should consider using the language\-specific AWS SDKs or caching solutions\. For more information, see [Get secrets](https://docs.aws.amazon.com/secretsmanager/latest/userguide/retrieving-secrets.html)\.
 
 For the Certificate Management capability, the provider runs as a dedicated system user with no login shell\. On Linux, it uses `CAP_DAC_OVERRIDE` to write certificate files without requiring root, and executes refresh commands via `sudo -n` with a generated sudoers entry that permits only the exact configured commands\. Private key files are written with `0600` permissions by default\. All configured paths must be absolute, and paths containing symlinks or traversal components are rejected\. The provider's base credentials only need `sts:AssumeRole`, while `acm:ExportCertificate` is scoped to a separate role\. For environments where elevated privileges are not acceptable, the install script supports `--no-privileges` and `--no-sudoers` modes\.
+
+In a container deployment, the Certificate Management capability uses no install script or sudoers entry. The trust boundary is the shared volumes: any container that mounts the certificate volume can read the certificate, and the private key is protected by running the provider and TLS containers with the same UID, or with a dedicated group if you use the permission fallback (see [Running as a Certificate Manager Sidecar](#-running-as-a-certificate-manager-sidecar-))\.
 
 ## Running Integration Tests Locally<a name="integration-tests-local"></a>
 

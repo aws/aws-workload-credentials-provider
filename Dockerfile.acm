@@ -1,0 +1,48 @@
+# ACM (Certificate Management) sidecar image. Runs `acm start`.
+#
+#   docker build -f Dockerfile.acm --build-arg CONFIG=<path/to/config.toml> -t <name> .
+#
+# CONFIG is required and is a path inside the build context. The file is
+# copied to /etc/aws-workload-credentials-provider/config.toml, which
+# `acm start` reads by default. Changing the configuration requires
+# rebuilding the image.
+#
+# The provider runs as the non-root user 65532, so the image starts where Pod
+# Security Standards or admission policies require `runAsNonRoot`.
+
+FROM rust:alpine AS builder
+
+ARG CONFIG
+
+WORKDIR /app
+
+RUN apk add build-base ca-certificates
+RUN update-ca-certificates
+
+COPY . .
+
+# Fails the build before compiling when CONFIG is not set or names no file in
+# the build context.
+RUN if [ -z "$CONFIG" ]; then echo "CONFIG is required: --build-arg CONFIG=<path/to/config.toml>" >&2; exit 1; fi; \
+    if [ ! -f "$CONFIG" ]; then echo "CONFIG file not found in the build context: $CONFIG" >&2; exit 1; fi; \
+    cp "$CONFIG" /config.toml
+
+# The scratch image has no shell to create directories, so the log directory
+# (`logs` under the working directory, used when `log_to_file = true`) is
+# made here and copied in owned by the runtime user.
+RUN mkdir /logs
+
+RUN cargo build --release -p aws_workload_credentials_provider
+
+FROM scratch
+
+WORKDIR /app
+
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+COPY --from=builder /app/target/release/aws-workload-credentials-provider .
+COPY --from=builder --chown=65532:65532 /config.toml /etc/aws-workload-credentials-provider/config.toml
+COPY --from=builder --chown=65532:65532 /logs /app/logs
+
+USER 65532:65532
+
+ENTRYPOINT [ "./aws-workload-credentials-provider", "acm", "start" ]

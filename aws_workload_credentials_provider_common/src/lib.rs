@@ -3,6 +3,8 @@ pub mod constants;
 pub mod filesystem;
 pub mod fs_permissions;
 pub mod logging;
+pub mod refresh_executor;
+pub mod watcher_request;
 
 #[cfg(windows)]
 pub mod win_service;

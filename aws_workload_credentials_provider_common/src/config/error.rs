@@ -60,6 +60,21 @@ pub enum ValidationErrorCode {
     /// Command contains invalid characters or format
     InvalidCommand,
 
+    // Watcher errors
+    /// Watcher identifier is empty or is not a single safe path segment
+    InvalidWatcherId,
+    /// A required watcher directory does not exist or is not a directory
+    WatcherDirectoryNotFound,
+    /// A watcher directory could not be resolved for a reason other than not
+    /// existing, for example permission denied on a parent directory
+    WatcherDirectoryInaccessible,
+    /// A watcher directory's mount has the wrong access mode (read-only vs
+    /// read-write) for the validating process
+    WatcherDirectoryWrongMountMode,
+    /// The access mode (read-only or read-write) of a watcher directory's
+    /// mount could not be determined
+    WatcherDirectoryMountUnknown,
+
     // Value errors
     /// Field value is syntactically valid but semantically invalid
     InvalidValue,

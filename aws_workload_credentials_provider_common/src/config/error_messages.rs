@@ -94,5 +94,77 @@ pub const INVALID_REFRESH_COMMAND_ERR_MSG: &str = "The refresh command may only 
 pub const DUPLICATE_CERTIFICATE_PATH_ERR_MSG: &str =
     "Certificate paths must be unique within and across certificate blocks.";
 
+// ============================================================================
+// ACM watcher
+// ============================================================================
+
+/// Error message for an invalid watcher ID.
+///
+/// A watcher ID is used to derive a directory name, so it must be a single
+/// safe path segment.
+#[cfg(unix)]
+pub const INVALID_WATCHER_ID_ERR_MSG: &str =
+    "The watcher ID specified in the configuration file isn't valid. The watcher ID must be 1 to 64 characters long, must start with a lowercase letter or a digit, and may only contain lowercase letters, digits, periods, hyphens, and underscores.";
+#[cfg(windows)]
+pub const INVALID_WATCHER_ID_ERR_MSG: &str =
+    "The watcher ID specified in the configuration file isn't valid. The watcher ID must be 1 to 64 characters long, must start with a lowercase letter or a digit, and may only contain lowercase letters, digits, periods, hyphens, and underscores. It can't end with a period, and the part before the first period can't be a reserved Windows device name (con, prn, aux, nul, com1 to com9, or lpt1 to lpt9).";
+
+/// Error message for a certificate that sets a watcher ID without a refresh command.
+pub const MISSING_REFRESH_COMMAND_FOR_WATCHER_ERR_MSG: &str =
+    "A certificate that specifies watcher_id must also specify refresh_command. The refresh command is carried into the watcher's configuration and can't be supplied later.";
+
+/// Error message for an invalid watcher directory.
+pub const INVALID_WATCHER_DIRECTORY_ERR_MSG: &str =
+    "The watcher directory specified in the configuration file isn't valid.";
+
+/// Error message for a watcher config whose schema version the reader doesn't support.
+pub const UNSUPPORTED_WATCHER_SCHEMA_VERSION_ERR_MSG: &str =
+    "The watcher configuration's schema version isn't supported. Upgrade the watcher to at least the provider's version.";
+
+/// Error message for a watcher config written for a different watcher.
+pub const WATCHER_ID_MISMATCH_ERR_MSG: &str =
+    "The watcher configuration belongs to a different watcher.";
+
+/// Error message for a watcher config without any reload entry.
+pub const MISSING_RELOAD_ENTRY_ERR_MSG: &str =
+    "The watcher configuration must contain at least one reload entry.";
+
+/// Error message for a reload entry without certificates.
+pub const RELOAD_WITHOUT_CERTIFICATES_ERR_MSG: &str =
+    "Each reload entry in the watcher configuration must list at least one certificate ARN.";
+
+/// Error message for a reload command element outside the allowed characters,
+/// a quoted element, or a program path that isn't absolute.
+pub const INVALID_RELOAD_COMMAND_ERR_MSG: &str =
+    "Each reload command element must use only the characters allowed in a refresh command, can't be quoted, and the first element must be an absolute path.";
+
+/// Error message for a watcher directory that does not exist.
+///
+/// Container configs are validated at provider startup inside the container,
+/// after all required volumes are mounted, so the directory is expected to
+/// exist at that point.
+pub const WATCHER_DIRECTORY_NOT_FOUND_ERR_MSG: &str =
+    "The watcher directory specified in the configuration file must exist and be a directory. It is expected to be mounted into the container before the provider starts.";
+
+/// Error message for a watcher directory that could not be resolved for a
+/// reason other than not existing, for example because a parent directory
+/// can't be searched by the user the process runs as.
+pub const WATCHER_DIRECTORY_INACCESSIBLE_ERR_MSG: &str =
+    "The watcher directory specified in the configuration file couldn't be accessed. Check that the directory and each of its parent directories are accessible to the user the process runs as.";
+
+/// Error message for the two watcher directories resolving to the same path.
+pub const WATCHER_DIRECTORIES_NOT_DISTINCT_ERR_MSG: &str =
+    "The watcher config directory and the watcher requests directory must be distinct paths.";
+
+/// Error message for a watcher directory whose mount has the wrong access
+/// mode (read-only vs read-write) for the validating process.
+pub const WATCHER_DIRECTORY_WRONG_MOUNT_MODE_ERR_MSG: &str =
+    "The watcher directory specified in the configuration is mounted with the wrong access mode. The watcher config directory must be mounted read-write for the provider and read-only for the watcher, and the watcher requests directory must be mounted read-write for both.";
+
+/// Error message for a watcher directory whose mount access mode could not be
+/// determined, so the required mount mode cannot be verified.
+pub const WATCHER_DIRECTORY_MOUNT_UNKNOWN_ERR_MSG: &str =
+    "The access mode (read-only or read-write) of the mount holding the watcher directory specified in the configuration couldn't be determined, so the required mount mode can't be verified.";
+
 pub const EMPTY_TRUSTEE_NAME_ERR_MSG: &str =
     "The trustee name specified in the permission configuration can't be empty.";

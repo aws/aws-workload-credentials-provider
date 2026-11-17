@@ -14,12 +14,3 @@ pub(crate) trait AcmCertificateExporter: Send + Sync {
         role_arn: &str,
     ) -> impl Future<Output = Result<ExportedCertificate, AcmManagerError>> + Send;
 }
-
-/// Interface for executing refresh actions after certificate renewal.
-pub trait RefreshExecutor: Send + Sync {
-    fn execute(
-        &self,
-        command: &str,
-        certificate_arn: &str,
-    ) -> impl Future<Output = Result<(), std::io::Error>> + Send;
-}
