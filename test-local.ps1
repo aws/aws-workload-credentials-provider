@@ -44,7 +44,7 @@ try {
     if ($acmEnabled) {
         cargo test -- --test-threads=1
     } else {
-        cargo test -- --test-threads=1 --skip certificate_provider
+        cargo test -- --test-threads=1 --skip certificate_provider --skip requests::
     }
     if ($LASTEXITCODE -ne 0) { throw "cargo test failed" }
 } finally {

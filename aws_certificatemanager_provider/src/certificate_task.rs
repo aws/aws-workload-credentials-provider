@@ -11,9 +11,11 @@ use std::time::Duration;
 
 use super::error::RefreshError;
 use crate::certificate_file_store::certificate_store::UpdateStoreFile;
-use crate::traits::{AcmCertificateExporter, RefreshExecutor};
+use crate::traits::AcmCertificateExporter;
 use aws_workload_credentials_provider_common::config::types::CertificateConfig;
 use aws_workload_credentials_provider_common::fs_permissions::PathPermission;
+use aws_workload_credentials_provider_common::refresh_executor::RefreshExecutor;
+use aws_workload_credentials_provider_common::watcher_request::{self, RequestsRoot};
 use log::{error, info, warn};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -68,6 +70,7 @@ pub(crate) struct CertificateTask<Exporter, Store, Executor> {
     refresh_interval: Duration,
     max_jitter: Option<Duration>,
     initial_delay: Duration,
+    requests_root: Option<Arc<RequestsRoot>>,
 }
 
 impl<Exporter: AcmCertificateExporter, Store: UpdateStoreFile, Executor: RefreshExecutor>
@@ -97,7 +100,15 @@ impl<Exporter: AcmCertificateExporter, Store: UpdateStoreFile, Executor: Refresh
             refresh_interval,
             max_jitter,
             initial_delay,
+            requests_root: None,
         }
+    }
+
+    /// Sends a watcher cert's refreshes to its watcher's inbox under `root`
+    /// instead of running the command.
+    pub fn with_requests_root(mut self, root: Arc<RequestsRoot>) -> Self {
+        self.requests_root = Some(root);
+        self
     }
 
     /// Runs the certificate task until cancellation.
@@ -163,6 +174,12 @@ impl<Exporter: AcmCertificateExporter, Store: UpdateStoreFile, Executor: Refresh
                             certificate_arn, self.state.failure_count, e
                         );
                     }
+                    RefreshError::RequestFailed { .. } => {
+                        warn!(
+                            "Could not queue the refresh request for {} (failure #{}): {}. Will retry next cycle.",
+                            certificate_arn, self.state.failure_count, e
+                        );
+                    }
                     _ => {
                         error!(
                             "Error refreshing certificate {} (failure #{}): {}. This may require configuration changes to resolve. Will retry next cycle.",
@@ -174,9 +191,10 @@ impl<Exporter: AcmCertificateExporter, Store: UpdateStoreFile, Executor: Refresh
         }
     }
 
-    /// Executes the three-step refresh workflow: export → store → notify.
+    /// Executes the three-step refresh workflow: export → store → notify, where
+    /// notify runs the command or queues a request to the certificate's watcher.
     ///
-    /// Returns `Err` on export, store, or command failure.
+    /// Returns `Err` on export, store, command or request failure.
     /// Only called serially from the run loop.
     async fn refresh(&mut self) -> Result<(), RefreshError> {
         let config = self.config.clone();
@@ -246,7 +264,8 @@ impl<Exporter: AcmCertificateExporter, Store: UpdateStoreFile, Executor: Refresh
         let failure_count = self.state.failure_count;
         let first_cycle = self.state.first_cycle;
 
-        if let Some(ref command) = config.refresh_command {
+        // Only the watcher runs a watcher cert's command, so its request doesn't depend on one.
+        if config.watcher_id.is_some() || config.refresh_command.is_some() {
             let reason = if changed {
                 "certificate files updated"
             } else if first_cycle {
@@ -261,17 +280,46 @@ impl<Exporter: AcmCertificateExporter, Store: UpdateStoreFile, Executor: Refresh
                 return Ok(());
             };
 
-            info!(
-                "Running refresh command for {}: {}",
-                certificate_arn, reason
-            );
-            self.refresh_executor
-                .execute(command, certificate_arn)
-                .await
-                .map_err(|e| RefreshError::CommandFailed {
-                    certificate_arn: certificate_arn.clone(),
-                    source: e,
-                })?;
+            if let Some(watcher_id) = &config.watcher_id {
+                // The command belongs to the watcher, so never fall back to running it here.
+                // A refused write (a link at `<watcher_id>` or `inbox`) is an
+                // error here, so it fails the refresh rather than being logged
+                // as queued.
+                let name = self
+                    .requests_root
+                    .as_deref()
+                    .ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            "no watcher requests directory configured",
+                        )
+                    })
+                    .and_then(|root| watcher_request::enqueue(root, watcher_id, certificate_arn))
+                    .map_err(|e| RefreshError::RequestFailed {
+                        certificate_arn: certificate_arn.clone(),
+                        watcher_id: watcher_id.clone(),
+                        source: e,
+                    })?;
+                info!(
+                    "Queued refresh request {} for {} to watcher {}: {}",
+                    name, certificate_arn, watcher_id, reason
+                );
+                return Ok(());
+            }
+
+            if let Some(command) = &config.refresh_command {
+                info!(
+                    "Running refresh command for {}: {}",
+                    certificate_arn, reason
+                );
+                self.refresh_executor
+                    .execute(command, certificate_arn)
+                    .await
+                    .map_err(|e| RefreshError::CommandFailed {
+                        certificate_arn: certificate_arn.clone(),
+                        source: e,
+                    })?;
+            }
         } else {
             let status = if changed { "updated" } else { "unchanged" };
             info!(
@@ -428,6 +476,7 @@ mod tests {
             refresh_command: Some("echo refresh".into()),
             cert_and_chain_permission: None,
             key_permission: None,
+            watcher_id: None,
         }
     }
 
@@ -722,6 +771,168 @@ mod tests {
             1,
             "executor should be called when failure_count > 0 even if certs unchanged"
         );
+    }
+
+    // -- watcher tests --
+
+    fn watcher_config() -> CertificateConfig {
+        CertificateConfig {
+            watcher_id: Some("nginx".into()),
+            ..test_config()
+        }
+    }
+
+    fn inbox_files(inbox: &Path) -> usize {
+        std::fs::read_dir(inbox).map(|d| d.count()).unwrap_or(0)
+    }
+
+    fn requests_root(dir: &Path) -> Arc<RequestsRoot> {
+        Arc::new(RequestsRoot::open(dir).unwrap())
+    }
+
+    #[tokio::test]
+    async fn watcher_cert_queues_a_request_instead_of_running_the_command() {
+        let root = tempfile::tempdir().unwrap();
+        let inbox = root.path().join("nginx").join("inbox");
+        std::fs::create_dir_all(&inbox).unwrap();
+        let executor = Arc::new(MockExecutor::new(false));
+        let mut task = test_task(
+            watcher_config(),
+            Arc::new(MockAcmExporter::new(false)),
+            Arc::new(MockStore::new(false)),
+            executor.clone(),
+        )
+        .with_requests_root(requests_root(root.path()));
+
+        assert!(task.refresh().await.is_ok());
+        assert_eq!(executor.call_count.load(Ordering::SeqCst), 0);
+        assert_eq!(inbox_files(&inbox), 1);
+    }
+
+    #[tokio::test]
+    async fn watcher_cert_without_a_command_still_queues_a_request() {
+        let root = tempfile::tempdir().unwrap();
+        let inbox = root.path().join("nginx").join("inbox");
+        std::fs::create_dir_all(&inbox).unwrap();
+        let mut config = watcher_config();
+        config.refresh_command = None;
+        let mut task = test_task(
+            config,
+            Arc::new(MockAcmExporter::new(false)),
+            Arc::new(MockStore::new(false)),
+            Arc::new(MockExecutor::new(false)),
+        )
+        .with_requests_root(requests_root(root.path()));
+
+        assert!(task.refresh().await.is_ok());
+        assert_eq!(inbox_files(&inbox), 1);
+    }
+
+    #[tokio::test]
+    async fn unchanged_watcher_cert_queues_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let inbox = root.path().join("nginx").join("inbox");
+        std::fs::create_dir_all(&inbox).unwrap();
+        let store = Arc::new(MockStore::new(false));
+        store.report_changed.store(false, Ordering::SeqCst);
+        let mut task = test_task(
+            watcher_config(),
+            Arc::new(MockAcmExporter::new(false)),
+            store,
+            Arc::new(MockExecutor::new(false)),
+        )
+        .with_requests_root(requests_root(root.path()));
+        task.state.record_success(Instant::now());
+
+        assert!(task.refresh().await.is_ok());
+        assert_eq!(inbox_files(&inbox), 0);
+    }
+
+    #[tokio::test]
+    async fn failed_request_fails_the_refresh_and_is_queued_next_cycle() {
+        let root = tempfile::tempdir().unwrap();
+        let watcher_dir = root.path().join("nginx");
+        let inbox = watcher_dir.join("inbox");
+        let store = Arc::new(MockStore::new(false));
+        let executor = Arc::new(MockExecutor::new(false));
+        let mut task = test_task(
+            watcher_config(),
+            Arc::new(MockAcmExporter::new(false)),
+            store.clone(),
+            executor.clone(),
+        )
+        .with_requests_root(requests_root(root.path()));
+
+        // The watcher's request volume isn't mounted yet.
+        task.perform_refresh().await;
+        assert_eq!(task.state.failure_count, 1);
+        assert_eq!(executor.call_count.load(Ordering::SeqCst), 0);
+
+        // Next cycle the files are unchanged, but the failed request is retried.
+        std::fs::create_dir_all(&inbox).unwrap();
+        store.report_changed.store(false, Ordering::SeqCst);
+        task.perform_refresh().await;
+        assert_eq!(task.state.failure_count, 0);
+        assert_eq!(inbox_files(&inbox), 1);
+        assert_eq!(executor.call_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn watcher_cert_without_an_inbox_never_runs_the_command() {
+        let executor = Arc::new(MockExecutor::new(false));
+        let mut task = test_task(
+            watcher_config(),
+            Arc::new(MockAcmExporter::new(false)),
+            Arc::new(MockStore::new(false)),
+            executor.clone(),
+        );
+
+        let err = task.refresh().await.unwrap_err();
+        assert!(matches!(err, RefreshError::RequestFailed { .. }), "{err:?}");
+        assert_eq!(executor.call_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn request_failure_is_a_request_error() {
+        let root = tempfile::tempdir().unwrap();
+        let mut task = test_task(
+            watcher_config(),
+            Arc::new(MockAcmExporter::new(false)),
+            Arc::new(MockStore::new(false)),
+            Arc::new(MockExecutor::new(false)),
+        )
+        .with_requests_root(requests_root(root.path()));
+
+        let err = task.refresh().await.unwrap_err();
+        assert!(
+            matches!(&err, RefreshError::RequestFailed { watcher_id, .. } if watcher_id == "nginx"),
+            "{err:?}"
+        );
+    }
+
+    /// A symlink planted at `<requests_dir>/<watcher_id>` fails the refresh
+    /// instead of queuing the request where the link points.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlinked_watcher_directory_fails_the_refresh() {
+        let root = tempfile::tempdir().unwrap();
+        let requests = root.path().join("requests");
+        let elsewhere = root.path().join("elsewhere");
+        std::fs::create_dir(&requests).unwrap();
+        std::fs::create_dir_all(elsewhere.join("inbox")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, requests.join("nginx")).unwrap();
+        let mut task = test_task(
+            watcher_config(),
+            Arc::new(MockAcmExporter::new(false)),
+            Arc::new(MockStore::new(false)),
+            Arc::new(MockExecutor::new(false)),
+        )
+        .with_requests_root(requests_root(&requests));
+
+        task.perform_refresh().await;
+
+        assert_eq!(task.state.failure_count, 1);
+        assert_eq!(inbox_files(&elsewhere.join("inbox")), 0);
     }
 
     // -- run loop tests --

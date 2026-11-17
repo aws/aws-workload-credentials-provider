@@ -31,6 +31,10 @@ pub struct ValidatedConfig {
     pub secrets_manager: SecretsManagerConfig,
     /// ACM configuration (optional)
     pub acm: Option<AcmConfig>,
+    /// Non-fatal findings from validation, to be logged once the logger is
+    /// initialized. Validation runs before any logger exists, so a `log`
+    /// call made during validation would be dropped.
+    pub warnings: Vec<String>,
 }
 
 /// Logging configuration for the provider.
@@ -111,14 +115,74 @@ impl Default for SecretsManagerConfig {
     }
 }
 
+/// Default directory holding the generated per-watcher configuration files.
+///
+/// The watcher configuration and the refresh request directories live on
+/// separate volumes, because mount options apply per volume: the configuration
+/// volume is read-write for the provider and read-only for the watcher's
+/// container.
+#[cfg(unix)]
+pub const DEFAULT_WATCHER_CONFIG_DIR: &str = "/shared/wcp-watchers/config";
+
+/// Default directory holding the per-watcher refresh request directories.
+#[cfg(unix)]
+pub const DEFAULT_WATCHER_REQUESTS_DIR: &str = "/shared/wcp-watchers/requests";
+
+/// Default directory holding the generated per-watcher configuration files.
+///
+/// A dedicated root, not a subtree of `%PROGRAMDATA%`: these directories are
+/// mount points shared with a customer's container, and `C:\ProgramData` is
+/// populated by the OS, Microsoft components and third-party installers. The
+/// `wcp-watchers` segment is lowercase because Windows Server lowercases
+/// bind-mount target paths, so an uppercase segment would not round-trip.
+#[cfg(windows)]
+pub const DEFAULT_WATCHER_CONFIG_DIR: &str = r"C:\shared\wcp-watchers\config";
+
+/// Default directory holding the per-watcher refresh request directories.
+#[cfg(windows)]
+pub const DEFAULT_WATCHER_REQUESTS_DIR: &str = r"C:\shared\wcp-watchers\requests";
+
+/// The resolved pair of shared watcher directories returned by
+/// [`validate_watcher_directories`](crate::config::validate_watcher_directories).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WatcherDirectories {
+    /// Directory holding the generated per-watcher configuration files.
+    pub config_dir: PathBuf,
+    /// Directory holding the per-watcher refresh request directories.
+    pub requests_dir: PathBuf,
+    /// Checks that passed without being verified (the Windows mount-mode
+    /// gap), one message per directory. The caller logs them once its
+    /// logger is initialized.
+    pub warnings: Vec<String>,
+}
+
 /// ACM (Certificate Manager) capability configuration.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct AcmConfig {
     /// Whether the ACM capability is enabled
     pub enabled: bool,
 
     /// Certificate configurations keyed by certificate ARN
     pub certificates: HashMap<String, CertificateConfig>,
+
+    /// Directory the provider writes the generated per-watcher configuration
+    /// files to, shared read-only with the watcher's container.
+    pub watcher_config_dir: PathBuf,
+
+    /// Directory holding the per-watcher refresh request directories, shared
+    /// read-write with the watcher's container.
+    pub watcher_requests_dir: PathBuf,
+}
+
+impl Default for AcmConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            certificates: HashMap::new(),
+            watcher_config_dir: PathBuf::from(DEFAULT_WATCHER_CONFIG_DIR),
+            watcher_requests_dir: PathBuf::from(DEFAULT_WATCHER_REQUESTS_DIR),
+        }
+    }
 }
 
 /// Cache configuration for Secrets Manager capability.
@@ -242,6 +306,12 @@ pub struct CertificateConfig {
 
     /// Optional command to execute after certificate refresh
     pub refresh_command: Option<String>,
+
+    /// Optional ID of the watcher that handles this certificate's refresh.
+    ///
+    /// When set, `refresh_command` is required and is carried into that
+    /// watcher's configuration rather than executed by the provider.
+    pub watcher_id: Option<String>,
 }
 
 // ============================================================================
@@ -399,6 +469,12 @@ pub struct AcmConfigInput {
     pub certificates: Option<Vec<CertificateConfigInput>>,
     pub default_certificate_permission: Option<PermissionConfig>,
     pub default_key_permission: Option<PermissionConfig>,
+    /// Override for the generated watcher configuration directory.
+    /// Defaults to [`DEFAULT_WATCHER_CONFIG_DIR`] when omitted.
+    pub watcher_config_dir: Option<String>,
+    /// Override for the watcher refresh request directory.
+    /// Defaults to [`DEFAULT_WATCHER_REQUESTS_DIR`] when omitted.
+    pub watcher_requests_dir: Option<String>,
 }
 
 #[cfg(unix)]
@@ -429,6 +505,9 @@ pub struct CertificateConfigInput {
     pub refresh_command: Option<String>,
     pub certificate_and_chain_permission: Option<PermissionConfig>,
     pub key_permission: Option<PermissionConfig>,
+    /// ID of the watcher that runs this certificate's `refresh_command`.
+    /// When set, `refresh_command` is required.
+    pub watcher_id: Option<String>,
 }
 
 #[cfg(test)]
@@ -452,6 +531,14 @@ mod tests {
         let config = AcmConfig::default();
         assert!(!config.enabled);
         assert!(config.certificates.is_empty());
+        assert_eq!(
+            config.watcher_config_dir,
+            PathBuf::from(DEFAULT_WATCHER_CONFIG_DIR)
+        );
+        assert_eq!(
+            config.watcher_requests_dir,
+            PathBuf::from(DEFAULT_WATCHER_REQUESTS_DIR)
+        );
     }
 
     #[test]

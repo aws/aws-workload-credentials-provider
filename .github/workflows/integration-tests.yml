@@ -70,7 +70,7 @@ jobs:
     
     - name: Build provider binary
       run: cargo build
-    
+
     - name: Run integration tests
       env:
         ACM_TEST_ROLE_ARN: ${{ secrets.ACM_TEST_ROLE_ARN }}

@@ -199,6 +199,7 @@ mod tests {
                 ..Default::default()
             },
             acm: None,
+            warnings: Vec::new(),
         };
         let (tx_addr, rx_addr) = mpsc::channel(); // Open channel for server to report the port
         let token = CancellationToken::new();
@@ -366,6 +367,7 @@ mod tests {
                 ..Default::default()
             },
             acm: None,
+            warnings: Vec::new(),
         };
 
         let err = init_listener(&cfg)
@@ -421,6 +423,7 @@ mod tests {
                 ..Default::default()
             },
             acm: None,
+            warnings: Vec::new(),
         };
 
         let err = init_listener(&cfg)

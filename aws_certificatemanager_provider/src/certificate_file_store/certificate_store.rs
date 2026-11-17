@@ -498,6 +498,9 @@ mod tests {
         fn grant_permissions(&self, _: &Path, _: &PathPermission) -> std::io::Result<()> {
             Ok(())
         }
+        fn is_read_only_mount(&self, _: &Path) -> std::io::Result<bool> {
+            Ok(false)
+        }
     }
 
     /// A mock FileSystem that succeeds on write_string_to_temp but fails on atomic_rename.
@@ -530,6 +533,9 @@ mod tests {
         fn grant_permissions(&self, _: &Path, _: &PathPermission) -> std::io::Result<()> {
             Ok(())
         }
+        fn is_read_only_mount(&self, _: &Path) -> std::io::Result<bool> {
+            Ok(false)
+        }
     }
 
     /// A mock FileSystem where canonicalize returns a different path, simulating a symlink in the path.
@@ -559,6 +565,9 @@ mod tests {
         }
         fn grant_permissions(&self, _: &Path, _: &PathPermission) -> std::io::Result<()> {
             Ok(())
+        }
+        fn is_read_only_mount(&self, _: &Path) -> std::io::Result<bool> {
+            Ok(false)
         }
     }
 

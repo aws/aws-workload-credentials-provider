@@ -73,6 +73,7 @@ fn acm_start(config_path: Option<String>) -> Result<(), Box<dyn std::error::Erro
             "acm_provider",
             &log_dir,
         )?;
+        log_validation_warnings(&validated.warnings);
         aws_certificatemanager_provider::run_acm(acm_config)
     }
 
@@ -84,7 +85,10 @@ fn acm_start(config_path: Option<String>) -> Result<(), Box<dyn std::error::Erro
 
         let token = CancellationToken::new();
         let token_for_workload = token.clone();
+        let warnings = validated.warnings;
         win_service::run_service(ServiceKind::Acm, validated.logging, token, move || {
+            // The service logger is initialized before the workload starts.
+            log_validation_warnings(&warnings);
             aws_certificatemanager_provider::acm_workload(acm_config, token_for_workload)
         })
         .map_err(|e| -> Box<dyn std::error::Error> { e })
@@ -109,6 +113,7 @@ fn sm_start(config_path: Option<String>) -> Result<(), Box<dyn std::error::Error
             "secrets_manager_provider",
             &log_dir,
         )?;
+        log_validation_warnings(&validated.warnings);
         aws_secretsmanager_provider::run_sm(validated)
     }
 
@@ -121,6 +126,8 @@ fn sm_start(config_path: Option<String>) -> Result<(), Box<dyn std::error::Error
         let token_for_workload = token.clone();
         let logging = validated.logging.clone();
         win_service::run_service(ServiceKind::Sm, logging, token, move || {
+            // The service logger is initialized before the workload starts.
+            log_validation_warnings(&validated.warnings);
             aws_secretsmanager_provider::sm_workload(validated, token_for_workload)
         })
         .map_err(|e| -> Box<dyn std::error::Error> { e })
@@ -410,6 +417,15 @@ mod tests {
         // The source is validated before this is called, so an unresolvable
         // source surfaces a clear error instead of a confusing copy failure.
         assert!(should_copy_config(&missing, &dst).is_err());
+    }
+}
+
+/// Logs the non-fatal findings config validation returned. Call only after
+/// the logger is initialized: validation runs before it, and the `log` crate
+/// drops messages until a logger is installed.
+fn log_validation_warnings(warnings: &[String]) {
+    for warning in warnings {
+        log::warn!("{warning}");
     }
 }
 

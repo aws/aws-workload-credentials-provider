@@ -18,12 +18,15 @@
 
 mod error;
 pub mod error_messages;
-mod field_validators;
+pub(crate) mod field_validators;
 #[cfg(unix)]
 pub mod sudoers;
 #[cfg(unix)]
 pub mod systemd;
 pub mod types;
 pub mod validator;
+pub mod watcher_config;
 
 pub use error::{ErrorCollector, ValidationError, ValidationErrorCode, ValidationErrors};
+pub use field_validators::{validate_watcher_directories, validate_watcher_id};
+pub use types::{WatcherDirectories, DEFAULT_WATCHER_CONFIG_DIR, DEFAULT_WATCHER_REQUESTS_DIR};

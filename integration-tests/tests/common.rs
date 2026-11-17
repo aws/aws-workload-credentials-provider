@@ -721,28 +721,23 @@ pub fn is_pem_private_key(content: &str) -> bool {
 /// helper works whether `cargo test` was invoked from the workspace root or
 /// from `integration-tests/`.
 pub fn locate_provider_binary() -> PathBuf {
-    #[cfg(unix)]
-    let provider_name = "aws-workload-credentials-provider";
-    #[cfg(windows)]
-    let provider_name = "aws-workload-credentials-provider.exe";
+    locate_binary("aws-workload-credentials-provider")
+}
 
-    let possible_paths = [
-        PathBuf::from("target").join("release").join(provider_name),
-        PathBuf::from("target").join("debug").join(provider_name),
-        PathBuf::from("..")
-            .join("target")
-            .join("release")
-            .join(provider_name),
-        PathBuf::from("..")
-            .join("target")
-            .join("debug")
-            .join(provider_name),
-    ];
+/// Locates the `wcp-watcher` binary the same way as [`locate_provider_binary`].
+#[allow(dead_code)]
+pub fn locate_watcher_binary() -> PathBuf {
+    locate_binary("wcp-watcher")
+}
 
-    possible_paths
+fn locate_binary(name: &str) -> PathBuf {
+    let file_name = format!("{name}{}", env::consts::EXE_SUFFIX);
+    ["target", "../target"]
         .into_iter()
+        .flat_map(|root| ["release", "debug"].map(|profile| Path::new(root).join(profile)))
+        .map(|dir| dir.join(&file_name))
         .find(|path| path.exists())
-        .expect("Provider binary not found — run `cargo build` first")
+        .unwrap_or_else(|| panic!("{file_name} not found — run `cargo build` first"))
 }
 
 /// Filesystem paths the provider writes during a single ACM integ test.
@@ -1020,6 +1015,15 @@ impl AcmProviderProcess {
             .expect("Failed to start provider");
 
         AcmProviderProcess { _child: child }
+    }
+
+    /// Returns whether the provider child process is still running.
+    #[allow(dead_code)]
+    pub fn is_running(&mut self) -> bool {
+        self._child
+            .try_wait()
+            .expect("failed to check provider process status")
+            .is_none()
     }
 }
 

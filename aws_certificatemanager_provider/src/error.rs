@@ -138,6 +138,15 @@ pub enum RefreshError {
         #[source]
         source: std::io::Error,
     },
+
+    /// Writing the refresh request to the certificate's watcher failed.
+    #[error("Refresh request to watcher {watcher_id} failed for {certificate_arn}: {source}")]
+    RequestFailed {
+        certificate_arn: String,
+        watcher_id: String,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 #[cfg(test)]

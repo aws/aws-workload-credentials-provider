@@ -29,7 +29,8 @@ use common::assert_mode;
 use common::AcmTestScheduledTask;
 use common::{
     create_test_config, is_pem_certificate, is_pem_private_key, run_provider_until_exit,
-    AcmProviderProcess, AcmTestConfigOptions, AcmTestPaths, TestCertificate,
+    AcmProviderProcess, AcmTestConfigOptions, AcmTestPaths, RoleChainingHelper, TestCertificate,
+    NO_ACCESS_ROLE_NAME,
 };
 
 /// Maximum time to wait for the provider to complete its initial startup and
@@ -94,9 +95,10 @@ pub fn create_canon_tempdir() -> (tempfile::TempDir, PathBuf) {
         .canonicalize()
         .expect("unable to canonicalize temp test dir");
 
-    // Some powershell cmdlets don't work with windows canonical paths, New-Item in particular
+    // Using dunce canonicalize as this is used to validate paths in field_validators
     #[cfg(windows)]
-    let canon_dir = tmp_dir.path().to_path_buf();
+    let canon_dir =
+        dunce::canonicalize(tmp_dir.path()).expect("unable to canonicalize temp test dir");
 
     return (tmp_dir, canon_dir);
 }
@@ -445,6 +447,13 @@ async fn certificate_provider_detects_byte_level_drift() {
     let drifted = format!("{original_cert}\n");
     std::fs::write(&paths.certificate, &drifted).expect("could not append newline to cert");
 
+    // Unix-only. On Windows, NTFS "file system tunneling" copies the old
+    // file's creation time onto a file that takes its name within ~15s of
+    // the old one being removed or replaced. The provider's atomic rename
+    // therefore leaves `created()` unchanged to the 100ns tick, so this
+    // check can never pass there. The content assertions below still prove
+    // the rewrite on Windows.
+    #[cfg(unix)]
     let pre_ctime = std::fs::metadata(&paths.certificate)
         .expect("unable to get cert file metadata")
         .created()
@@ -480,15 +489,19 @@ async fn certificate_provider_detects_byte_level_drift() {
         "cert content unchanged; rewrite did not happen"
     );
 
-    let post_ctime = std::fs::metadata(&paths.certificate)
-        .expect("unable to get cert file metadata")
-        .created()
-        .expect("unable to get cert file created time");
+    // Unix-only; see the tunneling note at `pre_ctime`.
+    #[cfg(unix)]
+    {
+        let post_ctime = std::fs::metadata(&paths.certificate)
+            .expect("unable to get cert file metadata")
+            .created()
+            .expect("unable to get cert file created time");
 
-    assert!(
-        post_ctime > pre_ctime,
-        "certificate file was not recreated on reload"
-    );
+        assert!(
+            post_ctime > pre_ctime,
+            "certificate file was not recreated on reload"
+        );
+    }
 }
 
 /// `refresh_command` is optional. When omitted, the provider must still
@@ -773,3 +786,325 @@ log_to_file = false
         "provider did not log the expected missing-section message. stdout: {stdout}, stderr: {stderr}"
     );
 }
+
+// ============================================================================
+// Automation gap tests
+//
+// These tests verify fault isolation, error handling, and resilience
+// behaviors that matter in multi-certificate production deployments but
+// are not covered by the single-certificate happy-path tests above.
+//
+// Like the happy-path ACM tests, these require ACM_TEST_CERTIFICATE_ARN
+// and ACM_TEST_ROLE_ARN (except where noted).
+// ============================================================================
+
+/// Proves that one certificate's export failure does not block or crash the
+/// provider — the healthy certificate still lands on disk.
+///
+/// Configures two certificates: one real (from the environment), one with a
+/// nonexistent ARN. The provider must export and write the real cert while
+/// logging an error for the bad one, without exiting.
+#[tokio::test]
+async fn test_multi_cert_fault_isolation() {
+    let cert = TestCertificate::from_env();
+
+    let (_tmp_dir, test_dir) = create_canon_tempdir();
+
+    // Paths for the real certificate
+    let real_cert_path = test_dir.join("real_server.pem");
+    let real_key_path = test_dir.join("real_server.key");
+    let real_chain_path = test_dir.join("real_chain.pem");
+    let real_marker_path = test_dir.join("real_refresh_marker");
+
+    // Paths for the bad certificate
+    let bad_cert_path = test_dir.join("bad_server.pem");
+    let bad_key_path = test_dir.join("bad_server.key");
+    let bad_chain_path = test_dir.join("bad_chain.pem");
+
+    let real_arn =
+        std::env::var("ACM_TEST_CERTIFICATE_ARN").expect("ACM_TEST_CERTIFICATE_ARN must be set");
+    let parts: Vec<&str> = real_arn.split(':').collect();
+    let region = parts[3];
+    let account = parts[4];
+    let bad_arn = format!(
+        "arn:aws:acm:{}:{}:certificate/00000000-0000-0000-0000-000000000000",
+        region, account
+    );
+
+    // Build a multi-cert TOML config manually since create_test_config()
+    // only supports a single certificate entry.
+    #[cfg(unix)]
+    let touch = ["/usr/bin/touch", "/bin/touch"]
+        .iter()
+        .find(|p| Path::new(p).exists())
+        .expect("could not locate touch");
+    #[cfg(unix)]
+    let real_refresh_cmd = format!("{touch} {}", real_marker_path.display());
+    #[cfg(windows)]
+    let real_refresh_cmd = format!("scheduled-task:{}", cert.arn());
+
+    let config_toml = format!(
+        r#"
+[capabilities.acm]
+enabled = true
+
+[[capabilities.acm.certificates]]
+certificate_arn = "{real_arn}"
+role_arn = "{role_arn}"
+certificate_path = '{real_cert}'
+private_key_path = '{real_key}'
+chain_path = '{real_chain}'
+refresh_command = "{refresh_cmd}"
+
+[[capabilities.acm.certificates]]
+certificate_arn = "{bad_arn}"
+role_arn = "{role_arn}"
+certificate_path = '{bad_cert}'
+private_key_path = '{bad_key}'
+chain_path = '{bad_chain}'
+"#,
+        real_arn = cert.arn(),
+        role_arn = cert.role_arn(),
+        real_cert = real_cert_path.display(),
+        real_key = real_key_path.display(),
+        real_chain = real_chain_path.display(),
+        refresh_cmd = real_refresh_cmd,
+        bad_arn = bad_arn,
+        bad_cert = bad_cert_path.display(),
+        bad_key = bad_key_path.display(),
+        bad_chain = bad_chain_path.display(),
+    );
+
+    let config_path = test_dir.join("config.toml");
+    std::fs::write(&config_path, config_toml).expect("could not write config");
+
+    #[cfg(windows)]
+    let _scheduled_task = AcmTestScheduledTask::register(cert.arn(), &real_marker_path);
+
+    let mut provider = AcmProviderProcess::start(&config_path, &test_dir).await;
+
+    // The real certificate should be exported and written successfully.
+    wait_for_files(
+        &[
+            &real_cert_path,
+            &real_key_path,
+            &real_chain_path,
+            &real_marker_path,
+        ],
+        PROVIDER_STARTUP_TIMEOUT,
+    )
+    .await;
+
+    let cert_pem = std::fs::read_to_string(&real_cert_path).expect("could not read real cert");
+    assert!(
+        is_pem_certificate(&cert_pem),
+        "real certificate file is not PEM-encoded"
+    );
+
+    let key_pem = std::fs::read_to_string(&real_key_path).expect("could not read real key");
+    assert!(
+        is_pem_private_key(&key_pem),
+        "real private key file is not PEM-encoded"
+    );
+
+    // Wait for the bad cert to be attempted and fail before asserting.
+    // Each cert gets its own random 0–5s startup jitter, so the bad cert
+    // may not have been attempted yet when the good cert finishes. Wait for
+    // the error line itself: the bad ARN alone already appears in the
+    // "Certificate task started" line logged at startup, before the attempt.
+    let log_path = test_dir.join(ACM_LOG_FILE);
+    wait_for_log_line(
+        &log_path,
+        &format!("Error refreshing certificate {bad_arn}"),
+        PROVIDER_STARTUP_TIMEOUT,
+    )
+    .await;
+
+    // The bad certificate's files should NOT have been written.
+    assert!(
+        !bad_cert_path.exists(),
+        "bad certificate file should not exist — export should have failed"
+    );
+
+    // Verify the log contains an error for the nonexistent cert ARN,
+    // confirming the failure was reported rather than silently swallowed.
+    let log_contents = std::fs::read_to_string(&log_path).unwrap_or_default();
+    assert!(
+        log_contents.lines().any(|line| {
+            line.contains("Error refreshing certificate")
+                && line.contains("00000000-0000-0000-0000-000000000000")
+        }),
+        "log should contain an error for the nonexistent certificate ARN.\nLog:\n{log_contents}"
+    );
+
+    assert!(
+        provider.is_running(),
+        "Provider should still be running after one cert fails"
+    );
+}
+
+/// Verifies that the provider handles an access-denied error on
+/// `ExportCertificate` gracefully — logs the error and keeps running.
+///
+/// Uses `provider-no-access-role`, which exists for SM role-chaining tests
+/// and lacks `acm:ExportCertificate` permissions.
+#[tokio::test]
+async fn test_export_insufficient_permissions() {
+    let cert = TestCertificate::from_env();
+    let role_helper = RoleChainingHelper::new().await;
+    let no_access_role_arn = role_helper.get_role_arn(NO_ACCESS_ROLE_NAME).await;
+
+    let (_tmp_dir, test_dir) = create_canon_tempdir();
+    let paths = AcmTestPaths::under(&test_dir);
+
+    let config_toml = create_test_config(
+        &test_dir,
+        AcmTestConfigOptions {
+            role_arn: no_access_role_arn,
+            ..AcmTestConfigOptions::for_cert(&cert)
+        },
+    );
+    let config_path = test_dir.join("config.toml");
+    std::fs::write(&config_path, config_toml).expect("could not write config");
+
+    let mut provider = AcmProviderProcess::start(&config_path, &test_dir).await;
+
+    // Wait for the provider to attempt the export and log the failure.
+    let log_path = test_dir.join(ACM_LOG_FILE);
+    wait_for_log_line(
+        &log_path,
+        "Error refreshing certificate",
+        PROVIDER_STARTUP_TIMEOUT,
+    )
+    .await;
+
+    let log_contents = std::fs::read_to_string(&log_path).unwrap_or_default();
+    let error_line = log_contents
+        .lines()
+        .find(|line| line.contains("Error refreshing certificate"))
+        .expect("log should contain an error line for the access-denied export failure");
+    assert!(
+        error_line.contains("AccessDeniedException"),
+        "expected AccessDeniedException from ExportCertificate, got: {}",
+        error_line
+    );
+
+    // Provider must still be running (not crashed). Certificate files
+    // should not have been written since the export failed.
+    assert!(
+        !paths.certificate.exists(),
+        "certificate file should not exist after access-denied export failure"
+    );
+    assert!(
+        provider.is_running(),
+        "provider should still be running after access-denied export failure"
+    );
+}
+
+/// Verifies that the provider handles a nonexistent certificate ARN
+/// gracefully — logs a ResourceNotFoundException-style error and keeps
+/// running without crashing.
+#[tokio::test]
+async fn test_export_nonexistent_cert() {
+    let cert = TestCertificate::from_env();
+
+    let (_tmp_dir, test_dir) = create_canon_tempdir();
+    let paths = AcmTestPaths::under(&test_dir);
+
+    // Derive region and account from the real test cert ARN so the
+    // nonexistent ARN targets the correct account (avoids AccessDeniedException)
+    // and region (CI uses us-west-2, not us-east-1).
+    let real_arn =
+        std::env::var("ACM_TEST_CERTIFICATE_ARN").expect("ACM_TEST_CERTIFICATE_ARN must be set");
+    let parts: Vec<&str> = real_arn.split(':').collect();
+    let region = parts[3];
+    let account = parts[4];
+    let nonexistent_arn =
+        format!("arn:aws:acm:{region}:{account}:certificate/00000000-0000-0000-0000-000000000000");
+
+    let config_toml = create_test_config(
+        &test_dir,
+        AcmTestConfigOptions {
+            certificate_arn: nonexistent_arn,
+            ..AcmTestConfigOptions::for_cert(&cert)
+        },
+    );
+    let config_path = test_dir.join("config.toml");
+    std::fs::write(&config_path, config_toml).expect("could not write config");
+
+    let mut provider = AcmProviderProcess::start(&config_path, &test_dir).await;
+
+    // Wait for the provider to attempt the export and log the failure.
+    let log_path = test_dir.join(ACM_LOG_FILE);
+    wait_for_log_line(
+        &log_path,
+        "Error refreshing certificate",
+        PROVIDER_STARTUP_TIMEOUT,
+    )
+    .await;
+
+    let log_contents = std::fs::read_to_string(&log_path).unwrap_or_default();
+    let error_line = log_contents
+        .lines()
+        .find(|line| line.contains("Error refreshing certificate"))
+        .expect("log should contain an error line for the nonexistent certificate");
+    assert!(
+        error_line.contains("ResourceNotFoundException"),
+        "expected ResourceNotFoundException, got: {}",
+        error_line
+    );
+
+    // Provider must still be running. No cert files should exist.
+    assert!(
+        !paths.certificate.exists(),
+        "certificate file should not exist after export of nonexistent ARN"
+    );
+    assert!(
+        provider.is_running(),
+        "provider should still be running after nonexistent certificate export failure"
+    );
+}
+
+/// Placeholder: config reload is not yet implemented in the ACM provider.
+///
+/// The provider reads its configuration once at startup and does not watch
+/// the config file for changes or respond to SIGHUP. This test should be
+/// unignored once a config-reload mechanism (file watcher, signal handler,
+/// or similar) is added.
+///
+/// Expected behavior when implemented:
+/// 1. Start provider with cert A
+/// 2. Rewrite config to include cert A + cert B
+/// 3. Trigger reload (SIGHUP / file change)
+/// 4. Assert cert B files appear on disk
+#[ignore = "blocked on config-reload feature: the ACM provider does not yet support runtime config changes (no SIGHUP, no file watcher)"]
+#[tokio::test]
+async fn test_config_reload_updates_certificates() {
+    // Intentionally empty — see ignore reason above.
+}
+
+/// Placeholder: crash recovery during atomic writes.
+///
+/// The provider uses atomic writes (temp file → rename) via
+/// `TempFileWithDropCleanup`, which makes partial-write corruption
+/// unlikely. A true crash-recovery test would need to kill the provider
+/// mid-rename (a narrow window) and verify the cert files are intact on
+/// restart. This is difficult to implement reliably in a deterministic
+/// test.
+///
+/// Expected behavior:
+/// 1. Start provider, let it write cert files
+/// 2. Kill during a subsequent refresh (between temp-write and rename)
+/// 3. Restart and verify existing cert files are still valid PEM
+#[ignore = "blocked on deterministic crash injection: atomic writes via TempFileWithDropCleanup make the corruption window too narrow to hit reliably"]
+#[tokio::test]
+async fn test_crash_recovery_during_write() {
+    // Intentionally empty — see ignore reason above.
+}
+
+/// Validates that the provider refreshes certificate files on a periodic interval.
+/// Start the provider, wait for the refresh interval, confirm changed cert replaces files.
+/// Currently blocked: requires a long-running test with configurable refresh interval.
+#[tokio::test]
+#[ignore = "requires long-running wait for periodic refresh interval"]
+async fn test_periodic_refresh_updates() {}

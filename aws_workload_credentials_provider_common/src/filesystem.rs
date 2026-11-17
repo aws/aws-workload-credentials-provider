@@ -3,7 +3,7 @@
 //! This module provides a trait for filesystem operations needed during
 //! configuration validation, along with real and mock implementations.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use tempfile::NamedTempFile;
@@ -62,6 +62,19 @@ pub trait FileSystem: Send + Sync {
     ///
     /// Returns an error if the path does not exist or cannot be resolved.
     fn canonicalize(&self, path: &Path) -> std::io::Result<PathBuf>;
+
+    /// Whether `path` is on a read-only mount, as seen by this process
+    /// (statvfs(3) `ST_RDONLY` on Unix).
+    ///
+    /// Used to confirm each shared watcher directory is mounted with the access
+    /// mode the validating process requires.
+    ///
+    /// Returns an error if the path does not exist or the mount's mode cannot be
+    /// read. Callers must treat an error as "unknown"
+    ///
+    /// Windows gap: [`RealFileSystem`] has no Windows
+    /// implementation and returns [`std::io::ErrorKind::Unsupported`]
+    fn is_read_only_mount(&self, path: &Path) -> std::io::Result<bool>;
 }
 
 /// Sets the bitmask for the path to mode.
@@ -221,6 +234,32 @@ impl FileSystem for RealFileSystem {
         dunce::canonicalize(path)
     }
 
+    #[cfg(unix)]
+    fn is_read_only_mount(&self, path: &Path) -> std::io::Result<bool> {
+        // statvfs(3) reports the flags of the mount the path is on, as this
+        // process sees it, so a bind mount or a container `:ro` volume reports
+        // its own mode rather than the source filesystem's. A path with an
+        // interior NUL byte is rejected by rustix as EINVAL (InvalidInput).
+        use rustix::fs::{statvfs, StatVfsMountFlags};
+
+        let stat = statvfs(path).map_err(std::io::Error::from)?;
+        Ok(stat.f_flag.contains(StatVfsMountFlags::RDONLY))
+    }
+
+    #[cfg(not(unix))]
+    fn is_read_only_mount(&self, _path: &Path) -> std::io::Result<bool> {
+        // There is no verified way to read a Windows container bind mount's
+        // read-only flag (the volume flags describe the backing volume, not
+        // the bind mount), so the mode is reported as `Unsupported`. The
+        // watcher directory validator warns about exactly this error kind on
+        // Windows and accepts the directory until a real implementation
+        // exists; every other error still fails closed.
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "determining a mount's read-only/read-write mode is not supported on Windows",
+        ))
+    }
+
     /// Grants the specified file permissions using a platform-specific [`PathPermission`] descriptor.
     fn grant_permissions(&self, path: &Path, permission: &PathPermission) -> std::io::Result<()> {
         #[cfg(unix)]
@@ -263,6 +302,10 @@ impl FileSystem for RealFileSystem {
 pub struct MockFileSystem {
     existing_paths: HashSet<String>,
     directories: HashSet<String>,
+    read_only_mounts: HashSet<String>,
+    mount_mode_errors: HashMap<String, std::io::ErrorKind>,
+    canonical_aliases: HashMap<String, PathBuf>,
+    canonicalize_errors: HashMap<String, std::io::ErrorKind>,
 }
 
 impl MockFileSystem {
@@ -277,10 +320,56 @@ impl MockFileSystem {
         self
     }
 
-    /// Adds a directory path that exists.
+    /// Adds a directory path that exists on a read-write mock mount.
     pub fn with_dir(mut self, path: &str) -> Self {
         self.existing_paths.insert(path.to_string());
         self.directories.insert(path.to_string());
+        self
+    }
+
+    /// Adds a directory path that exists on a read-only mock mount:
+    /// `is_read_only_mount(path)` returns `Ok(true)`.
+    pub fn with_read_only_dir(mut self, path: &str) -> Self {
+        self.existing_paths.insert(path.to_string());
+        self.directories.insert(path.to_string());
+        self.read_only_mounts.insert(path.to_string());
+        self
+    }
+
+    /// Adds a directory path that exists but whose mount access mode cannot be
+    /// determined: `is_read_only_mount(path)` returns an error of kind
+    /// [`std::io::ErrorKind::Other`].
+    pub fn with_dir_mount_mode_unknown(self, path: &str) -> Self {
+        self.with_dir_mount_mode_error(path, std::io::ErrorKind::Other)
+    }
+
+    /// Adds a directory path that exists but whose mount access mode lookup
+    /// fails with `kind`, e.g. [`std::io::ErrorKind::Unsupported`] to mimic
+    /// [`RealFileSystem`] on Windows.
+    pub fn with_dir_mount_mode_error(mut self, path: &str, kind: std::io::ErrorKind) -> Self {
+        self.existing_paths.insert(path.to_string());
+        self.directories.insert(path.to_string());
+        self.mount_mode_errors.insert(path.to_string(), kind);
+        self
+    }
+
+    /// Registers `path` as an existing non-canonical spelling (for example a
+    /// symlink, or a path with `..`) whose canonical form is `canonical`.
+    ///
+    /// `canonicalize(path)` returns `canonical`. `exists(path)` is true; the
+    /// alias is not registered as a directory.
+    pub fn with_canonical_alias(mut self, path: &str, canonical: &str) -> Self {
+        self.existing_paths.insert(path.to_string());
+        self.canonical_aliases
+            .insert(path.to_string(), PathBuf::from(canonical));
+        self
+    }
+
+    /// Registers `path` so that `canonicalize(path)` fails with `kind`, e.g.
+    /// [`std::io::ErrorKind::PermissionDenied`] to mimic a parent directory
+    /// this process can't search. The path is not registered as existing.
+    pub fn with_canonicalize_error(mut self, path: &str, kind: std::io::ErrorKind) -> Self {
+        self.canonicalize_errors.insert(path.to_string(), kind);
         self
     }
 }
@@ -314,9 +403,16 @@ impl FileSystem for MockFileSystem {
     }
 
     fn canonicalize(&self, path: &Path) -> std::io::Result<PathBuf> {
-        // Mock: registered paths are treated as canonical (no symlinks simulated)
+        // Mock: registered paths are canonical unless registered as an alias
         let path_str = path.to_str().unwrap_or("");
-        if self.existing_paths.contains(path_str) {
+        if let Some(kind) = self.canonicalize_errors.get(path_str) {
+            Err(std::io::Error::new(
+                *kind,
+                format!("mock: canonicalize failed: {}", path.display()),
+            ))
+        } else if let Some(canonical) = self.canonical_aliases.get(path_str) {
+            Ok(canonical.clone())
+        } else if self.existing_paths.contains(path_str) {
             Ok(path.to_path_buf())
         } else {
             Err(std::io::Error::new(
@@ -328,6 +424,23 @@ impl FileSystem for MockFileSystem {
 
     fn grant_permissions(&self, _path: &Path, _permission: &PathPermission) -> std::io::Result<()> {
         Ok(())
+    }
+
+    fn is_read_only_mount(&self, path: &Path) -> std::io::Result<bool> {
+        // Mock: a dir registered with a mount-mode error returns that error
+        // kind; an unregistered path is "not found", mirroring canonicalize;
+        // otherwise report the registered mode.
+        let path_str = path.to_str().unwrap_or("");
+        if let Some(kind) = self.mount_mode_errors.get(path_str) {
+            return Err(std::io::Error::new(*kind, "mock: mount mode unknown"));
+        }
+        if !self.existing_paths.contains(path_str) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("mock: path not found: {}", path.display()),
+            ));
+        }
+        Ok(self.read_only_mounts.contains(path_str))
     }
 }
 
@@ -349,6 +462,99 @@ mod tests {
         let fs = MockFileSystem::new().with_dir("/path/to/dir");
         assert!(fs.exists(Path::new("/path/to/dir")));
         assert!(fs.is_dir(Path::new("/path/to/dir")));
+    }
+
+    #[test]
+    fn test_mock_filesystem_read_only_mount() {
+        let fs = MockFileSystem::new()
+            .with_read_only_dir("/mnt/ro")
+            .with_dir("/mnt/rw")
+            .with_dir_mount_mode_unknown("/mnt/unknown");
+
+        assert!(fs.is_read_only_mount(Path::new("/mnt/ro")).unwrap());
+        // with_dir is a read-write mount.
+        assert!(!fs.is_read_only_mount(Path::new("/mnt/rw")).unwrap());
+        // Unregistered paths report "not found", mirroring canonicalize.
+        let err = fs
+            .is_read_only_mount(Path::new("/mnt/missing"))
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        // A directory with an unknown mode exists but its mode lookup fails.
+        assert!(fs.is_dir(Path::new("/mnt/unknown")));
+        let err = fs
+            .is_read_only_mount(Path::new("/mnt/unknown"))
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+    }
+
+    #[test]
+    fn test_mock_filesystem_mount_mode_error_kind() {
+        let fs = MockFileSystem::new()
+            .with_dir_mount_mode_error("/mnt/unsupported", std::io::ErrorKind::Unsupported);
+
+        assert!(fs.is_dir(Path::new("/mnt/unsupported")));
+        let err = fs
+            .is_read_only_mount(Path::new("/mnt/unsupported"))
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+    }
+
+    #[test]
+    fn test_mock_filesystem_canonical_alias() {
+        let fs = MockFileSystem::new()
+            .with_dir("/mnt/target")
+            .with_canonical_alias("/mnt/link", "/mnt/target");
+
+        assert_eq!(
+            fs.canonicalize(Path::new("/mnt/link")).unwrap(),
+            PathBuf::from("/mnt/target")
+        );
+        assert!(fs.exists(Path::new("/mnt/link")));
+        // A plain registered directory is still its own canonical form.
+        assert_eq!(
+            fs.canonicalize(Path::new("/mnt/target")).unwrap(),
+            PathBuf::from("/mnt/target")
+        );
+    }
+
+    #[test]
+    fn test_mock_filesystem_canonicalize_error_kind() {
+        let fs = MockFileSystem::new()
+            .with_canonicalize_error("/mnt/locked", std::io::ErrorKind::PermissionDenied);
+
+        let err = fs.canonicalize(Path::new("/mnt/locked")).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(!fs.exists(Path::new("/mnt/locked")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_real_filesystem_tempdir_is_not_read_only_mount() {
+        // A TempDir is writable, so its mount is read-write. (The read-only
+        // case needs a real ro mount, which the e2e reload tests create in a
+        // private mount namespace.)
+        let tmp = TempDir::new().expect("failed to create temp dir");
+        let fs = RealFileSystem;
+        assert!(!fs.is_read_only_mount(tmp.path()).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_real_filesystem_read_only_mount_missing_path_errors() {
+        let fs = RealFileSystem;
+        let err = fs
+            .is_read_only_mount(Path::new("/nonexistent_path_12345"))
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_real_filesystem_read_only_mount_unsupported_on_windows() {
+        let tmp = TempDir::new().expect("failed to create temp dir");
+        let fs = RealFileSystem;
+        let err = fs.is_read_only_mount(tmp.path()).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
     }
 
     #[test]

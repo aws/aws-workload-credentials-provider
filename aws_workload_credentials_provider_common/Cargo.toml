@@ -6,6 +6,7 @@ license = "Apache-2.0"
 description = "Common library for AWS Workload Credentials Provider configuration validation and shared utilities."
 
 [dependencies]
+aws-lc-rs = "1"
 chrono = "0.4"
 dunce = "1.0"
 log = "0.4"
@@ -18,10 +19,15 @@ regex = "1.12.3"
 
 
 [target.'cfg(unix)'.dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "process", "time"] }
+rustix = { version = "=1.1.4", features = ["fs"] }
+
+[target.'cfg(unix)'.dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
+rustix = { version = "=1.1.4", features = ["process"] }
 
 [target.'cfg(windows)'.dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "process", "time"] }
 tokio-util = "0.7.18"
 windows = { version = "0.62", features = [
     "Win32_Security",

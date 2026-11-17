@@ -14,17 +14,20 @@ use super::error_messages::{
     BAD_MAX_CONN_MSG, BAD_MAX_ROLES_MSG, BAD_PREFIX_MSG, EMPTY_ENV_LIST_MSG, EMPTY_SSRF_LIST_MSG,
     FLAT_KEY_WITH_CAPABILITIES_ERR_MSG, INVALID_CACHE_BUFFER_RATIO_MSG, INVALID_CACHE_SIZE_ERR_MSG,
     INVALID_HTTP_PORT_ERR_MSG, INVALID_MAX_JITTER_MSG, INVALID_TTL_SECONDS_ERR_MSG,
+    MISSING_REFRESH_COMMAND_FOR_WATCHER_ERR_MSG,
 };
 use super::field_validators::{
-    validate_permission_config, validate_refresh_command, ArnValidator, CertificateBlockPaths,
-    CrossFieldValidator, FilePathValidator, RangeValidator,
+    validate_permission_config, validate_refresh_command, validate_watcher_directories,
+    validate_watcher_id, ArnValidator, CertificateBlockPaths, CrossFieldValidator,
+    FilePathValidator, RangeValidator,
 };
 use super::types::{
     AcmConfig, AcmConfigInput, CapabilitiesConfig, CertificateConfig, CertificateConfigInput,
     ConfigInput, LogLevel, LoggingConfig, LoggingConfigInput, PrefetchConfig, PrefetchConfigInput,
     SecretPrefetchConfig, SecretsManagerConfig, SecretsManagerConfigInput, TagFilter,
-    ValidatedConfig,
+    ValidatedConfig, DEFAULT_WATCHER_CONFIG_DIR, DEFAULT_WATCHER_REQUESTS_DIR,
 };
+use super::watcher_config;
 use crate::filesystem::{FileSystem, RealFileSystem};
 
 use crate::fs_permissions::PathPermission;
@@ -67,6 +70,7 @@ impl<F: FileSystem> ConfigValidator<F> {
                     logging: Default::default(),
                     secrets_manager: SecretsManagerConfig::default(),
                     acm: None,
+                    warnings: Vec::new(),
                 })
             }
             Some(path) => {
@@ -139,7 +143,9 @@ impl<F: FileSystem> ConfigValidator<F> {
         };
 
         // Validate ACM config
-        let acm: Option<AcmConfig> = self.validate_acm_config(capabilities.acm, &mut collector);
+        let mut warnings = Vec::new();
+        let acm: Option<AcmConfig> =
+            self.validate_acm_config(capabilities.acm, &mut collector, &mut warnings);
 
         if !collector.is_empty() {
             Err(ValidationErrors::from_vec(collector.errors().to_vec()))
@@ -148,6 +154,7 @@ impl<F: FileSystem> ConfigValidator<F> {
                 logging,
                 secrets_manager,
                 acm,
+                warnings,
             })
         }
     }
@@ -643,12 +650,56 @@ impl<F: FileSystem> ConfigValidator<F> {
         &self,
         opt_acm_config_input: Option<AcmConfigInput>,
         collector: &mut ErrorCollector,
+        warnings: &mut Vec<String>,
     ) -> Option<AcmConfig> {
         let acm_config_input: AcmConfigInput = opt_acm_config_input?;
 
         let acm_enabled: bool = acm_config_input.enabled.unwrap_or(false);
         let cert_config_inputs: Vec<CertificateConfigInput> =
             acm_config_input.certificates.unwrap_or_default();
+
+        // Watcher directories are validated only for an enabled container
+        // config (at least one certificate declares a watcher_id). Such a
+        // config is validated at provider startup inside the container, after all
+        // required volumes are mounted. The provider writes the watcher configs
+        // and enqueues refresh requests, so it requires both directories on
+        // read-write mounts. On Windows the mount mode can't be read yet, so
+        // that check passes and adds to `warnings`, which the caller logs
+        // after its logger starts (see `validate_watcher_directories`).
+        // Other configs take the configured values (or defaults) as-is.
+        let is_container_config = cert_config_inputs.iter().any(|c| c.watcher_id.is_some());
+        let config_override = acm_config_input.watcher_config_dir.as_deref();
+        let requests_override = acm_config_input.watcher_requests_dir.as_deref();
+        let (watcher_config_dir, watcher_requests_dir) = if is_container_config && acm_enabled {
+            match validate_watcher_directories(
+                self.filesystem.as_ref(),
+                // The provider writes the watcher configs: config must not read_only.
+                false,
+                "capabilities.acm.watcher_config_dir",
+                config_override,
+                "capabilities.acm.watcher_requests_dir",
+                requests_override,
+            ) {
+                Ok(dirs) => {
+                    warnings.extend(dirs.warnings);
+                    (dirs.config_dir, dirs.requests_dir)
+                }
+                Err(errors) => {
+                    for e in errors {
+                        collector.add(e);
+                    }
+                    (
+                        PathBuf::from(DEFAULT_WATCHER_CONFIG_DIR),
+                        PathBuf::from(DEFAULT_WATCHER_REQUESTS_DIR),
+                    )
+                }
+            }
+        } else {
+            (
+                PathBuf::from(config_override.unwrap_or(DEFAULT_WATCHER_CONFIG_DIR)),
+                PathBuf::from(requests_override.unwrap_or(DEFAULT_WATCHER_REQUESTS_DIR)),
+            )
+        };
 
         if cert_config_inputs.len() > MAX_CERTIFICATES {
             collector.add(ValidationError::new(
@@ -735,6 +786,8 @@ impl<F: FileSystem> ConfigValidator<F> {
         Some(AcmConfig {
             enabled: acm_enabled,
             certificates,
+            watcher_config_dir,
+            watcher_requests_dir,
         })
     }
 
@@ -824,11 +877,46 @@ impl<F: FileSystem> ConfigValidator<F> {
 
         // Validate optional refresh_command
         let refresh_command = certificate_config_input.refresh_command.clone();
+        let mut refresh_command_valid = false;
         if let Some(ref cmd) = refresh_command {
-            if let Err(e) =
-                validate_refresh_command(&format!("{}.refresh_command", field_prefix), cmd)
-            {
+            match validate_refresh_command(&format!("{}.refresh_command", field_prefix), cmd) {
+                Ok(()) => refresh_command_valid = true,
+                Err(e) => collector.add(e),
+            }
+        }
+
+        // Validate optional watcher_id. Duplicate watcher_id values across
+        // certificate blocks are allowed: one watcher handles many
+        // certificates.
+        let watcher_id = certificate_config_input.watcher_id.clone();
+        if let Some(ref id) = watcher_id {
+            if let Err(e) = validate_watcher_id(&format!("{}.watcher_id", field_prefix), id) {
                 collector.add(e);
+            }
+
+            // The command is carried into the watcher's config and request
+            // files never carry one, so a missing command can't be recovered
+            // later.
+            if refresh_command.is_none() {
+                collector.add(ValidationError::new(
+                    format!("{}.refresh_command", field_prefix),
+                    ValidationErrorCode::MissingRequiredField,
+                    MISSING_REFRESH_COMMAND_FOR_WATCHER_ERR_MSG,
+                ));
+            }
+
+            // The watcher's rules are stricter on Unix, so check them here
+            // rather than fail when the provider writes the watcher's config.
+            if let (true, Some(cmd)) = (refresh_command_valid, &refresh_command) {
+                let mut errors = Vec::new();
+                watcher_config::validate_command(
+                    &format!("{}.refresh_command", field_prefix),
+                    &watcher_config::split_command(cmd),
+                    &mut errors,
+                );
+                for e in errors {
+                    collector.add(e);
+                }
             }
         }
 
@@ -877,6 +965,7 @@ impl<F: FileSystem> ConfigValidator<F> {
             refresh_command,
             cert_and_chain_permission,
             key_permission,
+            watcher_id,
         })
     }
 }
@@ -917,12 +1006,15 @@ fn toml_value_to_string(field_name: &str, val: &toml::Value) -> Result<String, V
 mod tests {
     use super::MAX_CERTIFICATES;
     use crate::config::error::ValidationErrorCode;
-    use crate::config::types::LogLevel;
+    use crate::config::types::{
+        LogLevel, DEFAULT_WATCHER_CONFIG_DIR, DEFAULT_WATCHER_REQUESTS_DIR,
+    };
     use crate::config::validator::ConfigValidator;
     use crate::filesystem::MockFileSystem;
     use crate::fs_permissions::PathPermission;
     #[cfg(windows)]
     use crate::fs_permissions::{Rights, TrusteeType};
+    use std::path::PathBuf;
     use std::sync::Arc;
 
     fn mock_fs() -> Arc<MockFileSystem> {
@@ -931,7 +1023,16 @@ mod tests {
                 .with_dir("/etc/ssl/certs")
                 .with_dir("/etc/ssl/private")
                 .with_dir("c:\\etc\\ssl\\certs")
-                .with_dir("c:\\etc\\ssl\\private"),
+                .with_dir("c:\\etc\\ssl\\private")
+                // Default watcher dirs (platform-specific) on read-write
+                // mounts, as the provider requires.
+                .with_dir(DEFAULT_WATCHER_CONFIG_DIR)
+                .with_dir(DEFAULT_WATCHER_REQUESTS_DIR)
+                // Override watcher dirs used by override tests, read-write.
+                .with_dir("/mnt/wcp/config")
+                .with_dir("/mnt/wcp/requests")
+                .with_dir(r"C:\mnt\wcp\config")
+                .with_dir(r"C:\mnt\wcp\requests"),
         )
     }
 
@@ -1895,6 +1996,8 @@ mod tests {
                 cert.refresh_command,
                 Some("/bin/systemctl reload nginx".to_string())
             );
+            // refresh_command without watcher_id stays provider-executed
+            assert_eq!(cert.watcher_id, None);
         }
 
         #[test]
@@ -1997,6 +2100,631 @@ mod tests {
                 result.is_ok(),
                 "Expected 50 certificates to be accepted, got: {:?}",
                 result.unwrap_err()
+            );
+        }
+
+        /// A program path a watcher accepts here: watcher commands need an
+        /// absolute program path, and `/bin/...` isn't absolute on Windows.
+        #[cfg(unix)]
+        const WATCHER_PROGRAM: &str = "/bin/systemctl";
+        #[cfg(windows)]
+        const WATCHER_PROGRAM: &str = "C:/tools/systemctl.exe";
+
+        /// A single certificate block, with `extra` appended inside it.
+        fn acm_toml_with(extra: &str) -> String {
+            let (cert, key, chain) = test_paths("");
+            format!(
+                r#"
+                [capabilities.acm]
+                enabled = true
+
+                [[capabilities.acm.certificates]]
+                certificate_arn = "arn:aws:acm:us-east-1:123456789012:certificate/12345678-1234-1234-1234-123456789012"
+                role_arn = "arn:aws:iam::123456789012:role/MyRole"
+                certificate_path = '{cert}'
+                private_key_path = '{key}'
+                chain_path = '{chain}'
+                {extra}
+            "#
+            )
+        }
+
+        #[test]
+        fn test_watcher_id_accepted_and_surfaced() {
+            let validator = ConfigValidator::with_filesystem(mock_fs());
+            let toml = acm_toml_with(&format!(
+                r#"refresh_command = "{WATCHER_PROGRAM} reload nginx"
+                watcher_id = "tls-sidecar""#,
+            ));
+            let result = validator.validate_toml_config_str(&toml);
+            assert!(result.is_ok(), "Errors: {}", result.unwrap_err());
+            let cert = result
+                .unwrap()
+                .acm
+                .unwrap()
+                .certificates
+                .into_values()
+                .next()
+                .unwrap();
+            assert_eq!(cert.watcher_id, Some("tls-sidecar".to_string()));
+            assert_eq!(
+                cert.refresh_command,
+                Some(format!("{WATCHER_PROGRAM} reload nginx"))
+            );
+        }
+
+        #[test]
+        fn test_watcher_id_without_refresh_command_rejected() {
+            let validator = ConfigValidator::with_filesystem(mock_fs());
+            let toml = acm_toml_with(r#"watcher_id = "tls-sidecar""#);
+            let result = validator.validate_toml_config_str(&toml);
+            assert!(result.is_err());
+            let errors = result.unwrap_err();
+            assert!(
+                errors.errors.iter().any(|e| {
+                    e.code == ValidationErrorCode::MissingRequiredField
+                        && e.field == "capabilities.acm.certificates[0].refresh_command"
+                }),
+                "Errors: {}",
+                errors
+            );
+        }
+
+        #[test]
+        #[cfg(windows)]
+        fn test_watcher_accepts_same_commands_as_windows_install() {
+            // Parity with an EC2 Windows installation: a watcher accepts any
+            // command that passes the general Windows refresh_command rules.
+            let validator = ConfigValidator::with_filesystem(mock_fs());
+            let toml = acm_toml_with(
+                r#"refresh_command = "nginx -s reload"
+                watcher_id = "tls-sidecar""#,
+            );
+            let errors = validator
+                .validate_toml_config_str(&toml)
+                .err()
+                .map(|e| e.errors)
+                .unwrap_or_default();
+            assert!(
+                !errors
+                    .iter()
+                    .any(|e| e.code == ValidationErrorCode::InvalidCommand),
+                "{errors:?}"
+            );
+        }
+
+        #[test]
+        #[cfg(windows)]
+        fn test_watcher_accepts_a_quoted_windows_path_with_spaces() {
+            let validator = ConfigValidator::with_filesystem(mock_fs());
+            let toml = acm_toml_with(
+                r#"refresh_command = '"C:\Program Files\nginx\nginx.exe" -s reload'
+                watcher_id = "tls-sidecar""#,
+            );
+            let errors = validator
+                .validate_toml_config_str(&toml)
+                .err()
+                .map(|e| e.errors)
+                .unwrap_or_default();
+            assert!(
+                !errors
+                    .iter()
+                    .any(|e| e.code == ValidationErrorCode::InvalidCommand),
+                "{errors:?}"
+            );
+        }
+
+        #[test]
+        #[cfg(windows)]
+        fn test_unverified_windows_mount_mode_surfaced_as_warnings() {
+            // The Windows mount-mode gap passes validation but is returned on
+            // ValidatedConfig, so main.rs can log it after the logger starts.
+            let fs = Arc::new(
+                MockFileSystem::new()
+                    .with_dir("c:\\etc\\ssl\\certs")
+                    .with_dir("c:\\etc\\ssl\\private")
+                    .with_dir_mount_mode_error(
+                        DEFAULT_WATCHER_CONFIG_DIR,
+                        std::io::ErrorKind::Unsupported,
+                    )
+                    .with_dir_mount_mode_error(
+                        DEFAULT_WATCHER_REQUESTS_DIR,
+                        std::io::ErrorKind::Unsupported,
+                    ),
+            );
+            let validator = ConfigValidator::with_filesystem(fs);
+            let toml = acm_toml_with(
+                r#"refresh_command = "/bin/systemctl reload nginx"
+                watcher_id = "tls-sidecar""#,
+            );
+            let validated = validator.validate_toml_config_str(&toml).unwrap();
+            assert_eq!(validated.warnings.len(), 2, "{:?}", validated.warnings);
+            assert!(validated.warnings[0].contains("capabilities.acm.watcher_config_dir"));
+            assert!(validated.warnings[1].contains("capabilities.acm.watcher_requests_dir"));
+        }
+
+        #[test]
+        fn test_watcher_config_has_no_warnings_when_mount_mode_verified() {
+            let validator = ConfigValidator::with_filesystem(mock_fs());
+            let toml = acm_toml_with(
+                r#"refresh_command = "/bin/systemctl reload nginx"
+                watcher_id = "tls-sidecar""#,
+            );
+            let validated = validator.validate_toml_config_str(&toml).unwrap();
+            assert!(validated.warnings.is_empty(), "{:?}", validated.warnings);
+        }
+
+        #[test]
+        fn test_invalid_watcher_id_rejected() {
+            let validator = ConfigValidator::with_filesystem(mock_fs());
+            let toml = acm_toml_with(
+                r#"refresh_command = "/bin/systemctl reload nginx"
+                watcher_id = "../escape""#,
+            );
+            let result = validator.validate_toml_config_str(&toml);
+            assert!(result.is_err());
+            let errors = result.unwrap_err();
+            assert!(
+                errors.errors.iter().any(|e| {
+                    e.code == ValidationErrorCode::InvalidWatcherId
+                        && e.field == "capabilities.acm.certificates[0].watcher_id"
+                }),
+                "Errors: {}",
+                errors
+            );
+        }
+
+        #[test]
+        fn test_watcher_directories_default_when_omitted() {
+            let validator = ConfigValidator::with_filesystem(mock_fs());
+            let toml = acm_toml_with(r#"refresh_command = "/bin/systemctl reload nginx""#);
+            let result = validator.validate_toml_config_str(&toml);
+            assert!(result.is_ok(), "Errors: {}", result.unwrap_err());
+            let acm = result.unwrap().acm.unwrap();
+            assert_eq!(
+                acm.watcher_config_dir,
+                PathBuf::from(DEFAULT_WATCHER_CONFIG_DIR)
+            );
+            assert_eq!(
+                acm.watcher_requests_dir,
+                PathBuf::from(DEFAULT_WATCHER_REQUESTS_DIR)
+            );
+        }
+
+        #[test]
+        fn test_watcher_directories_override_honored() {
+            #[cfg(unix)]
+            let (config_dir, requests_dir) = ("/mnt/wcp/config", "/mnt/wcp/requests");
+            #[cfg(windows)]
+            let (config_dir, requests_dir) = (r"C:\mnt\wcp\config", r"C:\mnt\wcp\requests");
+
+            let validator = ConfigValidator::with_filesystem(mock_fs());
+            let (cert, key, chain) = test_paths("");
+            let toml = format!(
+                r#"
+                [capabilities.acm]
+                enabled = true
+                watcher_config_dir = '{config_dir}'
+                watcher_requests_dir = '{requests_dir}'
+
+                [[capabilities.acm.certificates]]
+                certificate_arn = "arn:aws:acm:us-east-1:123456789012:certificate/12345678-1234-1234-1234-123456789012"
+                role_arn = "arn:aws:iam::123456789012:role/MyRole"
+                certificate_path = '{cert}'
+                private_key_path = '{key}'
+                chain_path = '{chain}'
+                refresh_command = "{WATCHER_PROGRAM} reload nginx"
+                watcher_id = "tls-sidecar"
+            "#
+            );
+            let result = validator.validate_toml_config_str(&toml);
+            assert!(result.is_ok(), "Errors: {}", result.unwrap_err());
+            let acm = result.unwrap().acm.unwrap();
+            assert_eq!(acm.watcher_config_dir, PathBuf::from(config_dir));
+            assert_eq!(acm.watcher_requests_dir, PathBuf::from(requests_dir));
+        }
+
+        #[test]
+        fn test_relative_config_watcher_directory_rejected() {
+            let validator = ConfigValidator::with_filesystem(mock_fs());
+            let (cert, key, chain) = test_paths("");
+            let toml = format!(
+                r#"
+                [capabilities.acm]
+                enabled = true
+                watcher_config_dir = 'relative/config'
+
+                [[capabilities.acm.certificates]]
+                certificate_arn = "arn:aws:acm:us-east-1:123456789012:certificate/12345678-1234-1234-1234-123456789012"
+                role_arn = "arn:aws:iam::123456789012:role/MyRole"
+                certificate_path = '{cert}'
+                private_key_path = '{key}'
+                chain_path = '{chain}'
+                refresh_command = "/bin/systemctl reload nginx"
+                watcher_id = "tls-sidecar"
+            "#
+            );
+            let result = validator.validate_toml_config_str(&toml);
+            assert!(result.is_err());
+            let errors = result.unwrap_err();
+            assert!(
+                errors.errors.iter().any(|e| {
+                    e.code == ValidationErrorCode::RelativePath
+                        && e.field == "capabilities.acm.watcher_config_dir"
+                }),
+                "Errors: {}",
+                errors
+            );
+        }
+
+        #[test]
+        fn test_container_config_both_bad_watcher_dirs_rejected() {
+            let validator = ConfigValidator::with_filesystem(mock_fs());
+            let (cert, key, chain) = test_paths("");
+            let toml = format!(
+                r#"
+                [capabilities.acm]
+                enabled = true
+                watcher_config_dir = ''
+                watcher_requests_dir = 'relative/requests'
+
+                [[capabilities.acm.certificates]]
+                certificate_arn = "arn:aws:acm:us-east-1:123456789012:certificate/12345678-1234-1234-1234-123456789012"
+                role_arn = "arn:aws:iam::123456789012:role/MyRole"
+                certificate_path = '{cert}'
+                private_key_path = '{key}'
+                chain_path = '{chain}'
+                refresh_command = "/bin/systemctl reload nginx"
+                watcher_id = "tls-sidecar"
+            "#
+            );
+            let result = validator.validate_toml_config_str(&toml);
+            assert!(result.is_err());
+            let errors = result.unwrap_err();
+            assert!(
+                errors.errors.iter().any(|e| {
+                    e.code == ValidationErrorCode::RelativePath
+                        && e.field == "capabilities.acm.watcher_requests_dir"
+                }),
+                "Errors: {}",
+                errors
+            );
+            assert!(
+                errors.errors.iter().any(|e| {
+                    e.code == ValidationErrorCode::InvalidValue
+                        && e.field == "capabilities.acm.watcher_config_dir"
+                }),
+                "Errors: {}",
+                errors
+            );
+        }
+
+        #[test]
+        fn test_certificates_may_share_a_watcher_id() {
+            let (cert, key, chain) = test_paths("");
+            let (cert2, key2, chain2) = test_paths("2");
+            let validator = ConfigValidator::with_filesystem(mock_fs());
+            let toml = format!(
+                r#"
+                [capabilities.acm]
+                enabled = true
+
+                [[capabilities.acm.certificates]]
+                certificate_arn = "arn:aws:acm:us-east-1:123456789012:certificate/11111111-1234-1234-1234-123456789012"
+                role_arn = "arn:aws:iam::123456789012:role/MyRole"
+                certificate_path = '{cert}'
+                private_key_path = '{key}'
+                chain_path = '{chain}'
+                refresh_command = "{WATCHER_PROGRAM} reload nginx"
+                watcher_id = "tls-sidecar"
+
+                [[capabilities.acm.certificates]]
+                certificate_arn = "arn:aws:acm:us-east-1:123456789012:certificate/22222222-1234-1234-1234-123456789012"
+                role_arn = "arn:aws:iam::123456789012:role/MyRole"
+                certificate_path = '{cert2}'
+                private_key_path = '{key2}'
+                chain_path = '{chain2}'
+                refresh_command = "{WATCHER_PROGRAM} reload envoy"
+                watcher_id = "tls-sidecar"
+            "#
+            );
+            let result = validator.validate_toml_config_str(&toml);
+            assert!(result.is_ok(), "Errors: {}", result.unwrap_err());
+            let acm = result.unwrap().acm.unwrap();
+            assert_eq!(acm.certificates.len(), 2);
+            assert!(acm
+                .certificates
+                .values()
+                .all(|c| c.watcher_id.as_deref() == Some("tls-sidecar")));
+        }
+
+        #[test]
+        fn test_certificates_may_be_mixed_usage_watcher_id_and_non_watcher_id() {
+            let (cert, key, chain) = test_paths("");
+            let (cert2, key2, chain2) = test_paths("2");
+            let validator = ConfigValidator::with_filesystem(mock_fs());
+            let toml = format!(
+                r#"
+                [capabilities.acm]
+                enabled = true
+
+                [[capabilities.acm.certificates]]
+                certificate_arn = "arn:aws:acm:us-east-1:123456789012:certificate/11111111-1234-1234-1234-123456789012"
+                role_arn = "arn:aws:iam::123456789012:role/MyRole"
+                certificate_path = '{cert}'
+                private_key_path = '{key}'
+                chain_path = '{chain}'
+                refresh_command = "{WATCHER_PROGRAM} reload nginx"
+                watcher_id = "tls-sidecar" # WCP will send request to watcher, watcher will run command
+
+                [[capabilities.acm.certificates]]
+                certificate_arn = "arn:aws:acm:us-east-1:123456789012:certificate/22222222-1234-1234-1234-123456789012"
+                role_arn = "arn:aws:iam::123456789012:role/MyRole"
+                certificate_path = '{cert2}'
+                private_key_path = '{key2}'
+                chain_path = '{chain2}'
+                refresh_command = "{WATCHER_PROGRAM} reload envoy" # WCP will call command directly
+            "#
+            );
+            let result = validator.validate_toml_config_str(&toml);
+            assert!(result.is_ok(), "Errors: {}", result.unwrap_err());
+            let acm = result.unwrap().acm.unwrap();
+            assert_eq!(acm.certificates.len(), 2);
+            assert!(acm
+                .certificates
+                .get("arn:aws:acm:us-east-1:123456789012:certificate/11111111-1234-1234-1234-123456789012")
+                .unwrap().watcher_id.as_deref() == Some("tls-sidecar"));
+            assert!(acm
+                .certificates
+                .get("arn:aws:acm:us-east-1:123456789012:certificate/22222222-1234-1234-1234-123456789012")
+                .unwrap().watcher_id.as_deref() == None);
+        }
+
+        #[test]
+        fn test_container_config_missing_watcher_dir_rejected() {
+            // Container config (watcher_id set) whose watcher directories are
+            // not present: existence must be enforced at startup.
+            let (cert_dir, key_dir) = test_dirs();
+            let fs = Arc::new(MockFileSystem::new().with_dir(cert_dir).with_dir(key_dir));
+            let validator = ConfigValidator::with_filesystem(fs);
+            let toml = acm_toml_with(
+                r#"refresh_command = "/bin/systemctl reload nginx"
+                watcher_id = "tls-sidecar""#,
+            );
+            let result = validator.validate_toml_config_str(&toml);
+            assert!(result.is_err());
+            let errors = result.unwrap_err();
+            assert!(
+                errors
+                    .errors
+                    .iter()
+                    .any(|e| e.code == ValidationErrorCode::WatcherDirectoryNotFound),
+                "Errors: {}",
+                errors
+            );
+        }
+
+        /// Validates a default-dirs container config against `fs` and asserts
+        /// it is refused with a wrong-mount-mode error on `field`.
+        fn assert_container_config_wrong_mount_mode(fs: MockFileSystem, field: &str) {
+            let validator = ConfigValidator::with_filesystem(Arc::new(fs));
+            let toml = acm_toml_with(
+                r#"refresh_command = "/bin/systemctl reload nginx"
+                watcher_id = "tls-sidecar""#,
+            );
+            let errors = validator.validate_toml_config_str(&toml).unwrap_err();
+            assert!(
+                errors.errors.iter().any(|e| e.code
+                    == ValidationErrorCode::WatcherDirectoryWrongMountMode
+                    && e.field == field),
+                "Errors: {}",
+                errors
+            );
+        }
+
+        #[test]
+        fn test_container_config_read_only_watcher_config_dir_rejected() {
+            // The provider writes the watcher configs, so a read-only config
+            // mount is refused.
+            let (cert_dir, key_dir) = test_dirs();
+            assert_container_config_wrong_mount_mode(
+                MockFileSystem::new()
+                    .with_dir(cert_dir)
+                    .with_dir(key_dir)
+                    .with_read_only_dir(DEFAULT_WATCHER_CONFIG_DIR)
+                    .with_dir(DEFAULT_WATCHER_REQUESTS_DIR),
+                "capabilities.acm.watcher_config_dir",
+            );
+        }
+
+        #[test]
+        fn test_container_config_read_only_watcher_requests_dir_rejected() {
+            // The provider enqueues refresh requests, so a read-only requests
+            // mount is refused.
+            let (cert_dir, key_dir) = test_dirs();
+            assert_container_config_wrong_mount_mode(
+                MockFileSystem::new()
+                    .with_dir(cert_dir)
+                    .with_dir(key_dir)
+                    .with_dir(DEFAULT_WATCHER_CONFIG_DIR)
+                    .with_read_only_dir(DEFAULT_WATCHER_REQUESTS_DIR),
+                "capabilities.acm.watcher_requests_dir",
+            );
+        }
+
+        #[test]
+        fn test_container_config_same_path_rejected() {
+            // Config dir and requests dir resolve to the same path.
+            #[cfg(unix)]
+            let shared_dir = "/mnt/shared";
+            #[cfg(windows)]
+            let shared_dir = r"C:\mnt\shared";
+
+            let (cert_dir, key_dir) = test_dirs();
+            let fs = Arc::new(
+                MockFileSystem::new()
+                    .with_dir(cert_dir)
+                    .with_dir(key_dir)
+                    .with_dir(shared_dir),
+            );
+            let validator = ConfigValidator::with_filesystem(fs);
+            let (cert, key, chain) = test_paths("");
+            let toml = format!(
+                r#"
+                [capabilities.acm]
+                enabled = true
+                watcher_config_dir = '{shared_dir}'
+                watcher_requests_dir = '{shared_dir}'
+
+                [[capabilities.acm.certificates]]
+                certificate_arn = "arn:aws:acm:us-east-1:123456789012:certificate/12345678-1234-1234-1234-123456789012"
+                role_arn = "arn:aws:iam::123456789012:role/MyRole"
+                certificate_path = '{cert}'
+                private_key_path = '{key}'
+                chain_path = '{chain}'
+                refresh_command = "/bin/systemctl reload nginx"
+                watcher_id = "tls-sidecar"
+            "#
+            );
+            let result = validator.validate_toml_config_str(&toml);
+            assert!(result.is_err());
+            let errors = result.unwrap_err();
+            assert!(
+                errors.errors.iter().any(|e| {
+                    e.code == ValidationErrorCode::ConflictingPaths
+                        && e.field == "capabilities.acm.watcher_requests_dir"
+                }),
+                "Errors: {}",
+                errors
+            );
+        }
+
+        #[test]
+        fn test_non_container_config_skips_dir_checks() {
+            // ACM enabled but NO watcher_id: the watcher directories are not
+            // registered yet validation still succeeds, because non-container
+            // configs skip the existence/distinctness/mount checks.
+            let (cert_dir, key_dir) = test_dirs();
+            let fs = Arc::new(MockFileSystem::new().with_dir(cert_dir).with_dir(key_dir));
+            let validator = ConfigValidator::with_filesystem(fs);
+            let toml = acm_toml_with(r#"refresh_command = "/bin/systemctl reload nginx""#);
+            let result = validator.validate_toml_config_str(&toml);
+            assert!(result.is_ok(), "Errors: {}", result.unwrap_err());
+            let acm = result.unwrap().acm.unwrap();
+            assert_eq!(
+                acm.watcher_config_dir,
+                PathBuf::from(DEFAULT_WATCHER_CONFIG_DIR)
+            );
+            assert_eq!(
+                acm.watcher_requests_dir,
+                PathBuf::from(DEFAULT_WATCHER_REQUESTS_DIR)
+            );
+        }
+
+        #[test]
+        fn test_non_container_config_bad_watcher_dir_accepted() {
+            // ACM enabled but NO watcher_id: watcher-dir overrides are carried
+            // as-is, without format or filesystem checks.
+            #[cfg(unix)]
+            let traversal_dir = "/shared/../etc";
+            #[cfg(windows)]
+            let traversal_dir = r"C:\shared\..\etc";
+
+            let (cert_dir, key_dir) = test_dirs();
+            let fs = Arc::new(MockFileSystem::new().with_dir(cert_dir).with_dir(key_dir));
+            let validator = ConfigValidator::with_filesystem(fs);
+            let (cert, key, chain) = test_paths("");
+            let toml = format!(
+                r#"
+                [capabilities.acm]
+                enabled = true
+                watcher_config_dir = 'relative/config'
+                watcher_requests_dir = '{traversal_dir}'
+
+                [[capabilities.acm.certificates]]
+                certificate_arn = "arn:aws:acm:us-east-1:123456789012:certificate/12345678-1234-1234-1234-123456789012"
+                role_arn = "arn:aws:iam::123456789012:role/MyRole"
+                certificate_path = '{cert}'
+                private_key_path = '{key}'
+                chain_path = '{chain}'
+                refresh_command = "/bin/systemctl reload nginx"
+            "#
+            );
+            let result = validator.validate_toml_config_str(&toml);
+            assert!(result.is_ok(), "Errors: {}", result.unwrap_err());
+            let acm = result.unwrap().acm.unwrap();
+            assert_eq!(acm.watcher_config_dir, PathBuf::from("relative/config"));
+            assert_eq!(acm.watcher_requests_dir, PathBuf::from(traversal_dir));
+        }
+
+        #[test]
+        fn test_container_config_acm_disabled_skips_dir_checks() {
+            // A watcher_id is declared but ACM is disabled: no watcher-dir
+            // checks run, even with a bad override and no mounted dirs.
+            let (cert_dir, key_dir) = test_dirs();
+            let fs = Arc::new(MockFileSystem::new().with_dir(cert_dir).with_dir(key_dir));
+            let validator = ConfigValidator::with_filesystem(fs);
+            let (cert, key, chain) = test_paths("");
+            let toml = format!(
+                r#"
+                [capabilities.acm]
+                enabled = false
+                watcher_config_dir = 'relative/config'
+
+                [[capabilities.acm.certificates]]
+                certificate_arn = "arn:aws:acm:us-east-1:123456789012:certificate/12345678-1234-1234-1234-123456789012"
+                role_arn = "arn:aws:iam::123456789012:role/MyRole"
+                certificate_path = '{cert}'
+                private_key_path = '{key}'
+                chain_path = '{chain}'
+                refresh_command = "{WATCHER_PROGRAM} reload nginx"
+                watcher_id = "tls-sidecar"
+            "#
+            );
+            let result = validator.validate_toml_config_str(&toml);
+            assert!(result.is_ok(), "Errors: {}", result.unwrap_err());
+            let acm = result.unwrap().acm.unwrap();
+            assert!(!acm.enabled);
+            assert_eq!(acm.watcher_config_dir, PathBuf::from("relative/config"));
+            assert_eq!(
+                acm.watcher_requests_dir,
+                PathBuf::from(DEFAULT_WATCHER_REQUESTS_DIR)
+            );
+        }
+
+        #[test]
+        fn test_container_config_acm_enabled_omitted_skips_dir_checks() {
+            // `enabled` omitted defaults to false: no watcher-dir checks run,
+            // and the defaults are carried.
+            let (cert_dir, key_dir) = test_dirs();
+            let fs = Arc::new(MockFileSystem::new().with_dir(cert_dir).with_dir(key_dir));
+            let validator = ConfigValidator::with_filesystem(fs);
+            let (cert, key, chain) = test_paths("");
+            let toml = format!(
+                r#"
+                [capabilities.acm]
+
+                [[capabilities.acm.certificates]]
+                certificate_arn = "arn:aws:acm:us-east-1:123456789012:certificate/12345678-1234-1234-1234-123456789012"
+                role_arn = "arn:aws:iam::123456789012:role/MyRole"
+                certificate_path = '{cert}'
+                private_key_path = '{key}'
+                chain_path = '{chain}'
+                refresh_command = "{WATCHER_PROGRAM} reload nginx"
+                watcher_id = "tls-sidecar"
+            "#
+            );
+            let result = validator.validate_toml_config_str(&toml);
+            assert!(result.is_ok(), "Errors: {}", result.unwrap_err());
+            let acm = result.unwrap().acm.unwrap();
+            assert!(!acm.enabled);
+            assert_eq!(
+                acm.watcher_config_dir,
+                PathBuf::from(DEFAULT_WATCHER_CONFIG_DIR)
+            );
+            assert_eq!(
+                acm.watcher_requests_dir,
+                PathBuf::from(DEFAULT_WATCHER_REQUESTS_DIR)
             );
         }
     }

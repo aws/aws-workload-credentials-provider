@@ -9,6 +9,7 @@ mod run;
 mod scheduler;
 mod traits;
 mod utils;
+mod watcher_configs;
 
 #[cfg(windows)]
 pub use refresh_executor::scheduled_task_name;
