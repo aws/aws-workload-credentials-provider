@@ -71,10 +71,18 @@ jobs:
     - name: Build provider binary
       run: cargo build
 
+    # ubuntu-latest (24.04) denies an unprivileged user namespace its uid/gid
+    # maps through AppArmor, and the watcher e2e tests need one to mount the
+    # watcher's config directory read-only.
+    - name: Allow unprivileged user namespaces
+      run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
     - name: Run integration tests
       env:
         ACM_TEST_ROLE_ARN: ${{ secrets.ACM_TEST_ROLE_ARN }}
         ACM_TEST_CERTIFICATE_ARN: ${{ secrets.ACM_TEST_CERTIFICATE_ARN }}
+        # Fail, rather than skip, the tests that need a user and mount namespace.
+        WCP_WATCHER_E2E_REQUIRE_MOUNTS: "1"
       run: |
         cd integration-tests
         cargo test -- --test-threads=1

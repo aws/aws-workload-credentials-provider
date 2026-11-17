@@ -32,7 +32,7 @@ RUN if [ -z "$CONFIG" ]; then echo "CONFIG is required: --build-arg CONFIG=<path
 # made here and copied in owned by the runtime user.
 RUN mkdir /logs
 
-RUN cargo build --release
+RUN cargo build --release -p aws_workload_credentials_provider
 
 FROM scratch
 
