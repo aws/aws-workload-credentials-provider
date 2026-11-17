@@ -365,7 +365,7 @@ You can run the Workload Credentials Provider as a sidecar container that runs `
 
 **Note:** The container path does not use the `install` / `install.ps1` script or sudoers; the provider runs its binary directly as its container's user and the reload runs inside the TLS container via `wcp-watcher`.
 
-**Obtaining the binaries.** The release bundle contains the watcher at `watcher/wcp-watcher` for Linux and `watcher\wcp-watcher.exe` for Windows. Copy both binaries into the Docker build directory before `docker build`. Alternatively, a single `cargo build --release` compiles both executables to `target/release/` (cross-compiled builds under `target/<target-triple>/release/`, e.g. `wcp-watcher.exe` on Windows).
+**Obtaining the binaries.** The watcher is versioned and released separately from the provider. Download it from `https://artifacts.awcp.global.on.aws/watcher/<watcher-version>/<target>/wcp-watcher` (`wcp-watcher.exe` for `x86_64-pc-windows-msvc`), where `<target>` is `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` or `x86_64-pc-windows-msvc`; the Linux builds are statically linked. Copy both binaries into the Docker build directory before `docker build`. Alternatively, a single `cargo build --release` compiles both executables to `target/release/` (cross-compiled builds under `target/<target-triple>/release/`, e.g. `wcp-watcher.exe` on Windows).
 
 **Shared volumes** (three mounts; at startup on Linux, the provider and watcher check the modes of the two watcher mounts):
 

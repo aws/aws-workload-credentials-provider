@@ -3,8 +3,15 @@ name: Release
 on:
   workflow_dispatch:
     inputs:
+      component:
+        description: Binary to release. The provider and wcp-watcher are versioned and released independently.
+        required: true
+        type: choice
+        options:
+          - provider
+          - watcher
       version:
-        description: Version number in the pattern x.y.z
+        description: Version number in the pattern x.y.z. Must match the component's crate version on the selected ref.
         required: true
         type: string
 
@@ -27,6 +34,35 @@ jobs:
         run: |
           if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "::error::Version '$VERSION' is not valid semver (expected x.y.z)"
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 1
+
+      # Each component has its own version line, so a provider version entered
+      # for the watcher (or the reverse) would publish a binary under a version
+      # its crate doesn't carry.
+      - name: Validate version matches the component's crate
+        env:
+          COMPONENT: ${{ inputs.component }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          case "$COMPONENT" in
+            provider) crate=aws_workload_credentials_provider ;;
+            watcher) crate=aws_workload_credentials_provider_watcher ;;
+            *) echo "::error::Unknown component '$COMPONENT'"; exit 1 ;;
+          esac
+          crate_version=$(cargo metadata --format-version 1 --no-deps \
+            | jq -r --arg name "$crate" '.packages[] | select(.name == $name) | .version')
+          if [[ -z "$crate_version" ]]; then
+            echo "::error::Crate $crate not found in the workspace"
+            exit 1
+          fi
+          if [[ "$crate_version" != "$VERSION" ]]; then
+            echo "::error::$crate is at $crate_version on this ref, not $VERSION"
             exit 1
           fi
   staging:
@@ -74,60 +110,68 @@ jobs:
           RELEASE_BUCKET: ${{ secrets.RELEASE_BUCKET }}
           RELEASE_WINDOWS_BUCKET: ${{ secrets.RELEASE_WINDOWS_BUCKET }}
           RELEASE_WINDOWS_BIN_PATH: ${{ secrets.RELEASE_WINDOWS_BIN_PATH }}
+          COMPONENT: ${{ inputs.component }}
+          VERSION: ${{ inputs.version }}
         run: |
           # Each downloaded artifact is a directory named "aws-wcp-<target>"
           # (e.g. artifacts/aws-wcp-x86_64-unknown-linux-gnu/) laid out as
           # staging.yml publishes it:
           #   aws-workload-credentials-provider[.exe]
           #   watcher/wcp-watcher[.exe]
-          # Strip the "artifacts/aws-wcp-" prefix and trailing slash
+          # Only the selected component is published:
+          #   provider: <version>/<target>/aws-workload-credentials-provider[.exe]
+          #   watcher:  watcher/<version>/<target>/wcp-watcher[.exe]
+          # The watcher has its own key prefix because its versions overlap
+          # the provider's numbers without matching its releases.
+          #
           # Every target is checked before anything is uploaded: put-object
           # uses --if-none-match, so a release that stopped partway could not
           # be rerun with the same version.
-          for dir in artifacts/aws-wcp-*/; do
-            target="${dir#artifacts/aws-wcp-}"
-            target="${target%/}"
-            count=$(find "$dir" -maxdepth 1 -type f -name 'aws-workload-credentials-provider*' | wc -l)
-            if [[ "$count" -ne 1 ]]; then
-              echo "::error::Expected exactly one provider binary for target $target in $dir, found $count"
-              exit 1
-            fi
-            if [[ "$target" == *windows* ]]; then
-              watcher="${dir}watcher/wcp-watcher.exe"
+          binary_for() {
+            local dir="$1" target="$2"
+            if [[ "$COMPONENT" == "provider" ]]; then
+              find "$dir" -maxdepth 1 -type f -name 'aws-workload-credentials-provider*'
+            elif [[ "$target" == *windows* ]]; then
+              echo "${dir}watcher/wcp-watcher.exe"
             else
-              watcher="${dir}watcher/wcp-watcher"
+              echo "${dir}watcher/wcp-watcher"
             fi
-            if [[ ! -f "$watcher" ]]; then
-              echo "::error::Expected the watcher binary for target $target at $watcher"
-              exit 1
-            fi
-          done
+          }
 
           for dir in artifacts/aws-wcp-*/; do
             target="${dir#artifacts/aws-wcp-}"
             target="${target%/}"
-            binary=$(find "$dir" -maxdepth 1 -type f -name 'aws-workload-credentials-provider*')
+            binary=$(binary_for "$dir" "$target")
+            count=$(printf '%s' "$binary" | grep -c . || true)
+            if [[ "$count" -ne 1 || ! -f "$binary" ]]; then
+              echo "::error::Expected exactly one $COMPONENT binary for target $target in $dir"
+              exit 1
+            fi
+          done
+
+          if [[ "$COMPONENT" == "provider" ]]; then
+            component_prefix=""
+          else
+            component_prefix="watcher/"
+          fi
+
+          for dir in artifacts/aws-wcp-*/; do
+            target="${dir#artifacts/aws-wcp-}"
+            target="${target%/}"
+            binary=$(binary_for "$dir" "$target")
 
             # Windows targets go to a separate bucket under a key prefix
             if [[ "$target" == *windows* ]]; then
               bucket="$RELEASE_WINDOWS_BUCKET"
               key_prefix="${RELEASE_WINDOWS_BIN_PATH}/"
-              watcher="${dir}watcher/wcp-watcher.exe"
             else
               bucket="$RELEASE_BUCKET"
               key_prefix=""
-              watcher="${dir}watcher/wcp-watcher"
             fi
 
             aws s3api put-object \
               --bucket "$bucket" \
-              --key "${key_prefix}${{ inputs.version }}/${target}/$(basename "$binary")" \
+              --key "${key_prefix}${component_prefix}${VERSION}/${target}/$(basename "$binary")" \
               --body "$binary" \
-              --if-none-match "*"
-
-            aws s3api put-object \
-              --bucket "$bucket" \
-              --key "${key_prefix}${{ inputs.version }}/${target}/watcher/$(basename "$watcher")" \
-              --body "$watcher" \
               --if-none-match "*"
           done

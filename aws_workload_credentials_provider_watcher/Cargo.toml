@@ -1,6 +1,6 @@
 [package]
 name = "aws_workload_credentials_provider_watcher"
-version = "3.1.2"
+version = "1.0.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "In-container watcher that runs a TLS reload command when the AWS Workload Credentials Provider renews a certificate."
