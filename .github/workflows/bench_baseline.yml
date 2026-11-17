@@ -1,0 +1,37 @@
+name: Push Benchmark Baseline
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  deployments: write
+  pull-requests: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Log toolchain versions
+        run: rustup --version && rustc --version && cargo --version
+      - name: Run benchmarks
+        working-directory: aws_secretsmanager_caching
+        run: cargo bench --bench benchmark -- --output-format bencher | tee ../bench-result.txt
+
+      - name: Compare and push benchmarks
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          name: Secrets Manager Agent Benchmarks
+          tool: cargo
+          output-file-path: bench-result.txt
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          comment-on-alert: true
+          summary-always: true
+          auto-push: true

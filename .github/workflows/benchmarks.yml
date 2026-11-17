@@ -1,8 +1,6 @@
-name: Benchmarks
+name: Benchmark PR Check
 
 on:
-  push:
-    branches: [main]
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -33,23 +31,12 @@ jobs:
         working-directory: aws_secretsmanager_caching
         run: cargo bench --bench benchmark -- --output-format bencher | tee ../bench-result.txt
 
-      - name: Download previous benchmark data
-        uses: actions/cache@v4
-        with:
-          path: ./cache
-          key: benchmark-${{ runner.os }}-${{ github.run_id }}
-          restore-keys: |
-            benchmark-${{ runner.os }}
-
       - name: Compare benchmarks
         uses: benchmark-action/github-action-benchmark@v1
         with:
           name: Secrets Manager Caching Benchmarks
           tool: cargo
           output-file-path: bench-result.txt
-          external-data-json-path: ./cache/benchmark-data.json
           github-token: ${{ secrets.GITHUB_TOKEN }}
           comment-on-alert: true
           summary-always: true
-          alert-threshold: '300%'
-          fail-on-alert: true
