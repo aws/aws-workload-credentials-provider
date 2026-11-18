@@ -590,6 +590,51 @@ impl TestSecrets {
         .await
     }
 
+    /// Waits until Secrets Manager returns `version_id` as the AWSCURRENT
+    /// version on several reads in a row.
+    ///
+    /// Reads after an update are eventually consistent, so a read right after
+    /// the update can still return the previous version. Checks both calls the
+    /// provider makes on a refresh.
+    #[allow(dead_code)]
+    pub async fn wait_for_current_version(
+        &self,
+        secret_type: &SecretType,
+        version_id: &str,
+    ) -> Result<(), tokio::time::error::Elapsed> {
+        const CONSECUTIVE_HITS: u32 = 5;
+
+        let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+        let client = aws_sdk_secretsmanager::Client::new(&config);
+        let secret_name = self.secret_name(secret_type);
+
+        tokio::time::timeout(Duration::from_secs(60), async {
+            let mut hits = 0;
+            while hits < CONSECUTIVE_HITS {
+                let value = client
+                    .get_secret_value()
+                    .secret_id(&secret_name)
+                    .send()
+                    .await;
+                let described = client
+                    .describe_secret()
+                    .secret_id(&secret_name)
+                    .send()
+                    .await;
+                let found = value.is_ok_and(|output| output.version_id() == Some(version_id))
+                    && described.is_ok_and(|output| {
+                        output
+                            .version_ids_to_stages()
+                            .and_then(|stages| stages.get(version_id))
+                            .is_some_and(|stages| stages.iter().any(|s| s == "AWSCURRENT"))
+                    });
+                hits = if found { hits + 1 } else { 0 };
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        })
+        .await
+    }
+
     #[allow(dead_code)]
     pub async fn get_version_ids(&self, secret_type: &SecretType) -> (String, String) {
         let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;

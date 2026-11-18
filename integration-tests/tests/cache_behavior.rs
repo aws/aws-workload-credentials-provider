@@ -55,6 +55,11 @@ async fn test_refresh_now_on_updated_secret_succeeds() {
     // Should still have the old value from cache
     assert!(cached_secret.contains("testuser"));
 
+    secrets
+        .wait_for_current_version(&SecretType::Basic, new_version_id)
+        .await
+        .expect("Timed out waiting for the updated secret to propagate");
+
     // Third request with refreshNow=true - should get fresh value
     let refresh_query = ProviderQueryBuilder::default()
         .secret_id(&secret_name)
