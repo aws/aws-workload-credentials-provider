@@ -15,7 +15,8 @@ async fn test_refresh_now_on_updated_secret_succeeds() {
     let secrets = TestSecrets::setup_basic().await;
     let secret_name: String = secrets.secret_name(&SecretType::Basic);
 
-    let provider = ProviderProcess::start().await;
+    // The TTL outlasts the propagation wait, so the cached entry is still live at the refreshNow read.
+    let provider = ProviderProcess::start_with_config(2775, 300).await;
 
     // First request - populate cache with original value
     let query = ProviderQueryBuilder::default()

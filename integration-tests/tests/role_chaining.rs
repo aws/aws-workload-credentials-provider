@@ -80,7 +80,8 @@ async fn test_role_chaining_with_refresh_now() {
     let secrets = TestSecrets::setup_basic().await;
     let secret_name = secrets.secret_name(&SecretType::Basic);
 
-    let provider = ProviderProcess::start().await;
+    // The TTL outlasts the propagation wait, so the cached entry is still live at the refreshNow read.
+    let provider = ProviderProcess::start_with_config(2775, 300).await;
 
     // First request with roleArn — populate cache with original value
     let query = ProviderQueryBuilder::default()
@@ -187,7 +188,8 @@ async fn test_role_chaining_separate_caches_per_role() {
     let secrets = TestSecrets::setup_basic().await;
     let secret_name = secrets.secret_name(&SecretType::Basic);
 
-    let provider = ProviderProcess::start().await;
+    // The TTL outlasts the propagation wait, so the default role's entry is still live at the target role read.
+    let provider = ProviderProcess::start_with_config(2775, 300).await;
 
     // Fetch with default provider role (no roleArn) — caches the original value
     let query_default = ProviderQueryBuilder::default()
