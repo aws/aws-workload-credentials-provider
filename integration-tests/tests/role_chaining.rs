@@ -118,6 +118,11 @@ async fn test_role_chaining_with_refresh_now() {
     let json2: serde_json::Value = serde_json::from_str(&response2).unwrap();
     assert!(json2["SecretString"].as_str().unwrap().contains("testuser"));
 
+    secrets
+        .wait_for_current_version(&SecretType::Basic, new_version_id)
+        .await
+        .expect("Timed out waiting for the updated secret to propagate");
+
     // Third request with refreshNow=true — should get fresh value via assumed role
     let refresh_query = ProviderQueryBuilder::default()
         .secret_id(&secret_name)
