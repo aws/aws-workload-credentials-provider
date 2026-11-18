@@ -509,18 +509,26 @@ impl TestSecrets {
         temp_secrets
     }
 
+    /// Waits until a tag-key filter finds the secret on several reads in a row.
+    ///
+    /// The filtered listing is eventually consistent: one read can return a new
+    /// secret and the next one miss it, so a single hit doesn't mean a later
+    /// reader will see the secret.
     #[allow(dead_code)]
     pub async fn wait_for_tag(
         &self,
         secret_type: &SecretType,
         tag_key: &str,
     ) -> Result<(), tokio::time::error::Elapsed> {
+        const CONSECUTIVE_HITS: u32 = 5;
+
         let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
         let client = aws_sdk_secretsmanager::Client::new(&config);
         let secret_name = self.secret_name(secret_type);
 
         tokio::time::timeout(Duration::from_secs(60), async {
-            loop {
+            let mut hits = 0;
+            while hits < CONSECUTIVE_HITS {
                 let resp = client
                     .batch_get_secret_value()
                     .filters(
@@ -531,15 +539,13 @@ impl TestSecrets {
                     )
                     .send()
                     .await;
-                if let Ok(output) = resp {
-                    if output
+                let found = resp.is_ok_and(|output| {
+                    output
                         .secret_values()
                         .iter()
                         .any(|s| s.name() == Some(secret_name.as_str()))
-                    {
-                        break;
-                    }
-                }
+                });
+                hits = if found { hits + 1 } else { 0 };
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
         })
