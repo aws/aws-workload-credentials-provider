@@ -371,6 +371,20 @@ ttl_seconds = {}
     }
 }
 
+impl Drop for ProviderProcess {
+    /// Kills the provider and waits for it to exit, so the next test can bind
+    /// the same port. `kill_on_drop` alone doesn't wait.
+    fn drop(&mut self) {
+        let _ = self._child.start_kill();
+        for _ in 0..500 {
+            if !matches!(self._child.try_wait(), Ok(None)) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
 pub struct TestSecrets {
     pub prefix: String,
     pub created_types: Vec<SecretType>,
