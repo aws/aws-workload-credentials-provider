@@ -15,7 +15,8 @@ async fn test_refresh_now_on_updated_secret_succeeds() {
     let secrets = TestSecrets::setup_basic().await;
     let secret_name: String = secrets.secret_name(&SecretType::Basic);
 
-    let provider = ProviderProcess::start().await;
+    // The TTL outlasts the propagation wait, so the cached entry is still live at the refreshNow read.
+    let provider = ProviderProcess::start_with_config(2775, 300).await;
 
     // First request - populate cache with original value
     let query = ProviderQueryBuilder::default()
@@ -54,6 +55,11 @@ async fn test_refresh_now_on_updated_secret_succeeds() {
 
     // Should still have the old value from cache
     assert!(cached_secret.contains("testuser"));
+
+    secrets
+        .wait_for_current_version(&SecretType::Basic, new_version_id)
+        .await
+        .expect("Timed out waiting for the updated secret to propagate");
 
     // Third request with refreshNow=true - should get fresh value
     let refresh_query = ProviderQueryBuilder::default()
@@ -174,8 +180,10 @@ async fn test_ttl_zero_disables_caching() {
         .version_id()
         .expect("No version ID returned");
 
-    // Allow time for update to propagate
-    sleep(Duration::from_millis(500)).await;
+    secrets
+        .wait_for_current_version(&SecretType::Basic, new_version_id)
+        .await
+        .expect("Timed out waiting for the updated secret to propagate");
 
     // Second request - with TTL=0, should always fetch fresh value from AWS
     let response2 = provider.make_request(&query).await;

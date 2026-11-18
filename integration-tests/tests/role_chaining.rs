@@ -80,7 +80,8 @@ async fn test_role_chaining_with_refresh_now() {
     let secrets = TestSecrets::setup_basic().await;
     let secret_name = secrets.secret_name(&SecretType::Basic);
 
-    let provider = ProviderProcess::start().await;
+    // The TTL outlasts the propagation wait, so the cached entry is still live at the refreshNow read.
+    let provider = ProviderProcess::start_with_config(2775, 300).await;
 
     // First request with roleArn — populate cache with original value
     let query = ProviderQueryBuilder::default()
@@ -117,6 +118,11 @@ async fn test_role_chaining_with_refresh_now() {
     let response2 = provider.make_request(&query).await;
     let json2: serde_json::Value = serde_json::from_str(&response2).unwrap();
     assert!(json2["SecretString"].as_str().unwrap().contains("testuser"));
+
+    secrets
+        .wait_for_current_version(&SecretType::Basic, new_version_id)
+        .await
+        .expect("Timed out waiting for the updated secret to propagate");
 
     // Third request with refreshNow=true — should get fresh value via assumed role
     let refresh_query = ProviderQueryBuilder::default()
@@ -182,7 +188,8 @@ async fn test_role_chaining_separate_caches_per_role() {
     let secrets = TestSecrets::setup_basic().await;
     let secret_name = secrets.secret_name(&SecretType::Basic);
 
-    let provider = ProviderProcess::start().await;
+    // The TTL outlasts the propagation wait, so the default role's entry is still live at the target role read.
+    let provider = ProviderProcess::start_with_config(2775, 300).await;
 
     // Fetch with default provider role (no roleArn) — caches the original value
     let query_default = ProviderQueryBuilder::default()
@@ -199,13 +206,17 @@ async fn test_role_chaining_separate_caches_per_role() {
     // Update the secret directly
     let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
     let client = aws_sdk_secretsmanager::Client::new(&config);
-    client
+    let update_response = client
         .update_secret()
         .secret_id(&secret_name)
         .secret_string(r#"{"username":"updateduser","password":"updatedpass"}"#)
         .send()
         .await
         .expect("Failed to update secret");
+
+    let new_version_id = update_response
+        .version_id()
+        .expect("No version ID returned");
 
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
@@ -219,6 +230,12 @@ async fn test_role_chaining_separate_caches_per_role() {
             .contains("testuser"),
         "Default role should return stale cached value"
     );
+
+    // A stale read here would be cached for the target role.
+    secrets
+        .wait_for_current_version(&SecretType::Basic, new_version_id)
+        .await
+        .expect("Timed out waiting for the updated secret to propagate");
 
     // Fetch with target role — cache miss on its own cache, should get the updated value
     let query_role = ProviderQueryBuilder::default()

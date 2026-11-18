@@ -105,15 +105,34 @@ async fn test_version_stage_transitions() {
         .unwrap()
         .contains(&serde_json::Value::String("AWSCURRENT".to_string())));
 
-    // Verify the old current version is no longer AWSCURRENT
-    let old_current_query = ProviderQueryBuilder::default()
-        .secret_id(&secret_name)
-        .version_id(&current_version_id)
-        .refresh_now(true)
-        .build()
-        .unwrap();
-    let old_current_response = provider.make_request(&old_current_query).await;
-    let old_current_json: serde_json::Value = serde_json::from_str(&old_current_response).unwrap();
+    // Verify the old current version is no longer AWSCURRENT. Retried like the
+    // promoted read: the old version can still list AWSCURRENT right after the
+    // stage move.
+    let mut old_current_json = None;
+    for attempt in 0..10 {
+        let old_current_query = ProviderQueryBuilder::default()
+            .secret_id(&secret_name)
+            .version_id(&current_version_id)
+            .refresh_now(true)
+            .build()
+            .unwrap();
+        let old_current_response = provider.make_request(&old_current_query).await;
+        let json: serde_json::Value = serde_json::from_str(&old_current_response).unwrap();
+
+        let still_current = json["VersionStages"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::Value::String("AWSCURRENT".to_string()));
+        old_current_json = Some(json);
+        if !still_current {
+            break;
+        }
+
+        if attempt < 9 {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    }
+    let old_current_json = old_current_json.expect("Old version was never read");
 
     // The old version should still exist but not have AWSCURRENT stage
     assert_eq!(old_current_json["VersionId"], current_version_id);

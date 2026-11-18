@@ -371,6 +371,20 @@ ttl_seconds = {}
     }
 }
 
+impl Drop for ProviderProcess {
+    /// Kills the provider and waits for it to exit, so the next test can bind
+    /// the same port. `kill_on_drop` alone doesn't wait.
+    fn drop(&mut self) {
+        let _ = self._child.start_kill();
+        for _ in 0..500 {
+            if !matches!(self._child.try_wait(), Ok(None)) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
 pub struct TestSecrets {
     pub prefix: String,
     pub created_types: Vec<SecretType>,
@@ -509,18 +523,26 @@ impl TestSecrets {
         temp_secrets
     }
 
+    /// Waits until a tag-key filter finds the secret on several reads in a row.
+    ///
+    /// The filtered listing is eventually consistent: one read can return a new
+    /// secret and the next one miss it, so a single hit doesn't mean a later
+    /// reader will see the secret.
     #[allow(dead_code)]
     pub async fn wait_for_tag(
         &self,
         secret_type: &SecretType,
         tag_key: &str,
     ) -> Result<(), tokio::time::error::Elapsed> {
+        const CONSECUTIVE_HITS: u32 = 5;
+
         let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
         let client = aws_sdk_secretsmanager::Client::new(&config);
         let secret_name = self.secret_name(secret_type);
 
         tokio::time::timeout(Duration::from_secs(60), async {
-            loop {
+            let mut hits = 0;
+            while hits < CONSECUTIVE_HITS {
                 let resp = client
                     .batch_get_secret_value()
                     .filters(
@@ -531,32 +553,82 @@ impl TestSecrets {
                     )
                     .send()
                     .await;
-                if let Ok(output) = resp {
-                    if output
+                let found = resp.is_ok_and(|output| {
+                    output
                         .secret_values()
                         .iter()
                         .any(|s| s.name() == Some(secret_name.as_str()))
-                    {
-                        break;
-                    }
-                }
+                });
+                hits = if found { hits + 1 } else { 0 };
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
         })
         .await
     }
 
+    /// Waits until the secret shows an AWSPENDING version on several reads in
+    /// a row, since one read can show it and the next one miss it.
     #[allow(dead_code)]
     pub async fn wait_for_pending_version(
         &self,
         secret_type: &SecretType,
     ) -> Result<(), tokio::time::error::Elapsed> {
+        const CONSECUTIVE_HITS: u32 = 5;
+
         tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
+            let mut hits = 0;
+            while hits < CONSECUTIVE_HITS {
                 let (_, pending_version) = self.get_version_ids(secret_type).await;
-                if !pending_version.is_empty() {
-                    break;
-                }
+                hits = if pending_version.is_empty() {
+                    0
+                } else {
+                    hits + 1
+                };
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        })
+        .await
+    }
+
+    /// Waits until Secrets Manager returns `version_id` as the AWSCURRENT
+    /// version on several reads in a row.
+    ///
+    /// Reads after an update are eventually consistent, so a read right after
+    /// the update can still return the previous version. Checks both calls the
+    /// provider makes on a refresh.
+    #[allow(dead_code)]
+    pub async fn wait_for_current_version(
+        &self,
+        secret_type: &SecretType,
+        version_id: &str,
+    ) -> Result<(), tokio::time::error::Elapsed> {
+        const CONSECUTIVE_HITS: u32 = 5;
+
+        let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+        let client = aws_sdk_secretsmanager::Client::new(&config);
+        let secret_name = self.secret_name(secret_type);
+
+        tokio::time::timeout(Duration::from_secs(60), async {
+            let mut hits = 0;
+            while hits < CONSECUTIVE_HITS {
+                let value = client
+                    .get_secret_value()
+                    .secret_id(&secret_name)
+                    .send()
+                    .await;
+                let described = client
+                    .describe_secret()
+                    .secret_id(&secret_name)
+                    .send()
+                    .await;
+                let found = value.is_ok_and(|output| output.version_id() == Some(version_id))
+                    && described.is_ok_and(|output| {
+                        output
+                            .version_ids_to_stages()
+                            .and_then(|stages| stages.get(version_id))
+                            .is_some_and(|stages| stages.iter().any(|s| s == "AWSCURRENT"))
+                    });
+                hits = if found { hits + 1 } else { 0 };
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
         })
@@ -595,21 +667,36 @@ impl TestSecrets {
 
 impl Drop for TestSecrets {
     fn drop(&mut self) {
-        let prefix = self.prefix.clone();
-        let created_types = self.created_types.clone();
-        tokio::spawn(async move {
-            let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
-            let client = aws_sdk_secretsmanager::Client::new(&config);
+        // A task spawned on the test's runtime is dropped unpolled when the test
+        // returns, so the deletes run on their own thread and runtime, and
+        // drop waits for them.
+        std::thread::scope(|scope| {
+            let cleanup = scope.spawn(|| {
+                let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                else {
+                    return;
+                };
+                runtime.block_on(async {
+                    let _ = tokio::time::timeout(Duration::from_secs(30), async {
+                        let config =
+                            aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+                        let client = aws_sdk_secretsmanager::Client::new(&config);
 
-            for secret_type in created_types {
-                let secret_name = format!("{}-{}", prefix, secret_type);
-                let _ = client
-                    .delete_secret()
-                    .secret_id(&secret_name)
-                    .force_delete_without_recovery(true)
-                    .send()
+                        for secret_type in &self.created_types {
+                            let _ = client
+                                .delete_secret()
+                                .secret_id(self.secret_name(secret_type))
+                                .force_delete_without_recovery(true)
+                                .send()
+                                .await;
+                        }
+                    })
                     .await;
-            }
+                });
+            });
+            let _ = cleanup.join();
         });
     }
 }

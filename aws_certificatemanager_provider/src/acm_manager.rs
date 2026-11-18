@@ -355,11 +355,10 @@ mod tests {
         #[cfg(feature = "fips")]
         {
             use pkcs8::pkcs5::pbes2;
-            use rand_core::RngCore;
-            let mut salt = [0u8; 16];
-            rand_core::OsRng.fill_bytes(&mut salt);
-            let mut iv = [0u8; 16];
-            rand_core::OsRng.fill_bytes(&mut iv);
+            // Fixed salt and IV: the FIPS decrypt path detects a wrong passphrase only by
+            // the PKCS#7 padding check, which a random salt and IV pass about 1 time in 255.
+            let salt = [0x01u8; 16];
+            let iv = [0x02u8; 16];
             let params = pbes2::Parameters::pbkdf2_sha256_aes256cbc(1, &salt, &iv).unwrap();
             let encrypted = pki.encrypt_with_params(params, passphrase).unwrap();
             encrypted
