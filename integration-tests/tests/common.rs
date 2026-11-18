@@ -566,17 +566,24 @@ impl TestSecrets {
         .await
     }
 
+    /// Waits until the secret shows an AWSPENDING version on several reads in
+    /// a row, since one read can show it and the next one miss it.
     #[allow(dead_code)]
     pub async fn wait_for_pending_version(
         &self,
         secret_type: &SecretType,
     ) -> Result<(), tokio::time::error::Elapsed> {
+        const CONSECUTIVE_HITS: u32 = 5;
+
         tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
+            let mut hits = 0;
+            while hits < CONSECUTIVE_HITS {
                 let (_, pending_version) = self.get_version_ids(secret_type).await;
-                if !pending_version.is_empty() {
-                    break;
-                }
+                hits = if pending_version.is_empty() {
+                    0
+                } else {
+                    hits + 1
+                };
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
         })
