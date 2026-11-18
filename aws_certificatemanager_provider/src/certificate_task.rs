@@ -654,8 +654,9 @@ mod tests {
 
     // -- jitter tests --
 
-    #[test]
-    fn next_refresh_time_within_bounds() {
+    // Paused clock: the bounds are exact however long the call takes.
+    #[tokio::test(start_paused = true)]
+    async fn next_refresh_time_within_bounds() {
         let exporter = Arc::new(MockAcmExporter::new(false));
         let store = Arc::new(MockStore::new(false));
         let executor = Arc::new(MockExecutor::new(false));
@@ -674,7 +675,7 @@ mod tests {
         let now = Instant::now();
         let next = task.next_refresh_time();
         assert!(next >= now + interval);
-        assert!(next <= now + interval + jitter + Duration::from_millis(100));
+        assert!(next < now + interval + jitter);
     }
 
     #[test]
