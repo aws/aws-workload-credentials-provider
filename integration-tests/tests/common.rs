@@ -601,21 +601,36 @@ impl TestSecrets {
 
 impl Drop for TestSecrets {
     fn drop(&mut self) {
-        let prefix = self.prefix.clone();
-        let created_types = self.created_types.clone();
-        tokio::spawn(async move {
-            let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
-            let client = aws_sdk_secretsmanager::Client::new(&config);
+        // A task spawned on the test's runtime is dropped unpolled when the test
+        // returns, so the deletes run on their own thread and runtime, and
+        // drop waits for them.
+        std::thread::scope(|scope| {
+            let cleanup = scope.spawn(|| {
+                let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                else {
+                    return;
+                };
+                runtime.block_on(async {
+                    let _ = tokio::time::timeout(Duration::from_secs(30), async {
+                        let config =
+                            aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+                        let client = aws_sdk_secretsmanager::Client::new(&config);
 
-            for secret_type in created_types {
-                let secret_name = format!("{}-{}", prefix, secret_type);
-                let _ = client
-                    .delete_secret()
-                    .secret_id(&secret_name)
-                    .force_delete_without_recovery(true)
-                    .send()
+                        for secret_type in &self.created_types {
+                            let _ = client
+                                .delete_secret()
+                                .secret_id(self.secret_name(secret_type))
+                                .force_delete_without_recovery(true)
+                                .send()
+                                .await;
+                        }
+                    })
                     .await;
-            }
+                });
+            });
+            let _ = cleanup.join();
         });
     }
 }
