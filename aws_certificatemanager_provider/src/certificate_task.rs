@@ -678,8 +678,9 @@ mod tests {
         assert!(next < now + interval + jitter);
     }
 
-    #[test]
-    fn next_refresh_time_zero_jitter() {
+    // Paused clock: the result is exact however long the call takes.
+    #[tokio::test(start_paused = true)]
+    async fn next_refresh_time_zero_jitter() {
         let exporter = Arc::new(MockAcmExporter::new(false));
         let store = Arc::new(MockStore::new(false));
         let executor = Arc::new(MockExecutor::new(false));
@@ -696,8 +697,7 @@ mod tests {
 
         let now = Instant::now();
         let next = task.next_refresh_time();
-        assert!(next >= now + interval);
-        assert!(next <= now + interval + Duration::from_millis(100));
+        assert_eq!(next, now + interval);
     }
 
     // -- skip refresh command tests --
