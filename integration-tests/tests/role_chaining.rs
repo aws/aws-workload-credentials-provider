@@ -204,13 +204,17 @@ async fn test_role_chaining_separate_caches_per_role() {
     // Update the secret directly
     let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
     let client = aws_sdk_secretsmanager::Client::new(&config);
-    client
+    let update_response = client
         .update_secret()
         .secret_id(&secret_name)
         .secret_string(r#"{"username":"updateduser","password":"updatedpass"}"#)
         .send()
         .await
         .expect("Failed to update secret");
+
+    let new_version_id = update_response
+        .version_id()
+        .expect("No version ID returned");
 
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
@@ -224,6 +228,12 @@ async fn test_role_chaining_separate_caches_per_role() {
             .contains("testuser"),
         "Default role should return stale cached value"
     );
+
+    // A stale read here would be cached for the target role.
+    secrets
+        .wait_for_current_version(&SecretType::Basic, new_version_id)
+        .await
+        .expect("Timed out waiting for the updated secret to propagate");
 
     // Fetch with target role — cache miss on its own cache, should get the updated value
     let query_role = ProviderQueryBuilder::default()
