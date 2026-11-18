@@ -336,4 +336,7 @@ jobs:
         run: |
           prefix="s3://$BUCKET/$KEY_PREFIX$RUN_ID/$TARGET"
           aws s3 cp "dist/$BIN" "$prefix/$BIN"
-          aws s3 cp "dist/watcher/$WATCHER_BIN" "$prefix/watcher/$WATCHER_BIN"
+          # Same key shape as release.yml, watcher/<build>/<target>/, so the
+          # Windows signing and replication path is tested on the key release
+          # publishes.
+          aws s3 cp "dist/watcher/$WATCHER_BIN" "s3://$BUCKET/${KEY_PREFIX}watcher/$RUN_ID/$TARGET/$WATCHER_BIN"
