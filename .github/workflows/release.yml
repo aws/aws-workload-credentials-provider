@@ -125,9 +125,12 @@ jobs:
               --body "$binary" \
               --if-none-match "*"
 
+            # The watcher has its own URL prefix, watcher/<version>/<target>/,
+            # so it can be versioned and released apart from the provider
+            # later without moving any published object.
             aws s3api put-object \
               --bucket "$bucket" \
-              --key "${key_prefix}${{ inputs.version }}/${target}/watcher/$(basename "$watcher")" \
+              --key "${key_prefix}watcher/${{ inputs.version }}/${target}/$(basename "$watcher")" \
               --body "$watcher" \
               --if-none-match "*"
           done
