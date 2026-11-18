@@ -533,10 +533,12 @@ pub mod tests {
         };
 
         // Implement a sleep for testing. We can not do an async sleep here so
-        // timeout tests should use the timeout_client instead.
+        // timeout tests should use the timeout_client instead. block_in_place
+        // moves the runtime's other work off this thread while it sleeps, so the
+        // server keeps accepting and serving connections in the meantime.
         if let Some(sleep_val) = name.strip_prefix("SleepyTest_") {
             if let Ok(sleep_num) = sleep_val.parse::<u64>() {
-                sleep(Duration::from_secs(sleep_num));
+                tokio::task::block_in_place(|| sleep(Duration::from_secs(sleep_num)));
             }
         }
 
