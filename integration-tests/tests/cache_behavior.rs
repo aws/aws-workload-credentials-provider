@@ -179,8 +179,10 @@ async fn test_ttl_zero_disables_caching() {
         .version_id()
         .expect("No version ID returned");
 
-    // Allow time for update to propagate
-    sleep(Duration::from_millis(500)).await;
+    secrets
+        .wait_for_current_version(&SecretType::Basic, new_version_id)
+        .await
+        .expect("Timed out waiting for the updated secret to propagate");
 
     // Second request - with TTL=0, should always fetch fresh value from AWS
     let response2 = provider.make_request(&query).await;
