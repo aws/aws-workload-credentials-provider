@@ -41,21 +41,31 @@ const MAX_CERTIFICATES: usize = 50;
 /// configuration or a collection of all config validation errors.
 pub struct ConfigValidator<F: FileSystem = RealFileSystem> {
     filesystem: Arc<F>,
+    check_certificate_dirs: bool,
 }
 
 impl ConfigValidator<RealFileSystem> {
     /// Create a new ConfigValidator with the real filesystem.
     pub fn new() -> Self {
-        Self {
-            filesystem: Arc::new(RealFileSystem),
-        }
+        Self::with_filesystem(Arc::new(RealFileSystem))
     }
 }
 
 impl<F: FileSystem> ConfigValidator<F> {
     /// Create a new ConfigValidator with a custom filesystem (for testing).
     pub fn with_filesystem(filesystem: Arc<F>) -> Self {
-        Self { filesystem }
+        Self {
+            filesystem,
+            check_certificate_dirs: true,
+        }
+    }
+
+    /// Skips checking that each ACM certificate's directory exists, for a
+    /// process that doesn't write certificates. On Windows the Secrets Manager
+    /// service usually can't read those directories.
+    pub fn without_certificate_dir_checks(mut self) -> Self {
+        self.check_certificate_dirs = false;
+        self
     }
 
     /// Validate a configuration file at the given path.
@@ -846,24 +856,20 @@ impl<F: FileSystem> ConfigValidator<F> {
 
         // Validate file paths
         let path_validator = FilePathValidator::new(self.filesystem.clone());
-
-        if let Err(e) = path_validator.validate(
-            &format!("{}.certificate_path", field_prefix),
-            &certificate_path,
-        ) {
-            collector.add(e);
-        }
-
-        if let Err(e) = path_validator.validate(
-            &format!("{}.private_key_path", field_prefix),
-            &private_key_path,
-        ) {
-            collector.add(e);
-        }
-
-        if let Some(ref chain) = chain_path {
-            if let Err(e) = path_validator.validate(&format!("{}.chain_path", field_prefix), chain)
-            {
+        let paths = [
+            ("certificate_path", Some(&certificate_path)),
+            ("private_key_path", Some(&private_key_path)),
+            ("chain_path", chain_path.as_ref()),
+        ];
+        for (field, path) in paths {
+            let Some(path) = path else { continue };
+            let field = format!("{}.{}", field_prefix, field);
+            let result = if self.check_certificate_dirs {
+                path_validator.validate(&field, path)
+            } else {
+                FilePathValidator::<F>::validate_format(&field, path).map(|_| ())
+            };
+            if let Err(e) = result {
                 collector.add(e);
             }
         }
@@ -1892,6 +1898,58 @@ mod tests {
             let result = validator.validate_toml_config_str(&toml);
             assert!(result.is_err());
             let errors = result.unwrap_err();
+            assert!(errors
+                .errors
+                .iter()
+                .any(|e| e.code == ValidationErrorCode::RelativePath));
+        }
+
+        fn one_certificate_toml(cert: &str, key: &str, chain: &str) -> String {
+            format!(
+                r#"
+                [capabilities.acm]
+                enabled = true
+
+                [[capabilities.acm.certificates]]
+                certificate_arn = "arn:aws:acm:us-east-1:123456789012:certificate/12345678-1234-1234-1234-123456789012"
+                role_arn = "arn:aws:iam::123456789012:role/MyRole"
+                certificate_path = '{cert}'
+                private_key_path = '{key}'
+                chain_path = '{chain}'
+            "#
+            )
+        }
+
+        #[test]
+        fn test_unreadable_certificate_dirs_pass_without_dir_checks() {
+            // No directories, as the Secrets Manager service sees them on Windows.
+            let fs = Arc::new(MockFileSystem::new());
+            let (cert, key, chain) = test_paths("");
+            let toml = one_certificate_toml(&cert, &key, &chain);
+
+            let errors = ConfigValidator::with_filesystem(fs.clone())
+                .validate_toml_config_str(&toml)
+                .unwrap_err();
+            assert!(errors
+                .errors
+                .iter()
+                .any(|e| e.code == ValidationErrorCode::ParentDirectoryNotFound));
+
+            let config = ConfigValidator::with_filesystem(fs)
+                .without_certificate_dir_checks()
+                .validate_toml_config_str(&toml)
+                .unwrap();
+            assert_eq!(config.acm.unwrap().certificates.len(), 1);
+        }
+
+        #[test]
+        fn test_relative_path_rejected_without_dir_checks() {
+            let (_cert, key, chain) = test_paths("");
+            let toml = one_certificate_toml("relative/path/cert.pem", &key, &chain);
+            let errors = ConfigValidator::with_filesystem(Arc::new(MockFileSystem::new()))
+                .without_certificate_dir_checks()
+                .validate_toml_config_str(&toml)
+                .unwrap_err();
             assert!(errors
                 .errors
                 .iter()
