@@ -152,28 +152,7 @@ impl<F: FileSystem> FilePathValidator<F> {
     ///
     /// Note: Does not check if the file itself exists (it will be created).
     pub fn validate(&self, field_name: &str, path: &Path) -> Result<(), ValidationError> {
-        // Check if path is absolute
-        if !path.is_absolute() {
-            return Err(ValidationError::with_guidance(
-                field_name.to_string(),
-                ValidationErrorCode::RelativePath,
-                INVALID_FILE_PATH_ERR_MSG.to_string(),
-                format!("Path must be absolute, got: '{}'", path.display()),
-            ));
-        }
-
-        // Check parent directory exists
-        let parent = match self.filesystem.parent(path) {
-            Some(p) if !p.as_os_str().is_empty() => p,
-            _ => {
-                return Err(ValidationError::with_guidance(
-                    field_name.to_string(),
-                    ValidationErrorCode::ParentDirectoryNotFound,
-                    INVALID_FILE_PATH_ERR_MSG.to_string(),
-                    format!("Path must include a filename, got: '{}'", path.display()),
-                ));
-            }
-        };
+        let parent = Self::validate_format(field_name, path)?;
 
         if !self.filesystem.exists(&parent) {
             return Err(ValidationError::with_guidance(
@@ -214,6 +193,29 @@ impl<F: FileSystem> FilePathValidator<F> {
         }
 
         Ok(())
+    }
+
+    /// The checks that don't touch the filesystem: the path is absolute and
+    /// names a file. Returns its parent directory.
+    pub fn validate_format(field_name: &str, path: &Path) -> Result<PathBuf, ValidationError> {
+        if !path.is_absolute() {
+            return Err(ValidationError::with_guidance(
+                field_name.to_string(),
+                ValidationErrorCode::RelativePath,
+                INVALID_FILE_PATH_ERR_MSG.to_string(),
+                format!("Path must be absolute, got: '{}'", path.display()),
+            ));
+        }
+
+        match path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => Ok(p.to_path_buf()),
+            _ => Err(ValidationError::with_guidance(
+                field_name.to_string(),
+                ValidationErrorCode::ParentDirectoryNotFound,
+                INVALID_FILE_PATH_ERR_MSG.to_string(),
+                format!("Path must include a filename, got: '{}'", path.display()),
+            )),
+        }
     }
 }
 
@@ -862,6 +864,40 @@ mod tests {
         let canonical_dir = std::fs::canonicalize(&real_dir).unwrap();
         let path = canonical_dir.join("cert.pem");
         assert!(validator.validate("test", &path).is_ok());
+    }
+
+    #[test]
+    fn test_validate_format_does_not_need_the_directory() {
+        #[cfg(unix)]
+        let (path, parent) = ("/nonexistent/cert.pem", "/nonexistent");
+        #[cfg(windows)]
+        let (path, parent) = ("c:\\nonexistent\\cert.pem", "c:\\nonexistent");
+
+        let result = FilePathValidator::<MockFileSystem>::validate_format("test", Path::new(path));
+        assert_eq!(result.unwrap(), Path::new(parent));
+    }
+
+    #[test]
+    fn test_validate_format_rejects_a_relative_path() {
+        let err = FilePathValidator::<MockFileSystem>::validate_format(
+            "test",
+            Path::new("certs/cert.pem"),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ValidationErrorCode::RelativePath);
+    }
+
+    #[test]
+    fn test_validate_format_rejects_a_path_without_a_file_name() {
+        #[cfg(unix)]
+        let root = "/";
+        #[cfg(windows)]
+        let root = "c:\\";
+
+        let err = FilePathValidator::<MockFileSystem>::validate_format("test", Path::new(root))
+            .unwrap_err();
+        assert_eq!(err.code, ValidationErrorCode::ParentDirectoryNotFound);
+        assert!(err.guidance.unwrap().contains("include a filename"));
     }
 
     #[cfg(windows)]

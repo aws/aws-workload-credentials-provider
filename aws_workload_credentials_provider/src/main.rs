@@ -97,7 +97,10 @@ fn acm_start(config_path: Option<String>) -> Result<(), Box<dyn std::error::Erro
 
 fn sm_start(config_path: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
     let config_path = resolve_config_path(config_path)?;
-    let validated = ConfigValidator::new().validate(config_path.as_deref())?;
+    // SM writes no certificates and may not be able to read their directories.
+    let validated = ConfigValidator::new()
+        .without_certificate_dir_checks()
+        .validate(config_path.as_deref())?;
 
     if !validated.secrets_manager.enabled {
         eprintln!("Secrets Manager is not enabled");
