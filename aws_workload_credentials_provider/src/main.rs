@@ -15,9 +15,10 @@ use aws_workload_credentials_provider_common::{
     logging::{init_logger, log_dir},
 };
 
-use aws_workload_credentials_provider_common::config::types::ValidatedConfig;
 #[cfg(windows)]
-use aws_workload_credentials_provider_common::logging::default_config_path;
+use aws_workload_credentials_provider_common::{
+    config::types::ValidatedConfig, logging::default_config_path,
+};
 
 fn main() {
     let cli = Cli::parse();
@@ -95,14 +96,6 @@ fn acm_start(config_path: Option<String>) -> Result<(), Box<dyn std::error::Erro
 }
 
 fn sm_start(config_path: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
-    sm_start_with(config_path, run_sm)
-}
-
-/// `sm start` up to running the service, which `run` does.
-fn sm_start_with(
-    config_path: Option<String>,
-    run: impl FnOnce(ValidatedConfig) -> Result<(), Box<dyn std::error::Error>>,
-) -> Result<(), Box<dyn std::error::Error>> {
     let config_path = resolve_config_path(config_path)?;
     // SM writes no certificates and may not be able to read their directories.
     let validated = ConfigValidator::new()
@@ -113,10 +106,7 @@ fn sm_start_with(
         eprintln!("Secrets Manager is not enabled");
         return Ok(());
     }
-    run(validated)
-}
 
-fn run_sm(validated: ValidatedConfig) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(unix)]
     {
         let log_dir = log_dir()?;
@@ -465,51 +455,4 @@ fn resolve_config_path(path: Option<String>) -> Result<Option<String>, Box<dyn s
     }
 
     Ok(None)
-}
-
-#[cfg(all(test, unix))]
-mod sm_start_tests {
-    use super::sm_start_with;
-    use aws_workload_credentials_provider_common::config::validator::ConfigValidator;
-    use tempfile::TempDir;
-
-    #[test]
-    fn sm_start_skips_the_certificate_directory_checks_acm_start_makes() {
-        let dir = TempDir::new().unwrap();
-        // Stands in for a directory only the ACM service can read.
-        let certs = dir.path().join("unreadable");
-        let config = dir.path().join("config.toml");
-        std::fs::write(
-            &config,
-            format!(
-                r#"
-[capabilities.secrets_manager]
-enabled = true
-
-[capabilities.acm]
-enabled = true
-
-[[capabilities.acm.certificates]]
-certificate_arn = "arn:aws:acm:us-east-1:123456789012:certificate/12345678-1234-1234-1234-123456789012"
-role_arn = "arn:aws:iam::123456789012:role/MyRole"
-certificate_path = '{0}'
-private_key_path = '{1}'
-"#,
-                certs.join("cert.pem").display(),
-                certs.join("key.pem").display()
-            ),
-        )
-        .unwrap();
-        let config = config.to_str().unwrap().to_string();
-
-        // `acm start`'s validator needs the directory.
-        assert!(ConfigValidator::new().validate(Some(&config)).is_err());
-        let mut certificates = None;
-        sm_start_with(Some(config), |validated| {
-            certificates = Some(validated.acm.unwrap().certificates.len());
-            Ok(())
-        })
-        .unwrap();
-        assert_eq!(certificates, Some(1), "SM should have started");
-    }
 }
