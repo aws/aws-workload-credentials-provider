@@ -44,12 +44,15 @@ impl CacheManager {
     /// Create a new CacheManager.
     pub async fn new(cfg: &SecretsManagerConfig) -> Result<Self, Box<dyn std::error::Error>> {
         let (client, sdk_config) = asm_client(cfg).await?;
-        let default_client = Arc::new(SecretsManagerCachingClient::new(
-            client,
-            cfg.cache.cache_size,
-            Duration::from_secs(cfg.cache.ttl_seconds as u64),
-            cfg.ignore_transient_errors,
-        )?);
+        let default_client = Arc::new(
+            SecretsManagerCachingClient::new(
+                client,
+                cfg.cache.cache_size,
+                Duration::from_secs(cfg.cache.ttl_seconds as u64),
+                cfg.ignore_transient_errors,
+            )?
+            .with_primary_timeout(Duration::from_millis(cfg.failover.operation_timeout_ms)),
+        );
 
         Ok(Self {
             default_client,
@@ -69,6 +72,7 @@ impl CacheManager {
     /// * `label` - The label of the secret to fetch.
     /// * `refresh_now` - Whether to serve from the cache or fetch from ASM.
     /// * `role_arn` - Optional IAM role ARN for cross-account access via AssumeRole.
+    /// * `query_failover_region` - Optional `failoverRegion` query parameter; overrides config.
     ///
     /// # Returns
     ///
@@ -94,12 +98,14 @@ impl CacheManager {
         label: Option<&str>,
         refresh_now: bool,
         role_arn: Option<&str>,
+        query_failover_region: Option<&str>,
     ) -> Result<String, HttpError> {
         let client = self.get_client(role_arn).await?;
+        let failover_region = self.resolve_failover_region(secret_id, query_failover_region);
 
         // Read the secret from the cache or fetch it over the network.
         let found = match client
-            .get_secret_value(secret_id, version, label, refresh_now)
+            .get_secret_value(secret_id, version, label, refresh_now, failover_region)
             .await
         {
             Ok(value) => value,
@@ -125,6 +131,24 @@ impl CacheManager {
                 Err(int_err())?
             }
         }
+    }
+
+    /// Pick the failover region: query parameter, then `secret_to_region_map`
+    /// (keyed by ARN), then `default_failover_region`. `None` if none apply.
+    fn resolve_failover_region<'a>(
+        &'a self,
+        secret_id: &str,
+        query_failover_region: Option<&'a str>,
+    ) -> Option<&'a str> {
+        let failover = &self.config.failover;
+        query_failover_region
+            .or_else(|| {
+                failover
+                    .secret_to_region_map
+                    .get(secret_id)
+                    .map(String::as_str)
+            })
+            .or(failover.default_failover_region.as_deref())
     }
 
     /// Checks whether the number of cached role clients has reached the configured max_roles limit.
@@ -260,7 +284,10 @@ impl CacheManager {
             self.config.cache.cache_size,
             Duration::from_secs(self.config.cache.ttl_seconds as u64),
             self.config.ignore_transient_errors,
-        )?)
+        )?
+        .with_primary_timeout(Duration::from_millis(
+            self.config.failover.operation_timeout_ms,
+        )))
     }
 
     /// Test stub for creating role clients — uses the same fake client as default.
@@ -351,12 +378,15 @@ pub mod tests {
     use aws_sdk_secretsmanager as secretsmanager;
     use aws_smithy_runtime::client::http::test_util::{infallible_client_fn, NeverClient};
     use aws_smithy_types::body::SdkBody;
-    use aws_workload_credentials_provider_common::config::types::SecretsManagerConfig;
+    use aws_workload_credentials_provider_common::config::types::{
+        FailoverConfig, SecretsManagerConfig,
+    };
     use aws_workload_credentials_provider_common::constants::PROVIDER_NAME;
     use http::{Request, Response};
     use serde_json::Value;
     use std::cell::RefCell;
-    use std::sync::Arc;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
     use std::thread::sleep;
     use std::thread_local;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -550,15 +580,24 @@ pub mod tests {
         (code, rsp)
     }
 
+    // Config shared by the test clients: fake credentials and the agent's
+    // interceptor, in us-west-2.
+    fn fake_config() -> secretsmanager::config::Builder {
+        secretsmanager::Config::builder()
+            .behavior_version(BehaviorVersion::latest())
+            .credentials_provider(secretsmanager::config::Credentials::new(
+                "AKIDTESTKEY",
+                "astestsecretkey",
+                Some("atestsessiontoken".to_string()),
+                None,
+                "",
+            ))
+            .interceptor(AgentModifierInterceptor)
+            .region(secretsmanager::config::Region::new("us-west-2"))
+    }
+
     // Test client that stubs off network call and provides a canned response.
     fn def_fake_client() -> secretsmanager::Client {
-        let fake_creds = secretsmanager::config::Credentials::new(
-            "AKIDTESTKEY",
-            "astestsecretkey",
-            Some("atestsessiontoken".to_string()),
-            None,
-            "",
-        );
         let http_client = infallible_client_fn(|_req| {
             let (code, rsp) = format_rsp(_req);
             Response::builder()
@@ -566,36 +605,51 @@ pub mod tests {
                 .body(SdkBody::from(rsp))
                 .unwrap()
         });
+        secretsmanager::Client::from_conf(fake_config().http_client(http_client).build())
+    }
 
+    // Test client that makes all Secrets Manager calls time out.
+    pub fn timeout_client() -> secretsmanager::Client {
+        secretsmanager::Client::from_conf(fake_config().http_client(NeverClient::new()).build())
+    }
+
+    // Test client over `http_client`, with retries off and the given timeouts.
+    fn no_retry_client(
+        http_client: aws_smithy_runtime_api::client::http::SharedHttpClient,
+        timeouts: secretsmanager::config::timeout::TimeoutConfig,
+    ) -> secretsmanager::Client {
         secretsmanager::Client::from_conf(
-            secretsmanager::Config::builder()
-                .behavior_version(BehaviorVersion::latest())
-                .credentials_provider(fake_creds)
-                .interceptor(AgentModifierInterceptor)
-                .region(secretsmanager::config::Region::new("us-west-2"))
+            fake_config()
+                .retry_config(secretsmanager::config::retry::RetryConfig::disabled())
+                .timeout_config(timeouts)
                 .http_client(http_client)
                 .build(),
         )
     }
 
-    // Test client that makes all Secrets Manager calls time out.
-    pub fn timeout_client() -> secretsmanager::Client {
-        let fake_creds = secretsmanager::config::Credentials::new(
-            "AKIDTESTKEY",
-            "astestsecretkey",
-            Some("atestsessiontoken".to_string()),
-            None,
-            "",
-        );
-
-        secretsmanager::Client::from_conf(
-            secretsmanager::Config::builder()
-                .behavior_version(BehaviorVersion::latest())
-                .credentials_provider(fake_creds)
-                .region(secretsmanager::config::Region::new("us-west-2"))
-                .http_client(NeverClient::new())
-                .build(),
-        )
+    // Test client whose calls fail with a 500 in us-west-2 and get the usual canned
+    // response in any other region. Records each call's host.
+    fn primary_down_client() -> (secretsmanager::Client, Arc<Mutex<Vec<String>>>) {
+        let hosts = Arc::new(Mutex::new(Vec::new()));
+        let seen = hosts.clone();
+        let http_client = infallible_client_fn(move |req| {
+            let host = req.uri().host().unwrap_or_default().to_string();
+            seen.lock().unwrap().push(host.clone());
+            let (code, rsp) = if host.contains("us-west-2") {
+                (
+                    500,
+                    r#"{"__type":"InternalServiceError","Message":"down"}"#.to_string(),
+                )
+            } else {
+                format_rsp(req)
+            };
+            Response::builder()
+                .status(code)
+                .body(SdkBody::from(rsp))
+                .unwrap()
+        });
+        let timeouts = secretsmanager::config::timeout::TimeoutConfig::disabled();
+        (no_retry_client(http_client, timeouts), hosts)
     }
 
     // Helper to create a CacheManager with a specific config.
@@ -610,7 +664,7 @@ pub mod tests {
     async fn test_fetch_without_role_arn() {
         let config = SecretsManagerConfig::default();
         let cm = cache_manager_with_config(&config).await;
-        let result = cm.fetch("MySecret", None, None, false, None).await;
+        let result = cm.fetch("MySecret", None, None, false, None, None).await;
         assert!(result.is_ok());
         let body: Value = serde_json::from_str(&result.unwrap()).unwrap();
         assert_eq!(body["SecretString"], DEFAULT_SECRET_STRING);
@@ -627,9 +681,13 @@ pub mod tests {
         let cm = cache_manager_with_config(&config).await;
         let role = "arn:aws:iam::123456789012:role/CachedRole";
 
-        let r1 = cm.fetch("MySecret", None, None, false, Some(role)).await;
+        let r1 = cm
+            .fetch("MySecret", None, None, false, Some(role), None)
+            .await;
         assert!(r1.is_ok());
-        let r2 = cm.fetch("MySecret", None, None, false, Some(role)).await;
+        let r2 = cm
+            .fetch("MySecret", None, None, false, Some(role), None)
+            .await;
         assert!(r2.is_ok());
 
         // Verify only one client was created
@@ -654,6 +712,7 @@ pub mod tests {
                 None,
                 false,
                 Some("arn:aws:iam::111111111111:role/Role1"),
+                None,
             )
             .await;
         assert!(r1.is_ok());
@@ -665,6 +724,7 @@ pub mod tests {
                 None,
                 false,
                 Some("arn:aws:iam::222222222222:role/Role2"),
+                None,
             )
             .await;
         assert!(r2.is_ok());
@@ -683,6 +743,7 @@ pub mod tests {
                 None,
                 false,
                 Some("arn:aws:iam::333333333333:role/Role3"),
+                None,
             )
             .await;
         assert!(r3.is_err());
@@ -698,6 +759,7 @@ pub mod tests {
                 None,
                 false,
                 Some("arn:aws:iam::222222222222:role/Role2"),
+                None,
             )
             .await;
         assert!(r2.is_ok());
@@ -715,7 +777,8 @@ pub mod tests {
             let cm = cm.clone();
             let role = role.to_string();
             handles.push(tokio::spawn(async move {
-                cm.fetch("MySecret", None, None, false, Some(&role)).await
+                cm.fetch("MySecret", None, None, false, Some(&role), None)
+                    .await
             }));
         }
 
@@ -741,7 +804,7 @@ pub mod tests {
         ];
 
         for role in &roles {
-            cm.fetch("MySecret", None, None, false, Some(role))
+            cm.fetch("MySecret", None, None, false, Some(role), None)
                 .await
                 .unwrap();
         }
@@ -751,5 +814,92 @@ pub mod tests {
         for role in &roles {
             assert!(clients.contains_key(*role), "missing client for {role}");
         }
+    }
+
+    // Verify failover region precedence: query parameter, then per-secret, then default.
+    #[tokio::test]
+    async fn test_resolve_failover_region() {
+        let arn = "arn:aws:secretsmanager:us-west-2:123456789012:secret:Mapped-NhBWsc";
+        let config = SecretsManagerConfig {
+            failover: FailoverConfig {
+                default_failover_region: Some("us-east-1".into()),
+                secret_to_region_map: HashMap::from([(arn.into(), "eu-west-1".into())]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let cm = cache_manager_with_config(&config).await;
+        assert_eq!(
+            cm.resolve_failover_region(arn, Some("ap-south-1")),
+            Some("ap-south-1")
+        );
+        assert_eq!(cm.resolve_failover_region(arn, None), Some("eu-west-1"));
+        assert_eq!(
+            cm.resolve_failover_region("Mapped", None),
+            Some("us-east-1")
+        );
+
+        let cm = cache_manager_with_config(&SecretsManagerConfig::default()).await;
+        assert_eq!(cm.resolve_failover_region(arn, None), None);
+    }
+
+    // A transient primary error fails over to the region resolved for the request:
+    // default_failover_region, or the failoverRegion query parameter on its own.
+    #[tokio::test]
+    async fn test_fetch_fails_over() {
+        let with_default = SecretsManagerConfig {
+            failover: FailoverConfig {
+                default_failover_region: Some("us-east-1".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        for (config, query_failover_region) in [
+            (with_default, None),
+            (SecretsManagerConfig::default(), Some("us-east-1")),
+        ] {
+            let (client, hosts) = primary_down_client();
+            set_client(client);
+            let cm = cache_manager_with_config(&config).await;
+            cm.fetch("MySecret", None, None, false, None, query_failover_region)
+                .await
+                .expect("fails over");
+            assert_eq!(
+                *hosts.lock().unwrap(),
+                [
+                    "secretsmanager.us-west-2.amazonaws.com",
+                    "secretsmanager.us-east-1.amazonaws.com"
+                ]
+            );
+        }
+    }
+
+    // operation_timeout_ms cuts off the primary call. Every call hangs: the
+    // primary is cut off at 10 ms, the failover call at the client's 100 ms
+    // attempt timeout. The clock is paused, so the elapsed time is exact.
+    #[tokio::test(start_paused = true)]
+    async fn test_operation_timeout_cuts_off_primary() {
+        let timeouts = secretsmanager::config::timeout::TimeoutConfig::builder()
+            .operation_attempt_timeout(Duration::from_millis(100))
+            .build();
+        set_client(no_retry_client(
+            aws_smithy_runtime_api::client::http::SharedHttpClient::new(NeverClient::new()),
+            timeouts,
+        ));
+        let config = SecretsManagerConfig {
+            failover: FailoverConfig {
+                default_failover_region: Some("us-east-1".into()),
+                operation_timeout_ms: 10,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let cm = cache_manager_with_config(&config).await;
+
+        let start = tokio::time::Instant::now();
+        cm.fetch("MySecret", None, None, false, None, None)
+            .await
+            .expect_err("both regions hang");
+        assert_eq!(start.elapsed(), Duration::from_millis(110));
     }
 }

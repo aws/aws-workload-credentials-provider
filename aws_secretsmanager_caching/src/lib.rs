@@ -16,9 +16,11 @@ pub mod secret_store;
 mod utils;
 
 use aws_config::BehaviorVersion;
+use aws_sdk_secretsmanager::config::{retry::RetryPartition, Builder as ConfigBuilder, Region};
 use aws_sdk_secretsmanager::operation::batch_get_secret_value::BatchGetSecretValueOutput;
 use aws_sdk_secretsmanager::types::Filter;
 use aws_sdk_secretsmanager::Client as SecretsManagerClient;
+use aws_smithy_types::timeout::TimeoutConfig;
 use error::is_transient_error;
 #[cfg(debug_assertions)]
 use log::{info, warn};
@@ -26,9 +28,9 @@ use output::{BlobDef, GetSecretValueOutputDef};
 use secret_store::{MemoryStore, SecretStore, SecretStoreError};
 #[cfg(debug_assertions)]
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::{error::Error, num::NonZeroUsize, time::Duration};
+use std::{error::Error, fmt::Display, num::NonZeroUsize, time::Duration};
 use tokio::sync::RwLock;
-use utils::CachingLibraryInterceptor;
+use utils::{error_chain, retarget_arn, CachingLibraryInterceptor};
 
 /// AWS Secrets Manager Caching client
 #[derive(Debug)]
@@ -38,6 +40,10 @@ pub struct SecretsManagerCachingClient {
     /// A store used to cache secrets.
     store: RwLock<Box<dyn SecretStore>>,
     ignore_transient_errors: bool,
+    /// Bound on each primary-region call that has a failover region, retries
+    /// included, so a hanging primary fails over in time. `None` leaves primary
+    /// calls unbounded.
+    primary_timeout: Option<Duration>,
     #[cfg(debug_assertions)]
     metrics: CacheMetrics,
 }
@@ -88,6 +94,7 @@ impl SecretsManagerCachingClient {
             asm_client,
             store: RwLock::new(Box::new(MemoryStore::new(max_size, ttl))),
             ignore_transient_errors,
+            primary_timeout: None,
             #[cfg(debug_assertions)]
             metrics: CacheMetrics {
                 hits: AtomicU32::new(0),
@@ -168,6 +175,12 @@ impl SecretsManagerCachingClient {
         Self::new(asm_client, max_size, ttl, ignore_transient_errors)
     }
 
+    /// Set the primary timeout (`operation_timeout_ms`). Failover calls aren't bounded by it.
+    pub fn with_primary_timeout(mut self, timeout: Duration) -> Self {
+        self.primary_timeout = Some(timeout);
+        self
+    }
+
     /// Retrieves the value of the secret from the specified version.
     ///
     /// # Arguments
@@ -176,13 +189,20 @@ impl SecretsManagerCachingClient {
     /// * `version_id` - The version id of the secret version to retrieve.
     /// * `version_stage` - The staging label of the version of the secret to retrieve.
     /// * `refresh_now` - Whether to serve from the cache or fetch from ASM.
+    /// * `failover_region` - Region to repeat a call in when the primary region fails
+    ///   with a transient error. Ignored when it is the client's own region.
     pub async fn get_secret_value(
         &self,
         secret_id: &str,
         version_id: Option<&str>,
         version_stage: Option<&str>,
         refresh_now: bool,
+        failover_region: Option<&str>,
     ) -> Result<GetSecretValueOutputDef, Box<dyn Error>> {
+        // Failing over to the primary itself would only repeat the failed call.
+        let primary_region = self.asm_client.config().region().map(|r| r.as_ref());
+        let failover_region = failover_region.filter(|r| Some(*r) != primary_region);
+
         if refresh_now {
             #[cfg(debug_assertions)]
             {
@@ -203,7 +223,7 @@ impl SecretsManagerCachingClient {
             }
 
             return self
-                .refresh_secret_value(secret_id, version_id, version_stage, None)
+                .refresh_secret_value(secret_id, version_id, version_stage, None, failover_region)
                 .await;
         }
 
@@ -250,7 +270,13 @@ impl SecretsManagerCachingClient {
 
                 drop(read_lock);
                 Ok(self
-                    .refresh_secret_value(secret_id, version_id, version_stage, None)
+                    .refresh_secret_value(
+                        secret_id,
+                        version_id,
+                        version_stage,
+                        None,
+                        failover_region,
+                    )
                     .await?)
             }
             Err(SecretStoreError::CacheExpired(cached_value)) => {
@@ -274,7 +300,13 @@ impl SecretsManagerCachingClient {
 
                 drop(read_lock);
                 Ok(self
-                    .refresh_secret_value(secret_id, version_id, version_stage, Some(cached_value))
+                    .refresh_secret_value(
+                        secret_id,
+                        version_id,
+                        version_stage,
+                        Some(cached_value),
+                        failover_region,
+                    )
                     .await?)
             }
             Err(e) => Err(Box::new(e)),
@@ -377,17 +409,25 @@ impl SecretsManagerCachingClient {
     /// * `version_id` - The version id of the secret version to retrieve.
     /// * `version_stage` - The staging label of the version of the secret to retrieve.
     /// * `cached_value` - The value currently in the cache.
+    /// * `failover_region` - Region to repeat a call in after a transient primary error.
     async fn refresh_secret_value(
         &self,
         secret_id: &str,
         version_id: Option<&str>,
         version_stage: Option<&str>,
         cached_value: Option<Box<GetSecretValueOutputDef>>,
+        failover_region: Option<&str>,
     ) -> Result<GetSecretValueOutputDef, Box<dyn Error>> {
         if let Some(ref cached_value) = cached_value {
             // The cache already had a value in it, we can quick-refresh it if the value is still current.
             if self
-                .is_current(version_id, version_stage, cached_value.clone())
+                .is_current(
+                    secret_id,
+                    version_id,
+                    version_stage,
+                    cached_value.clone(),
+                    failover_region,
+                )
                 .await?
             {
                 // Re-up the entry freshness (TTL, cache rank) by writing the same data back to the cache.
@@ -402,15 +442,46 @@ impl SecretsManagerCachingClient {
             }
         }
 
-        let result: GetSecretValueOutputDef = match self
+        let request = self
             .asm_client
             .get_secret_value()
             .secret_id(secret_id)
             .set_version_id(version_id.map(String::from))
-            .set_version_stage(version_stage.map(String::from))
+            .set_version_stage(version_stage.map(String::from));
+
+        let primary = request
+            .clone()
+            .customize()
+            .config_override(self.primary_overrides(failover_region))
             .send()
-            .await
-        {
+            .await;
+
+        let response = match (primary, failover_region) {
+            // Try the failover region before falling back to a stale value.
+            (Err(e), Some(region)) if is_transient_error(&e) => {
+                let failover = request
+                    .secret_id(retarget_arn(secret_id, region))
+                    .customize()
+                    .config_override(Self::failover_overrides(region))
+                    .send()
+                    .await;
+                let outcome = match &failover {
+                    Ok(r) => format!("ok version_id={}", r.version_id().unwrap_or("none")),
+                    Err(f) => format!("error \"{}\"", error_chain(f)),
+                };
+                self.warn_failover(
+                    "GetSecretValue",
+                    secret_id,
+                    error_chain(&e),
+                    region,
+                    outcome,
+                );
+                // If the failover fails too, it's handled as the primary's transient error.
+                failover.or(Err(e))
+            }
+            (primary, _) => primary,
+        };
+        let result: GetSecretValueOutputDef = match response {
             Ok(r) => r.into(),
             Err(e)
                 if self.ignore_transient_errors
@@ -422,6 +493,7 @@ impl SecretsManagerCachingClient {
             Err(e) => Err(e)?,
         };
 
+        // Cached under the caller's identifier, whichever region served it.
         self.store.write().await.write_secret_value(
             secret_id.to_owned(),
             version_id.map(String::from),
@@ -435,25 +507,56 @@ impl SecretsManagerCachingClient {
     /// Check if the value in the cache is still fresh enough to be served again
     ///
     /// # Arguments
+    /// * `secret_id` - The ARN or name the caller asked for. The cached value's own ARN names
+    ///   whichever region served it, so it is not used here.
     /// * `version_id` - The version id of the secret version to retrieve.
     /// * `version_stage` - The staging label of the version of the secret to retrieve. Defaults to AWSCURRENT
     /// * `cached_value` - The value currently in the cache.
+    /// * `failover_region` - Region to repeat the call in after a transient primary error.
     ///
     /// # Returns
     /// * true if value can be reused, false if not
     async fn is_current(
         &self,
+        secret_id: &str,
         version_id: Option<&str>,
         version_stage: Option<&str>,
         cached_value: Box<GetSecretValueOutputDef>,
+        failover_region: Option<&str>,
     ) -> Result<bool, Box<dyn Error>> {
-        let describe = match self
-            .asm_client
-            .describe_secret()
-            .secret_id(cached_value.arn.unwrap())
+        let request = self.asm_client.describe_secret().secret_id(secret_id);
+        let primary = request
+            .clone()
+            .customize()
+            .config_override(self.primary_overrides(failover_region))
             .send()
-            .await
-        {
+            .await;
+        let response = match (primary, failover_region) {
+            // Try the failover region before falling back to the cached value.
+            (Err(e), Some(region)) if is_transient_error(&e) => {
+                let failover = request
+                    .secret_id(retarget_arn(secret_id, region))
+                    .customize()
+                    .config_override(Self::failover_overrides(region))
+                    .send()
+                    .await;
+                let outcome = match &failover {
+                    Ok(_) => "ok".to_string(),
+                    Err(f) => format!("error \"{}\"", error_chain(f)),
+                };
+                self.warn_failover(
+                    "DescribeSecret",
+                    secret_id,
+                    error_chain(&e),
+                    region,
+                    outcome,
+                );
+                // If the failover fails too, it's handled as the primary's transient error.
+                failover.or(Err(e))
+            }
+            (primary, _) => primary,
+        };
+        let describe = match response {
             Ok(r) => r,
             Err(e) if self.ignore_transient_errors && is_transient_error(&e) => return Ok(true),
             Err(e) => Err(e)?,
@@ -489,6 +592,47 @@ impl SecretsManagerCachingClient {
         Ok(real_vids_to_stages
             .iter()
             .any(|(k, v)| k.eq(&version_id) && v.contains(&version_stage)))
+    }
+
+    /// Settings for a primary call, layered over the client's own: the primary
+    /// timeout, only when there is a failover region to move to. Otherwise the
+    /// settings are empty and the call runs as the client would.
+    fn primary_overrides(&self, failover_region: Option<&str>) -> ConfigBuilder {
+        match (failover_region, self.primary_timeout) {
+            (Some(_), Some(timeout)) => ConfigBuilder::default()
+                .timeout_config(TimeoutConfig::builder().operation_timeout(timeout).build()),
+            _ => ConfigBuilder::default(),
+        }
+    }
+
+    /// Settings for a failover call: the failover region, with its own retry
+    /// partition so a failing primary can't drain the retry tokens it needs. It
+    /// carries no credentials and isn't built from the client's config, which would
+    /// duplicate interceptors.
+    fn failover_overrides(region: &str) -> ConfigBuilder {
+        ConfigBuilder::default()
+            .region(Region::new(region.to_string()))
+            .retry_partition(RetryPartition::new(format!("secretsmanager-{region}")))
+    }
+
+    /// WARN on every failover, with the fields operators alert and build metrics on.
+    /// Logged in release builds too, unlike the cache metrics above.
+    fn warn_failover(
+        &self,
+        operation: &str,
+        secret_id: &str,
+        primary_error: impl Display,
+        failover_region: &str,
+        outcome: impl Display,
+    ) {
+        log::warn!(
+            "failover=true operation={operation} secret_id={secret_id} primary_region={} \
+             primary_error=\"{primary_error}\" failover_region={failover_region} result={outcome}",
+            self.asm_client
+                .config()
+                .region()
+                .map_or("unknown", |r| r.as_ref()),
+        );
     }
 
     #[cfg(debug_assertions)]
@@ -559,7 +703,7 @@ mod tests {
         let secret_id = "test_secret";
 
         let response = client
-            .get_secret_value(secret_id, None, None, false)
+            .get_secret_value(secret_id, None, None, false, None)
             .await
             .unwrap();
 
@@ -586,7 +730,7 @@ mod tests {
         let version_id = "test_version";
 
         let response = client
-            .get_secret_value(secret_id, Some(version_id), None, false)
+            .get_secret_value(secret_id, Some(version_id), None, false, None)
             .await
             .unwrap();
 
@@ -614,7 +758,7 @@ mod tests {
         let stage_label = "STAGEHERE";
 
         let response = client
-            .get_secret_value(secret_id, None, Some(stage_label), false)
+            .get_secret_value(secret_id, None, Some(stage_label), false, None)
             .await
             .unwrap();
 
@@ -639,7 +783,7 @@ mod tests {
         let stage_label = "STAGEHERE";
 
         let response = client
-            .get_secret_value(secret_id, Some(version_id), Some(stage_label), false)
+            .get_secret_value(secret_id, Some(version_id), Some(stage_label), false, None)
             .await
             .unwrap();
 
@@ -665,7 +809,7 @@ mod tests {
         // Run through this twice to test the cache expiration
         for i in 0..2 {
             let response = client
-                .get_secret_value(secret_id, None, None, false)
+                .get_secret_value(secret_id, None, None, false, None)
                 .await
                 .unwrap();
 
@@ -697,7 +841,7 @@ mod tests {
         let secret_id = "KMSACCESSDENIEDabcdef";
 
         client
-            .get_secret_value(secret_id, None, None, false)
+            .get_secret_value(secret_id, None, None, false, None)
             .await
             .unwrap();
     }
@@ -709,9 +853,20 @@ mod tests {
         let secret_id = "NOTFOUNDfasefasef";
 
         client
-            .get_secret_value(secret_id, None, None, false)
+            .get_secret_value(secret_id, None, None, false, None)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_get_secret_value_throttling_cold_cache_fails() {
+        let client = fake_client(None, true, None, None);
+        let secret_id = "THROTTLINGabcdef";
+
+        assert!(client
+            .get_secret_value(secret_id, None, None, false, None)
+            .await
+            .is_err());
     }
 
     #[tokio::test]
@@ -720,12 +875,12 @@ mod tests {
         let secret_id = "test_secret";
 
         let res1 = client
-            .get_secret_value(secret_id, None, None, false)
+            .get_secret_value(secret_id, None, None, false, None)
             .await
             .unwrap();
 
         let res2 = client
-            .get_secret_value(secret_id, None, None, false)
+            .get_secret_value(secret_id, None, None, false, None)
             .await
             .unwrap();
 
@@ -739,12 +894,12 @@ mod tests {
         let version_id = Some("test_version");
 
         let res1 = client
-            .get_secret_value(secret_id, version_id, None, false)
+            .get_secret_value(secret_id, version_id, None, false, None)
             .await
             .unwrap();
 
         let res2 = client
-            .get_secret_value(secret_id, version_id, None, false)
+            .get_secret_value(secret_id, version_id, None, false, None)
             .await
             .unwrap();
 
@@ -758,12 +913,12 @@ mod tests {
         let version_stage = Some("VERSIONSTAGE");
 
         let res1 = client
-            .get_secret_value(secret_id, None, version_stage, false)
+            .get_secret_value(secret_id, None, version_stage, false, None)
             .await
             .unwrap();
 
         let res2 = client
-            .get_secret_value(secret_id, None, version_stage, false)
+            .get_secret_value(secret_id, None, version_stage, false, None)
             .await
             .unwrap();
 
@@ -778,12 +933,12 @@ mod tests {
         let version_stage = Some("VERSIONSTAGE");
 
         let res1 = client
-            .get_secret_value(secret_id, version_id, version_stage, false)
+            .get_secret_value(secret_id, version_id, version_stage, false, None)
             .await
             .unwrap();
 
         let res2 = client
-            .get_secret_value(secret_id, version_id, version_stage, false)
+            .get_secret_value(secret_id, version_id, version_stage, false, None)
             .await
             .unwrap();
 
@@ -797,12 +952,12 @@ mod tests {
         let version_id = Some("test_version");
 
         client
-            .get_secret_value(secret_id, version_id, None, false)
+            .get_secret_value(secret_id, version_id, None, false, None)
             .await
             .unwrap();
 
         if (client
-            .get_secret_value(secret_id, version_id, None, false)
+            .get_secret_value(secret_id, version_id, None, false, None)
             .await)
             .is_ok()
         {
@@ -830,12 +985,50 @@ mod tests {
         let version_id = Some("test_version");
 
         let res1 = client
-            .get_secret_value(secret_id, version_id, None, false)
+            .get_secret_value(secret_id, version_id, None, false, None)
             .await
             .unwrap();
 
         let res2 = client
-            .get_secret_value(secret_id, version_id, None, false)
+            .get_secret_value(secret_id, version_id, None, false, None)
+            .await
+            .unwrap();
+
+        mock.shutdown();
+
+        assert_eq!(res1, res2)
+    }
+
+    #[tokio::test]
+    async fn test_is_current_describe_throttling_wire_mock_succeeds() {
+        use asm_mock::GSV_BODY;
+        use asm_mock::THROTTLING_EXCEPTION_BODY;
+        use aws_smithy_runtime::client::http::test_util::wire::{ReplayedEvent, WireMockServer};
+
+        let mock = WireMockServer::start(vec![
+            ReplayedEvent::with_body(GSV_BODY),
+            ReplayedEvent::HttpResponse {
+                status: 400,
+                body: THROTTLING_EXCEPTION_BODY.into(),
+            },
+        ])
+        .await;
+        let client = fake_client(
+            Some(Duration::from_secs(0)),
+            true,
+            Some(mock.http_client()),
+            Some(mock.endpoint_url()),
+        );
+        let secret_id = "WIRETHROTTLING_test_secret";
+        let version_id = Some("test_version");
+
+        let res1 = client
+            .get_secret_value(secret_id, version_id, None, false, None)
+            .await
+            .unwrap();
+
+        let res2 = client
+            .get_secret_value(secret_id, version_id, None, false, None)
             .await
             .unwrap();
 
@@ -852,12 +1045,32 @@ mod tests {
         let version_stage = Some("VERSIONSTAGE");
 
         let res1 = client
-            .get_secret_value(secret_id, version_id, version_stage, false)
+            .get_secret_value(secret_id, version_id, version_stage, false, None)
             .await
             .unwrap();
 
         let res2 = client
-            .get_secret_value(secret_id, version_id, version_stage, false)
+            .get_secret_value(secret_id, version_id, version_stage, false, None)
+            .await
+            .unwrap();
+
+        assert_eq!(res1, res2)
+    }
+
+    #[tokio::test]
+    async fn test_is_current_describe_throttling_error_succeeds() {
+        let client = fake_client(Some(Duration::from_secs(0)), true, None, None);
+        let secret_id = "DESCRIBETHROTTLING_test_secret";
+        let version_id = Some("test_version");
+        let version_stage = Some("VERSIONSTAGE");
+
+        let res1 = client
+            .get_secret_value(secret_id, version_id, version_stage, false, None)
+            .await
+            .unwrap();
+
+        let res2 = client
+            .get_secret_value(secret_id, version_id, version_stage, false, None)
             .await
             .unwrap();
 
@@ -893,12 +1106,12 @@ mod tests {
         let secret_id = "GSVTIMEOUT_test_secret";
 
         let res1 = client
-            .get_secret_value(secret_id, None, None, false)
+            .get_secret_value(secret_id, None, None, false, None)
             .await
             .unwrap();
 
         let res2 = client
-            .get_secret_value(secret_id, None, None, false)
+            .get_secret_value(secret_id, None, None, false, None)
             .await
             .unwrap();
 
@@ -913,7 +1126,7 @@ mod tests {
         let secret_id = "REFRESHNOW_test_secret";
 
         let response1 = client
-            .get_secret_value(secret_id, None, None, false)
+            .get_secret_value(secret_id, None, None, false, None)
             .await
             .unwrap();
 
@@ -934,7 +1147,7 @@ mod tests {
         sleep(Duration::from_millis(1)).await;
 
         let response2 = client
-            .get_secret_value(secret_id, None, None, true)
+            .get_secret_value(secret_id, None, None, true, None)
             .await
             .unwrap();
 
@@ -949,7 +1162,7 @@ mod tests {
         let secret_id = "REFRESHNOW_test_secret";
 
         let response1 = client
-            .get_secret_value(secret_id, None, None, false)
+            .get_secret_value(secret_id, None, None, false, None)
             .await
             .unwrap();
 
@@ -970,7 +1183,7 @@ mod tests {
         sleep(Duration::from_millis(1)).await;
 
         let response2 = client
-            .get_secret_value(secret_id, None, None, false)
+            .get_secret_value(secret_id, None, None, false, None)
             .await
             .unwrap();
 
@@ -985,14 +1198,14 @@ mod tests {
         let stage_label = "STAGEHERE";
 
         let response1 = client
-            .get_secret_value(secret_id, Some(version_id), Some(stage_label), false)
+            .get_secret_value(secret_id, Some(version_id), Some(stage_label), false, None)
             .await
             .unwrap();
 
         sleep(Duration::from_millis(1)).await;
 
         let response2 = client
-            .get_secret_value(secret_id, Some(version_id), Some(stage_label), true)
+            .get_secret_value(secret_id, Some(version_id), Some(stage_label), true, None)
             .await
             .unwrap();
 
@@ -1016,7 +1229,9 @@ mod tests {
         assert!(resp.errors().is_empty());
 
         // Verify the secret was written to the cache (cache hit, no network call)
-        let cached = client.get_secret_value("MyTest", None, None, false).await;
+        let cached = client
+            .get_secret_value("MyTest", None, None, false, None)
+            .await;
         assert!(cached.is_ok());
         assert_eq!(cached.unwrap().secret_string, Some("hunter2".to_string()));
     }
@@ -1045,7 +1260,7 @@ mod tests {
 
         // Valid secret should be cached
         let cached = client
-            .get_secret_value("ValidSecret", None, None, false)
+            .get_secret_value("ValidSecret", None, None, false, None)
             .await;
         assert!(cached.is_ok());
     }
@@ -1087,6 +1302,290 @@ mod tests {
         // Transient error should be suppressed → Ok(None)
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
+    }
+
+    // Failover tests. The fake routes each request by the region in its endpoint,
+    // so the primary (the fake client's us-west-2) and the failover region can
+    // each be up, down, or denied independently.
+    mod failover {
+        use super::asm_mock::{format_rsp, DEFAULT_SECRET_STRING, FAKE_ARN};
+        use super::*;
+        use aws_sdk_secretsmanager::error::SdkError;
+        use aws_sdk_secretsmanager::operation::describe_secret::DescribeSecretError;
+        use aws_sdk_secretsmanager::operation::get_secret_value::GetSecretValueError;
+        use aws_smithy_runtime::client::http::test_util::{infallible_client_fn, NeverClient};
+        use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
+        use aws_smithy_types::body::SdkBody;
+        use std::sync::{Arc, Mutex};
+
+        const PRIMARY: &str = "us-west-2";
+        const FAILOVER: &str = "us-east-1";
+        const SERVER_ERROR: &str = r#"{"__type":"InternalServiceError","Message":"down"}"#;
+        const DENIED: &str = r#"{"__type":"AccessDeniedException","Message":"denied"}"#;
+
+        // How a region answers.
+        #[derive(Clone, Copy)]
+        enum Mode {
+            Ok,
+            Down,
+            Denied,
+        }
+
+        struct Fake {
+            primary: Mode,
+            failover: Mode,
+            // "Operation@region" for each call, in order.
+            calls: Vec<String>,
+            // The SecretId sent with each call.
+            ids: Vec<String>,
+        }
+
+        type Shared = Arc<Mutex<Fake>>;
+
+        fn client(ignore_transient_errors: bool) -> (SecretsManagerCachingClient, Shared) {
+            let fake = Arc::new(Mutex::new(Fake {
+                primary: Mode::Ok,
+                failover: Mode::Ok,
+                calls: vec![],
+                ids: vec![],
+            }));
+            let state = fake.clone();
+            let http = infallible_client_fn(move |req| {
+                let region = if req.uri().to_string().contains(FAILOVER) {
+                    FAILOVER
+                } else {
+                    PRIMARY
+                };
+                let op = req.headers()["x-amz-target"]
+                    .to_str()
+                    .unwrap()
+                    .trim_start_matches("secretsmanager.")
+                    .to_string();
+                let body: serde_json::Value =
+                    serde_json::from_slice(req.body().bytes().unwrap()).unwrap();
+                let mode = {
+                    let mut f = state.lock().unwrap();
+                    f.calls.push(format!("{op}@{region}"));
+                    f.ids.push(body["SecretId"].as_str().unwrap().to_string());
+                    if region == FAILOVER {
+                        f.failover
+                    } else {
+                        f.primary
+                    }
+                };
+                let (code, rsp) = match (mode, op.as_str()) {
+                    (Mode::Ok, _) => format_rsp(req),
+                    (Mode::Down, _) => (500, SERVER_ERROR.to_string()),
+                    (Mode::Denied, _) => (400, DENIED.to_string()),
+                };
+                http::Response::builder()
+                    .status(code)
+                    .body(SdkBody::from(rsp))
+                    .unwrap()
+            });
+            let client = fake_client(
+                Some(Duration::from_millis(50)),
+                ignore_transient_errors,
+                Some(http),
+                None,
+            );
+            (client, fake)
+        }
+
+        // Set how each region answers, and clear the call log.
+        fn set(fake: &Shared, primary: Mode, failover: Mode) {
+            let mut f = fake.lock().unwrap();
+            f.primary = primary;
+            f.failover = failover;
+            f.calls.clear();
+            f.ids.clear();
+        }
+
+        fn calls(fake: &Shared) -> Vec<String> {
+            std::mem::take(&mut fake.lock().unwrap().calls)
+        }
+
+        // Cache the secret while both regions are healthy, then let it expire.
+        async fn cache_then_expire(client: &SecretsManagerCachingClient) {
+            get(client, "prod-db", false, Some(FAILOVER)).await.unwrap();
+            sleep(Duration::from_millis(80)).await;
+        }
+
+        async fn get(
+            client: &SecretsManagerCachingClient,
+            secret_id: &str,
+            refresh_now: bool,
+            failover_region: Option<&str>,
+        ) -> Result<String, Box<dyn Error>> {
+            client
+                .get_secret_value(secret_id, None, None, refresh_now, failover_region)
+                .await
+                .map(|v| v.secret_string.unwrap())
+        }
+
+        // The HTTP status of the error, whichever operation returned it.
+        fn status(err: &(dyn Error + 'static)) -> u16 {
+            let raw = match err.downcast_ref::<SdkError<GetSecretValueError, HttpResponse>>() {
+                Some(e) => e.raw_response(),
+                None => err
+                    .downcast_ref::<SdkError<DescribeSecretError, HttpResponse>>()
+                    .and_then(|e| e.raw_response()),
+            };
+            raw.map(|r| r.status().as_u16()).unwrap_or_default()
+        }
+
+        // The version check fails over, and the cached value is confirmed current.
+        // ignore_transient_errors is off, so the value can only come from the failover answer.
+        #[tokio::test]
+        async fn test_failover_confirms_cached_value() {
+            let (client, fake) = client(false);
+            cache_then_expire(&client).await;
+            set(&fake, Mode::Down, Mode::Ok);
+
+            let value = get(&client, "prod-db", false, Some(FAILOVER))
+                .await
+                .unwrap();
+            assert_eq!(value, DEFAULT_SECRET_STRING);
+            assert_eq!(
+                calls(&fake),
+                ["DescribeSecret@us-west-2", "DescribeSecret@us-east-1"]
+            );
+        }
+
+        // Any failover error falls back to the stale value, not only a transient one.
+        #[tokio::test]
+        async fn test_failover_access_denied_serves_stale_value() {
+            let (client, fake) = client(true);
+            cache_then_expire(&client).await;
+            set(&fake, Mode::Down, Mode::Denied);
+
+            let value = get(&client, "prod-db", false, Some(FAILOVER))
+                .await
+                .unwrap();
+            assert_eq!(value, DEFAULT_SECRET_STRING);
+            assert_eq!(
+                calls(&fake),
+                ["DescribeSecret@us-west-2", "DescribeSecret@us-east-1"]
+            );
+        }
+
+        // Without ignore_transient_errors, a failed failover returns the primary's
+        // error (500), not the failover's (400).
+        #[tokio::test]
+        async fn test_failed_failover_returns_primary_error() {
+            let (client, fake) = client(false);
+            cache_then_expire(&client).await;
+            set(&fake, Mode::Down, Mode::Denied);
+
+            let err = get(&client, "prod-db", false, Some(FAILOVER))
+                .await
+                .expect_err("both regions failed");
+            assert_eq!(status(err.as_ref()), 500);
+            assert_eq!(
+                calls(&fake),
+                ["DescribeSecret@us-west-2", "DescribeSecret@us-east-1"]
+            );
+        }
+
+        // With nothing cached, a failed failover returns the primary's error even
+        // with ignore_transient_errors on.
+        #[tokio::test]
+        async fn test_failed_failover_on_cold_cache_returns_primary_error() {
+            let (client, fake) = client(true);
+            set(&fake, Mode::Down, Mode::Denied);
+
+            let err = get(&client, "prod-db", false, Some(FAILOVER))
+                .await
+                .expect_err("both regions failed");
+            assert_eq!(status(err.as_ref()), 500);
+            assert_eq!(
+                calls(&fake),
+                ["GetSecretValue@us-west-2", "GetSecretValue@us-east-1"]
+            );
+        }
+
+        // Both failover calls rewrite the ARN, and the version check sends the caller's ARN.
+        #[tokio::test]
+        async fn test_failover_retargets_arn() {
+            let (client, fake) = client(true);
+            set(&fake, Mode::Down, Mode::Ok);
+            let arn = FAKE_ARN.replace("{{name}}", "prod-db");
+            let replica_arn = arn.replace(":us-west-2:", ":us-east-1:");
+
+            get(&client, &arn, true, Some(FAILOVER)).await.unwrap();
+            sleep(Duration::from_millis(80)).await;
+            get(&client, &arn, false, Some(FAILOVER)).await.unwrap();
+            assert_eq!(
+                calls(&fake),
+                [
+                    "GetSecretValue@us-west-2",
+                    "GetSecretValue@us-east-1",
+                    "DescribeSecret@us-west-2",
+                    "DescribeSecret@us-east-1"
+                ]
+            );
+            assert_eq!(
+                fake.lock().unwrap().ids,
+                [arn.clone(), replica_arn.clone(), arn, replica_arn]
+            );
+        }
+
+        // A non-transient primary error is returned without failing over.
+        #[tokio::test]
+        async fn test_no_failover_on_non_transient_error() {
+            let (client, fake) = client(true);
+            set(&fake, Mode::Denied, Mode::Ok);
+            let err = get(&client, "prod-db", false, Some(FAILOVER))
+                .await
+                .expect_err("primary denied");
+            assert_eq!(status(err.as_ref()), 400);
+            assert_eq!(calls(&fake), ["GetSecretValue@us-west-2"]);
+
+            set(&fake, Mode::Ok, Mode::Ok);
+            cache_then_expire(&client).await;
+            set(&fake, Mode::Denied, Mode::Ok);
+            let err = get(&client, "prod-db", false, Some(FAILOVER))
+                .await
+                .expect_err("primary denied");
+            assert_eq!(status(err.as_ref()), 400);
+            assert_eq!(calls(&fake), ["DescribeSecret@us-west-2"]);
+        }
+
+        // A failover region equal to the primary is ignored, so the call isn't repeated.
+        #[tokio::test]
+        async fn test_failover_region_equal_to_primary_is_ignored() {
+            let (client, fake) = client(true);
+            set(&fake, Mode::Down, Mode::Ok);
+
+            let err = get(&client, "prod-db", false, Some(PRIMARY))
+                .await
+                .expect_err("primary down, no failover");
+            assert_eq!(status(err.as_ref()), 500);
+            assert_eq!(calls(&fake), ["GetSecretValue@us-west-2"]);
+        }
+
+        // When both regions hang, the primary call is cut off at the primary timeout
+        // (10 ms), not the fake client's 100 ms attempt timeout, and the failover call
+        // isn't bounded by it. Without a failover region, the primary timeout doesn't
+        // apply. The clock is paused, so the elapsed times are exact.
+        #[tokio::test(start_paused = true)]
+        async fn test_primary_timeout_applies_only_with_failover_region() {
+            let hang = SharedHttpClient::new(NeverClient::new());
+            let client = fake_client(None, false, Some(hang), None)
+                .with_primary_timeout(Duration::from_millis(10));
+
+            let start = tokio::time::Instant::now();
+            get(&client, "prod-db", false, Some(FAILOVER))
+                .await
+                .expect_err("both regions hang");
+            assert_eq!(start.elapsed(), Duration::from_millis(110));
+
+            let start = tokio::time::Instant::now();
+            get(&client, "prod-db", false, None)
+                .await
+                .expect_err("primary hangs");
+            assert_eq!(start.elapsed(), Duration::from_millis(100));
+        }
     }
 
     mod asm_mock {
@@ -1156,6 +1655,11 @@ mod tests {
         "Message": "Internal service error"
         }"###;
 
+        pub const THROTTLING_EXCEPTION_BODY: &str = r###"{
+        "__type":"ThrottlingException",
+        "message":"Rate exceeded"
+        }"###;
+
         // Template BatchGetSecretValue response for testing
         const BATCH_GSV_BODY: &str = r###"{
             "SecretValues": [
@@ -1198,8 +1702,8 @@ mod tests {
             "message":"The parameter SecretIdList contains invalid values"
         }"###;
 
-        // Private helper to look at the request and provide the correct response.
-        fn format_rsp(req: Request<SdkBody>) -> (u16, String) {
+        // Helper to look at the request and provide the correct response.
+        pub fn format_rsp(req: Request<SdkBody>) -> (u16, String) {
             let (parts, body) = req.into_parts();
             let target = parts.headers["x-amz-target"].to_str().unwrap();
 
@@ -1278,12 +1782,18 @@ mod tests {
                 "secretsmanager.GetSecretValue" if name.starts_with("NOTFOUND") => {
                     (400, NOT_FOUND_EXCEPTION_BODY)
                 }
+                "secretsmanager.GetSecretValue" if name.starts_with("THROTTLING") => {
+                    (400, THROTTLING_EXCEPTION_BODY)
+                }
                 "secretsmanager.GetSecretValue" => (200, GSV_BODY),
                 "secretsmanager.DescribeSecret" if name.contains("DESCRIBEACCESSDENIED") => {
                     (400, SECRETSMANAGER_ACCESS_DENIED_BODY)
                 }
                 "secretsmanager.DescribeSecret" if name.contains("DESCRIBESERVICEERROR") => {
                     (500, SECRETSMANAGER_INTERNAL_SERVICE_ERROR_BODY)
+                }
+                "secretsmanager.DescribeSecret" if name.contains("DESCRIBETHROTTLING") => {
+                    (400, THROTTLING_EXCEPTION_BODY)
                 }
                 "secretsmanager.DescribeSecret" => (200, DESC_BODY),
                 _ => panic!("Unknown operation"),

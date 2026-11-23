@@ -13,6 +13,7 @@ pub(crate) struct GSVQuery {
     pub version_stage: Option<String>,
     pub refresh_now: bool,
     pub role_arn: Option<String>,
+    pub failover_region: Option<String>,
 }
 
 impl GSVQuery {
@@ -58,6 +59,38 @@ impl GSVQuery {
         Ok(())
     }
 
+    /// Validate the failover region against the AWS region naming format.
+    ///
+    /// Checks that the provided string matches the region pattern
+    /// `^[a-z0-9]+(-[a-z0-9]+)+$` (e.g. `us-east-1`, `us-gov-west-1`).
+    ///
+    /// # Arguments
+    ///
+    /// * `region` - The failover region string to validate.
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(())` - If the region passes format validation.
+    ///
+    /// # Errors
+    ///
+    /// * `HttpError(400, ...)` - If the region does not match the expected format.
+    fn validate_failover_region(region: &str) -> Result<(), HttpError> {
+        static FAILOVER_REGION_RE: OnceLock<Regex> = OnceLock::new();
+        let re = FAILOVER_REGION_RE.get_or_init(|| {
+            Regex::new(r"^[a-z0-9]+(-[a-z0-9]+)+$")
+                .expect("hard-coded failoverRegion regex must compile")
+        });
+        if !re.is_match(region) {
+            return Err(HttpError(
+                400,
+                "invalid failoverRegion format, expected an AWS region such as us-east-1"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn try_from_query(s: &str) -> Result<Self, HttpError> {
         // url library can only parse complete URIs. The host/port/scheme used is irrelevant since it is not used
         let complete_uri = format!("http://localhost{}", s);
@@ -70,6 +103,7 @@ impl GSVQuery {
             version_stage: None,
             refresh_now: false,
             role_arn: None,
+            failover_region: None,
         };
 
         for (k, v) in url.query_pairs() {
@@ -79,6 +113,8 @@ impl GSVQuery {
                 "versionStage" => query.version_stage = Some(v.into()),
                 "refreshNow" => query.refresh_now = GSVQuery::parse_refresh_value(&v)?,
                 "roleArn" => query.role_arn = Some(v.into()),
+                "failoverRegion" if v.is_empty() => {}
+                "failoverRegion" => query.failover_region = Some(v.into()),
                 p => return Err(HttpError(400, format!("unknown parameter: {}", p))),
             }
         }
@@ -89,6 +125,10 @@ impl GSVQuery {
 
         if let Some(ref arn) = query.role_arn {
             Self::validate_role_arn(arn)?;
+        }
+
+        if let Some(ref region) = query.failover_region {
+            Self::validate_failover_region(region)?;
         }
 
         Ok(query)
@@ -111,6 +151,7 @@ impl GSVQuery {
             version_stage: None,
             refresh_now: false,
             role_arn: None,
+            failover_region: None,
         };
 
         for (k, v) in url.query_pairs() {
@@ -119,12 +160,18 @@ impl GSVQuery {
                 "versionStage" => query.version_stage = Some(v.into()),
                 "refreshNow" => query.refresh_now = GSVQuery::parse_refresh_value(&v)?,
                 "roleArn" => query.role_arn = Some(v.into()),
+                "failoverRegion" if v.is_empty() => {}
+                "failoverRegion" => query.failover_region = Some(v.into()),
                 p => return Err(HttpError(400, format!("unknown parameter: {}", p))),
             }
         }
 
         if let Some(ref arn) = query.role_arn {
             Self::validate_role_arn(arn)?;
+        }
+
+        if let Some(ref region) = query.failover_region {
+            Self::validate_failover_region(region)?;
         }
 
         Ok(query)
@@ -494,6 +541,91 @@ mod tests {
         ] {
             parse_with_role_arn(payload)
                 .unwrap_or_else(|e| panic!("valid role name must parse ({payload:?}): {e:?}"));
+        }
+    }
+
+    #[test]
+    fn parse_query_failover_region() {
+        let query = GSVQuery::try_from_query(
+            "/secretsmanager/get?secretId=MyTest&failoverRegion=us-east-1",
+        )
+        .unwrap();
+        assert_eq!(query.failover_region, Some("us-east-1".to_string()));
+    }
+
+    #[test]
+    fn parse_path_query_failover_region() {
+        let query =
+            GSVQuery::try_from_path_query("/v1/MyTest?failoverRegion=us-gov-west-1", "/v1/")
+                .unwrap();
+        assert_eq!(query.failover_region, Some("us-gov-west-1".to_string()));
+    }
+
+    #[test]
+    fn parse_query_no_failover_region() {
+        let query = GSVQuery::try_from_query("/secretsmanager/get?secretId=MyTest").unwrap();
+        assert_eq!(query.failover_region, None);
+    }
+
+    #[test]
+    fn parse_query_empty_failover_region_is_absent() {
+        // An empty `failoverRegion=` is treated as absent, so the request falls back
+        // to the configured failover region instead of parsing to `Some("")`.
+        let query = GSVQuery::try_from_query("/secretsmanager/get?secretId=MyTest&failoverRegion=")
+            .unwrap();
+        assert_eq!(query.failover_region, None);
+    }
+
+    #[test]
+    fn parse_path_query_empty_failover_region_is_absent() {
+        let query = GSVQuery::try_from_path_query("/v1/MyTest?failoverRegion=", "/v1/").unwrap();
+        assert_eq!(query.failover_region, None);
+    }
+
+    #[test]
+    fn parse_query_invalid_failover_region() {
+        // A dotted or otherwise malformed value fails format validation with 400
+        // before it can ever reach the SDK or DNS.
+        for bad in &[
+            "us_east_1",
+            "US-EAST-1",
+            "us east 1",
+            "evil.example.com",
+            "us-east-1.",
+            "-us-east-1",
+            "useast1",
+            "us-",
+        ] {
+            let err = GSVQuery::try_from_query(&format!(
+                "/secretsmanager/get?secretId=MyTest&failoverRegion={}",
+                bad
+            ))
+            .expect_err("must reject malformed failoverRegion");
+            assert_eq!(err.0, 400, "value {bad:?}");
+            assert!(
+                err.1.contains("invalid failoverRegion format"),
+                "value {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_path_query_invalid_failover_region() {
+        let err = GSVQuery::try_from_path_query("/v1/MyTest?failoverRegion=not.a.region", "/v1/")
+            .expect_err("must reject malformed failoverRegion");
+        assert_eq!(err.0, 400);
+        assert!(err.1.contains("invalid failoverRegion format"));
+    }
+
+    #[test]
+    fn parse_query_valid_failover_region_variants() {
+        for good in &["us-east-1", "us-gov-west-1", "ap-southeast-1", "cn-north-1"] {
+            let query = GSVQuery::try_from_query(&format!(
+                "/secretsmanager/get?secretId=MyTest&failoverRegion={}",
+                good
+            ))
+            .unwrap_or_else(|e| panic!("valid region must parse ({good:?}): {e:?}"));
+            assert_eq!(query.failover_region, Some(good.to_string()));
         }
     }
 }

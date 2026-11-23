@@ -5,6 +5,7 @@ mod cache_manager;
 mod constants;
 pub mod credentials_file_provider;
 mod error;
+mod failover_credentials_provider;
 mod parse;
 mod prefetch;
 mod server;
@@ -885,5 +886,22 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         validate_response_extra("MyTest", ver, vec!["AWSPENDING"], body);
+    }
+
+    // Verify a query-style request with failoverRegion succeeds.
+    #[tokio::test]
+    async fn failover_region_query_success() {
+        let (status, body) =
+            run_request("/secretsmanager/get?secretId=MyTest&failoverRegion=us-east-1").await;
+        assert_eq!(status, StatusCode::OK);
+        validate_response("MyTest", body);
+    }
+
+    // Verify a path-style request with failoverRegion succeeds.
+    #[tokio::test]
+    async fn failover_region_path_success() {
+        let (status, body) = run_request("/v1/MyTest?failoverRegion=us-east-1").await;
+        assert_eq!(status, StatusCode::OK);
+        validate_response("MyTest", body);
     }
 }
