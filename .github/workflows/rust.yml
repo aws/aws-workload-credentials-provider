@@ -9,6 +9,11 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Pinned so a runner image update can't change the build. Matches staging.yml.
+  RUST_TOOLCHAIN: "1.100.0"
+  # Rust 1.100 coverage reports most lines as partial or missed, so coverage runs on 1.99.1.
+  COVERAGE_TOOLCHAIN: "1.99.1"
+  CARGO_LLVM_COV_VERSION: "0.9.2"
 
 permissions:
   contents: read
@@ -39,11 +44,15 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-${{ env.RUST_TOOLCHAIN }}-llvm-cov-${{ env.CARGO_LLVM_COV_VERSION }}-${{ hashFiles('**/Cargo.lock') }}
       - name: Rustup version
         run: rustup --version
-      - name: Install Rust components
-        run: rustup component add llvm-tools clippy rustfmt cargo
+      - name: Install Rust toolchains
+        shell: bash
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal -c llvm-tools,clippy,rustfmt
+          rustup default "$RUST_TOOLCHAIN"
+          rustup toolchain install "$COVERAGE_TOOLCHAIN" --profile minimal -c llvm-tools
       - name: Install ninja-build (Windows)
         if: runner.os == 'Windows'
         uses: seanmiddleditch/gha-setup-ninja@v6
@@ -56,8 +65,10 @@ jobs:
         with:
           go-version: 'stable'
       - name: Install Cargo binaries
+        shell: bash
         run: |
-          which cargo-llvm-cov || cargo install cargo-llvm-cov
+          cargo llvm-cov --version | grep -qx "cargo-llvm-cov $CARGO_LLVM_COV_VERSION" \
+            || cargo install cargo-llvm-cov --version "$CARGO_LLVM_COV_VERSION" --locked --force
           which cargo-deny || cargo install cargo-deny
       - name: Check licenses
         run: cargo-deny check licenses
@@ -66,7 +77,7 @@ jobs:
       - name: Run tests
         run: cargo test --verbose --all-features --no-fail-fast --workspace --exclude integration-tests
       - name: Code Coverage
-        run: cargo llvm-cov --all-features --workspace --exclude integration-tests --codecov --output-path ./codecov.json
+        run: cargo +${{ env.COVERAGE_TOOLCHAIN }} llvm-cov --all-features --workspace --exclude integration-tests --codecov --output-path ./codecov.json
       - name: Publish Code Coverage
         uses: codecov/codecov-action@v6
         with:
@@ -87,4 +98,4 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-${{ env.RUST_TOOLCHAIN }}-llvm-cov-${{ env.CARGO_LLVM_COV_VERSION }}-${{ hashFiles('**/Cargo.lock') }}
