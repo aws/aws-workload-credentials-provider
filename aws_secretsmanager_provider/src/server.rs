@@ -161,6 +161,7 @@ impl Server {
                         qry.version_stage.as_deref(),
                         qry.refresh_now,
                         qry.role_arn.as_deref(),
+                        qry.failover_region.as_deref(),
                     )
                     .await?)
             }
@@ -176,6 +177,7 @@ impl Server {
                         qry.version_stage.as_deref(),
                         qry.refresh_now,
                         qry.role_arn.as_deref(),
+                        qry.failover_region.as_deref(),
                     )
                     .await?)
             }

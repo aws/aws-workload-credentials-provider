@@ -51,6 +51,8 @@ pub struct ProviderQuery {
     pub refresh_now: Option<bool>,
     #[builder(default)]
     pub role_arn: Option<String>,
+    #[builder(default)]
+    pub failover_region: Option<String>,
 }
 
 impl ProviderQuery {
@@ -75,6 +77,10 @@ impl ProviderQuery {
             if let Some(role_arn) = &self.role_arn {
                 query_pairs.append_pair("roleArn", role_arn);
             }
+
+            if let Some(failover_region) = &self.failover_region {
+                query_pairs.append_pair("failoverRegion", failover_region);
+            }
         }
         url.query().unwrap_or("").to_string()
     }
@@ -83,6 +89,140 @@ impl ProviderQuery {
 pub struct ProviderProcess {
     pub _child: tokio::process::Child,
     pub port: u16,
+}
+
+// ---- Failover helpers ----
+
+/// Lines the provider wrote to stdout, collected in the background.
+#[derive(Clone, Default)]
+pub struct ProviderLogs(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+impl ProviderLogs {
+    /// Waits up to 2s for a line containing `pattern`, then returns every such line.
+    #[allow(dead_code)]
+    pub async fn wait_for(&self, pattern: &str) -> Vec<String> {
+        self.wait_for_count(pattern, 1).await
+    }
+
+    /// Waits up to 2s for `count` lines containing `pattern`, then returns every
+    /// such line. A line can reach the test after the response it belongs to.
+    #[allow(dead_code)]
+    pub async fn wait_for_count(&self, pattern: &str, count: usize) -> Vec<String> {
+        let mut found = Vec::new();
+        for _ in 0..20 {
+            found = self
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|l| l.contains(pattern))
+                .cloned()
+                .collect();
+            if found.len() >= count {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        found
+    }
+
+    /// Asserts that `operation` failed over once and the failover call succeeded.
+    #[allow(dead_code)]
+    pub async fn assert_failed_over(&self, operation: &str) {
+        // A duplicate failover line can arrive after the response; wait before counting.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let lines = self
+            .wait_for(&format!("failover=true operation={operation} "))
+            .await;
+        assert_eq!(
+            lines.len(),
+            1,
+            "Expected one {operation} failover line, got {lines:?}"
+        );
+        assert!(
+            lines[0].contains("result=ok"),
+            "Failover didn't succeed: {}",
+            lines[0]
+        );
+    }
+
+    /// Asserts that `operation` failed over once and the failover call failed,
+    /// and returns its failover line.
+    #[allow(dead_code)]
+    pub async fn assert_failover_errored(&self, operation: &str) -> String {
+        // A duplicate failover line can arrive after the response; wait before counting.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let lines = self
+            .wait_for(&format!("failover=true operation={operation} "))
+            .await;
+        assert_eq!(
+            lines.len(),
+            1,
+            "Expected one {operation} failover line, got {lines:?}"
+        );
+        assert!(
+            lines[0].contains("result=error"),
+            "Failover didn't fail: {}",
+            lines[0]
+        );
+        lines[0].clone()
+    }
+}
+
+/// A region with no endpoints: every call to it fails with a connection error.
+/// Set as the provider's `AWS_REGION` to take its whole primary region down.
+#[allow(dead_code)]
+pub const FAKE_REGION: &str = "us-fake-1";
+
+/// A second region with no endpoints. Set as the failover region, with
+/// `FAKE_REGION` as the primary, to take every region down.
+#[allow(dead_code)]
+pub const FAKE_FAILOVER_REGION: &str = "us-fake-2";
+
+/// The test's own SDK region, where its secrets are. With the provider's
+/// primary set to `FAKE_REGION`, this is the region to fail over to.
+#[allow(dead_code)]
+pub async fn real_region() -> String {
+    aws_config::load_defaults(aws_config::BehaviorVersion::latest())
+        .await
+        .region()
+        .expect("SDK region")
+        .to_string()
+}
+
+/// A real region to fail over to that differs from the test's own SDK region.
+#[allow(dead_code)]
+pub async fn other_region() -> &'static str {
+    match real_region().await.as_str() {
+        "us-west-2" => "us-east-1",
+        _ => "us-west-2",
+    }
+}
+
+/// Helper to write real AWS credentials from the environment to a temp file.
+#[allow(dead_code)]
+pub async fn write_real_credentials(file: &mut tempfile::NamedTempFile) {
+    use aws_credential_types::provider::ProvideCredentials;
+    use std::io::Write;
+
+    let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+    let creds = config
+        .credentials_provider()
+        .expect("No credentials provider")
+        .provide_credentials()
+        .await
+        .expect("Failed to resolve credentials");
+
+    let mut content = format!(
+        "[default]\naws_access_key_id={}\naws_secret_access_key={}\n",
+        creds.access_key_id(),
+        creds.secret_access_key()
+    );
+    if let Some(token) = creds.session_token() {
+        content.push_str(&format!("aws_session_token={}\n", token));
+    }
+    file.write_all(content.as_bytes()).unwrap();
+    file.flush().unwrap();
 }
 
 impl ProviderProcess {
@@ -199,6 +339,99 @@ ttl_seconds = {}
         }
     }
 
+    /// Like `start_with_config_content_and_env`, and also collects the provider's
+    /// stdout. Set `log_to_file = false` in the config to get its logs there.
+    #[allow(dead_code)]
+    pub async fn start_provider_with_captured_logs(
+        port: u16,
+        config_content: &str,
+        extra_env: &[(&str, &str)],
+    ) -> (ProviderProcess, ProviderLogs) {
+        let config_path = std::env::temp_dir().join(format!("test_config_{}.toml", port));
+        std::fs::write(&config_path, config_content).expect("Failed to write test config");
+
+        let provider_path = locate_provider_binary();
+
+        let mut cmd = TokioCommand::new(&provider_path);
+        cmd.arg("sm")
+            .arg("start")
+            .arg("--config")
+            .arg(&config_path)
+            .env("AWS_TOKEN", "test-token-123")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+
+        for (key, val) in extra_env {
+            cmd.env(key, val);
+        }
+
+        let mut child = cmd.spawn().expect("Failed to start provider");
+
+        let stdout = child.stdout.take().expect("Failed to get stdout");
+        let mut reader = BufReader::new(stdout).lines();
+        let logs = ProviderLogs::default();
+
+        // With console logging, log lines can come before the listening message.
+        loop {
+            match reader.next_line().await {
+                Ok(Some(line)) => {
+                    let listening = line.contains("listening on");
+                    logs.0.lock().unwrap().push(line);
+                    if listening {
+                        break;
+                    }
+                }
+                Ok(None) => panic!(
+                    "Provider exited without a listening message: {:?}",
+                    logs.0.lock().unwrap()
+                ),
+                Err(e) => panic!("Failed to read provider output: {}", e),
+            }
+        }
+
+        let sink = logs.clone();
+        tokio::spawn(async move {
+            while let Ok(Some(line)) = reader.next_line().await {
+                sink.0.lock().unwrap().push(line);
+            }
+        });
+
+        (
+            ProviderProcess {
+                _child: child,
+                port,
+            },
+            logs,
+        )
+    }
+
+    /// Starts the provider with console logs collected, and `failover` as the
+    /// body of `[capabilities.secrets_manager.failover]`. Later tables can
+    /// follow in `failover`.
+    #[allow(dead_code)]
+    pub async fn start_with_failover_config(
+        port: u16,
+        failover: &str,
+        extra_env: &[(&str, &str)],
+    ) -> (ProviderProcess, ProviderLogs) {
+        let config_content = format!(
+            r#"
+[logging]
+log_level = "info"
+log_to_file = false
+
+[capabilities.secrets_manager]
+http_port = {port}
+validate_credentials = false
+
+[capabilities.secrets_manager.failover]
+{failover}
+"#
+        );
+        Self::start_provider_with_captured_logs(port, &config_content, extra_env).await
+    }
+
     #[allow(dead_code)]
     pub async fn make_request(&self, query: &ProviderQuery) -> String {
         let response = self.make_request_raw(query).await;
@@ -215,7 +448,9 @@ ttl_seconds = {}
 
     pub async fn make_request_raw(&self, query: &ProviderQuery) -> reqwest::Response {
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
+            // Role credential failover retries several primary calls in a row
+            // before failing each one over, so a request can take over 10s.
+            .timeout(Duration::from_secs(30))
             .connect_timeout(Duration::from_secs(5))
             .build()
             .expect("Failed to build HTTP client");
@@ -597,7 +832,9 @@ impl Drop for TestSecrets {
     fn drop(&mut self) {
         let prefix = self.prefix.clone();
         let created_types = self.created_types.clone();
-        tokio::spawn(async move {
+        // Own thread and runtime, waited on: a task spawned on the test's runtime is
+        // dropped when the test ends, before the deletes finish.
+        let cleanup = async move {
             let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
             let client = aws_sdk_secretsmanager::Client::new(&config);
 
@@ -610,7 +847,13 @@ impl Drop for TestSecrets {
                     .send()
                     .await;
             }
-        });
+        };
+        let _ = std::thread::spawn(move || {
+            tokio::runtime::Runtime::new()
+                .expect("Failed to build cleanup runtime")
+                .block_on(async { tokio::time::timeout(Duration::from_secs(30), cleanup).await })
+        })
+        .join();
     }
 }
 

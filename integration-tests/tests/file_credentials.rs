@@ -14,28 +14,6 @@ use common::*;
 use std::io::Write;
 use tempfile::NamedTempFile;
 
-/// Helper to write real AWS credentials from the environment to a temp file.
-async fn write_real_credentials(file: &mut NamedTempFile) {
-    let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
-    let creds = config
-        .credentials_provider()
-        .expect("No credentials provider")
-        .provide_credentials()
-        .await
-        .expect("Failed to resolve credentials");
-
-    let mut content = format!(
-        "[default]\naws_access_key_id={}\naws_secret_access_key={}\n",
-        creds.access_key_id(),
-        creds.secret_access_key()
-    );
-    if let Some(token) = creds.session_token() {
-        content.push_str(&format!("aws_session_token={}\n", token));
-    }
-    file.write_all(content.as_bytes()).unwrap();
-    file.flush().unwrap();
-}
-
 /// Valid credentials via explicit path: provider starts and can fetch a secret.
 #[tokio::test]
 async fn test_valid_credentials_explicit_path() {

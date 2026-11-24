@@ -94,6 +94,9 @@ pub struct SecretsManagerConfig {
 
     /// Optional path to a credentials file for file-based credential loading
     pub credentials_file_path: Option<PathBuf>,
+
+    /// Region failover configuration (disabled unless a default or per-secret failover region is set)
+    pub failover: FailoverConfig,
 }
 
 impl Default for SecretsManagerConfig {
@@ -111,6 +114,7 @@ impl Default for SecretsManagerConfig {
             validate_credentials: true,
             prefetch: PrefetchConfig::default(),
             credentials_file_path: None,
+            failover: FailoverConfig::default(),
         }
     }
 }
@@ -265,6 +269,36 @@ impl PrefetchConfig {
     }
 }
 
+/// Region failover configuration for Secrets Manager requests.
+#[derive(Debug, Clone)]
+pub struct FailoverConfig {
+    /// The AWS Region to fail over to when the primary region fails, for secrets without a per-secret region
+    pub default_failover_region: Option<String>,
+
+    /// The timeout in milliseconds for a single Secrets Manager operation, including any credential refresh it triggers (2000 - 25000, default 3000)
+    pub operation_timeout_ms: u64,
+
+    /// Per-secret failover region, keyed by secret ARN (overrides default_failover_region)
+    pub secret_to_region_map: HashMap<String, String>,
+}
+
+impl Default for FailoverConfig {
+    fn default() -> Self {
+        Self {
+            default_failover_region: None,
+            operation_timeout_ms: 3000,
+            secret_to_region_map: HashMap::new(),
+        }
+    }
+}
+
+impl FailoverConfig {
+    /// Returns true if a default or any per-secret failover region is configured.
+    pub fn is_enabled(&self) -> bool {
+        self.default_failover_region.is_some() || !self.secret_to_region_map.is_empty()
+    }
+}
+
 /// A single tag filter entry for tag-based pre-fetching.
 #[derive(Debug, Clone)]
 pub struct TagFilter {
@@ -374,6 +408,7 @@ pub struct ConfigInput {
     #[serde(default)]
     pub prefetch: Option<PrefetchConfigInput>,
     pub credentials_file_path: Option<PathBuf>,
+    pub failover: Option<FailoverConfigInput>,
 
     // Nested capabilities
     pub capabilities: Option<CapabilitiesConfig>,
@@ -407,6 +442,7 @@ pub struct SecretsManagerConfigInput {
     #[serde(default)]
     pub prefetch: Option<PrefetchConfigInput>,
     pub credentials_file_path: Option<PathBuf>,
+    pub failover: Option<FailoverConfigInput>,
 }
 
 /// Cache configuration in nested format.
@@ -443,6 +479,16 @@ pub struct PrefetchConfigInput {
     pub filter_tags: Vec<TagFilterInput>,
     #[serde(default)]
     pub secrets: Vec<SecretPrefetchConfigInput>,
+}
+
+/// Failover configuration input from TOML.
+#[derive(Debug, Deserialize, Default, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct FailoverConfigInput {
+    pub default_failover_region: Option<String>,
+    pub operation_timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub secret_to_region_map: HashMap<String, String>,
 }
 
 /// Tag filter input from TOML.

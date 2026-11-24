@@ -48,13 +48,13 @@ fn cache_hit(c: &mut Criterion) {
         .unwrap();
 
     // Warm up the cache.
-    rt.block_on(cache.get_secret_value("secretid", None, None, false))
+    rt.block_on(cache.get_secret_value("secretid", None, None, false, None))
         .unwrap();
 
     c.bench_function("CacheHit", |b| {
         b.to_async(&rt).iter(async || {
             cache
-                .get_secret_value("secretid", None, None, false)
+                .get_secret_value("secretid", None, None, false, None)
                 .await
                 .unwrap();
         });
@@ -99,7 +99,7 @@ fn cache_eviction(c: &mut Criterion) {
     c.bench_function("CacheEviction", |b| {
         b.to_async(&rt).iter(async || {
             cache
-                .get_secret_value(&random_string(10), None, None, false)
+                .get_secret_value(&random_string(10), None, None, false, None)
                 .await
                 .unwrap();
         });

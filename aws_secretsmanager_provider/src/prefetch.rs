@@ -226,6 +226,10 @@ async fn fetch_secret_id_group(
                 }
             }
             Ok(None) => {
+                warn!(
+                    "Pre-fetch: BatchGetSecretValue failed with a transient error, {} secret(s) not fetched",
+                    batch_len
+                );
                 stats.failed += batch_len;
             }
             Err(e) => {
@@ -326,7 +330,13 @@ async fn fetch_tag_group(
 
                 next_token = resp.next_token().map(String::from);
             }
-            Ok(None) => break,
+            Ok(None) => {
+                warn!(
+                    "Pre-fetch: BatchGetSecretValue with filters failed with a transient error, stopping tag pre-fetch for {}",
+                    role_display(role_arn)
+                );
+                break;
+            }
             Err(e) => {
                 error!("Pre-fetch: BatchGetSecretValue with filters failed: {}", e);
                 break;
