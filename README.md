@@ -1106,7 +1106,7 @@ The provider fails over on server errors \(5XX\), timeouts, connection failures,
 
 If the failover region fails too, by default the provider returns the cached value if it has one, or the primary region's error\. With `refreshNow=true`, it returns the error\.
 
-`operation_timeout_ms` sets how long the provider waits for the primary region before it fails over\. The default is 3000\. It applies only to requests that have a failover region\. Other requests keep their current timeouts\.
+`operation_timeout_ms` sets the number of milliseconds the provider waits for the primary region before it fails over\. The default is 3000 milliseconds\. It applies only to requests that have a failover region\. Other requests keep their current timeouts\. For customers replicating their secrets to a failover region further away, increasing the `operation_timeout_ms` is recommended
 
 ### Credential failover \(STS\)<a name="region-failover-credentials"></a>
 
