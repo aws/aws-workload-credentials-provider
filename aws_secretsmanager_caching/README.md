@@ -40,7 +40,10 @@ let client = match SecretsManagerCachingClient::default(
     Err(_) => panic!("Handle this error"),
 };
 
-let secret_string = match client.get_secret_value("MyTest", None, None).await {
+let secret_string = match client
+    .get_secret_value("MyTest", None, None, false, None)
+    .await
+{
     Ok(s) => s.secret_string.unwrap(),
     Err(_) => panic!("Handle this error"),
 };
@@ -80,13 +83,13 @@ let client = match SecretsManagerCachingClient::from_builder(
     Err(_) => panic!("Handle this error"),
 };
 
-let secret_string = client
-    .get_secret_value("MyTest", None, None)
-    .await 
-    {
-        Ok(c) => c.secret_string.unwrap(),
-        Err(_) => panic!("Handle this error"),
-    };
+let secret_string = match client
+    .get_secret_value("MyTest", None, None, false, None)
+    .await
+{
+    Ok(c) => c.secret_string.unwrap(),
+    Err(_) => panic!("Handle this error"),
+};
 
 // Your code here
 ```

@@ -1111,7 +1111,7 @@ If the failover region fails too, by default the provider returns the cached val
 ### Credential failover \(STS\)<a name="region-failover-credentials"></a>
 
 **Important**  
-Only `default_failover_region` turns on credential failover\. With only `secret_to_region_map` or the `failoverRegion` query parameter, requests can fail when STS in the primary region is down and credentials need to be refreshed\.
+Only `default_failover_region` turns on credential failover\. With only `secret_to_region_map` or the `failoverRegion` query parameter, requests can fail when credentials need to be refreshed while STS in the primary region is down\. We recommend setting `default_failover_region`\.
 
 When `default_failover_region` is set and STS in the primary region is down, the provider gets credentials from STS in `default_failover_region` for:
 + Roles in `roleArn`\.
