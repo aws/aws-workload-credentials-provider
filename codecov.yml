@@ -1,0 +1,15 @@
+codecov:
+  notify:
+    # One upload per OS in the Rust workflow's build matrix.
+    after_n_builds: 3
+
+coverage:
+  status:
+    project:
+      default:
+        target: auto
+        # Coverage of unchanged code varies between runs.
+        threshold: 0.5%
+
+comment:
+  after_n_builds: 3
