@@ -38,7 +38,7 @@ log = "0.4.29"
 log4rs = { version = "1.2.0", features = ["gzip"] }
 tokio-util = "0.7.18"
 url = "2"
-aws_secretsmanager_caching = { version = "2.1.0", path = "../aws_secretsmanager_caching" }
+aws_secretsmanager_caching = { version = "3.0.0", path = "../aws_secretsmanager_caching" }
 aws_workload_credentials_provider_common = { version = "3.2.0", path = "../aws_workload_credentials_provider_common" }
 regex = "1"
 rand = "0.10"
@@ -47,7 +47,7 @@ rand = "0.10"
 [dev-dependencies]
 hyper = { version = "1", features = ["http1", "server", "client"] }
 aws-smithy-runtime = { version = "1", features = ["test-util"] }
-aws_secretsmanager_caching = { version = "2.1.0", path = "../aws_secretsmanager_caching", features = ["test-util"] }
+aws_secretsmanager_caching = { version = "3.0.0", path = "../aws_secretsmanager_caching", features = ["test-util"] }
 tokio = { version = "1", features = ["test-util", "rt-multi-thread", "net", "macros"] }
 http = "0.2.9"
 aws-smithy-types = "1"
