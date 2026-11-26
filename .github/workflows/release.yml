@@ -14,8 +14,6 @@ env:
 permissions:
   contents: read
   id-token: write
-  # Needed for staging
-  pull-requests: write
 
 jobs:
   validate-version:
