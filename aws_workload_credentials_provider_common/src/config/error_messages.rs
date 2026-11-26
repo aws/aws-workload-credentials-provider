@@ -67,6 +67,14 @@ pub const INVALID_CACHE_BUFFER_RATIO_MSG: &str =
 pub const INVALID_MAX_JITTER_MSG: &str =
     "The max jitter seconds specified in the configuration file isn't valid. The max jitter seconds must be in the range 0 to 10.";
 
+/// Error message for invalid failover operation timeout.
+pub const INVALID_OPERATION_TIMEOUT_MSG: &str =
+    "The operation timeout in milliseconds specified in the configuration file isn't valid. The operation timeout in milliseconds must be in the range 2000 to 25000.";
+
+/// Error message for an invalid failover region.
+pub const INVALID_FAILOVER_REGION_MSG: &str =
+    "The failover region specified in the configuration file isn't valid. The failover region can't be empty or the same as the primary region.";
+
 // ============================================================================
 // ACM
 // ============================================================================

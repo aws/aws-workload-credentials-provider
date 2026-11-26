@@ -60,6 +60,7 @@ To download the source code, see [https://github\.com/aws/aws\-workload\-credent
       - [\[ Python \]](#-python--1)
   - [Role chaining (cross-account access)](#role-chaining-cross-account-access)
   - [Pre-fetching](#pre-fetching)
+  - [Region failover](#region-failover)
   - [Step 4: Retrieve certificates with the Workload Credentials Provider](#step-4-retrieve-certificates-with-the-workload-credentials-provider)
   - [Configure the Workload Credentials Provider](#configure-the-workload-credentials-provider)
   - [File-based credentials](#file-based-credentials)
@@ -768,7 +769,7 @@ The following instructions show how to get a secret named *MyTest* by using the 
 
 **The following sections describe how to use the Secrets Manager capability\.**
 
-To retrieve a secret, you call the local Workload Credentials Provider endpoint and include the name or ARN of the secret as a query parameter\. By default, the Workload Credentials Provider retrieves the `AWSCURRENT` version of the secret\. To retrieve a different version, you can set `versionStage` or `versionId`\. To retrieve a secret using a different IAM role, you can set `roleArn`\. For more information, see [Role chaining \(cross\-account access\)](#role-chaining-cross-account-access)\.
+To retrieve a secret, you call the local Workload Credentials Provider endpoint and include the name or ARN of the secret as a query parameter\. By default, the Workload Credentials Provider retrieves the `AWSCURRENT` version of the secret\. To retrieve a different version, you can set `versionStage` or `versionId`\. To retrieve a secret using a different IAM role, you can set `roleArn`\. For more information, see [Role chaining \(cross\-account access\)](#role-chaining-cross-account-access)\. To retry a request in a second AWS region when the primary region is unavailable, you can set `failoverRegion` or configure failover\. For more information, see [Region failover](#region-failover)\.
 
 To help protect the Workload Credentials Provider, you must include a SSRF token header as part of each request: `X-Aws-Parameters-Secrets-Token`\. The Workload Credentials Provider denies requests that don't have this header or that have an invalid SSRF token\. You can customize the SSRF header name in the [Configuration file](#workload-credentials-provider-config)\.
 
@@ -1077,6 +1078,94 @@ key = "Team"
 role_arn = "arn:aws:iam::987654321098:role/TagRole"
 ```
 
+## Region failover<a name="region-failover"></a>
+
+By default, the Workload Credentials Provider reads secrets from a single AWS region\. With region failover, when Secrets Manager in the primary region returns a server error, times out, can't be reached, or throttles the request, the provider retries the request in a failover region\.
+
+Failover is opt\-in\. If you don't configure failover and don't use the `failoverRegion` query parameter, the provider behaves as before\.
+
+Before you use failover:
++ The secret must exist in the failover region under the same name, with the same value\. [Multi\-region secrets](https://docs.aws.amazon.com/secretsmanager/latest/userguide/replicate-secrets.html) keep the replica in sync for you\. If you replicate secrets yourself, you must keep them in sync\.
++ The provider's credentials, and any role you pass in `roleArn`, need `secretsmanager:GetSecretValue` and `secretsmanager:DescribeSecret` in the failover region\. For [credential failover](#region-failover-credentials), they also need the same STS permissions in `default_failover_region` as in the primary region\.
+
+### How the failover region is chosen
+
+Each request uses at most one failover region\. The provider picks it in this order:
+
+1. The `failoverRegion` query parameter on the request\. It works even when failover isn't configured\.
+1. The `secret_to_region_map` entry for the secret\.
+1. `default_failover_region`\.
+
+If none of these is set, the request doesn't fail over\.
+
+`secret_to_region_map` keys are secret ARNs and must match the request's `secretId` exactly\. A request by friendly name doesn't match an ARN key, so it uses `default_failover_region` instead\. Request secrets that have a map entry by their ARN\.
+
+### When the provider fails over
+
+The provider fails over on server errors \(5XX\), timeouts, connection failures, and throttling\. It doesn't fail over on errors that would fail the same way in every region, such as `AccessDeniedException` or `ResourceNotFoundException`\.
+
+If the failover region fails too, by default the provider returns the cached value if it has one, or the primary region's error\. With `refreshNow=true`, it returns the error\.
+
+`operation_timeout_ms` sets the number of milliseconds the provider waits for the primary region before it fails over\. The default is 3000 milliseconds\. It applies only to requests that have a failover region\. Other requests keep their current timeouts\. If your failover region is far from the primary region, consider raising `operation_timeout_ms`\.
+
+### Credential failover \(STS\)<a name="region-failover-credentials"></a>
+
+**Important**  
+Only `default_failover_region` turns on credential failover\. With only `secret_to_region_map` or the `failoverRegion` query parameter, requests can fail when credentials need to be refreshed while STS in the primary region is down\. We recommend setting `default_failover_region`\.
+
+When `default_failover_region` is set and STS in the primary region is down, the provider gets credentials from STS in `default_failover_region` for:
++ Roles in `roleArn`\.
++ The provider's own credentials, if they come from STS\. This is the case with [IAM roles for service accounts \(IRSA\)](https://docs.aws.amazon.com/eks/latest/userguide/iam-roles-for-service-accounts.html) on Amazon EKS, and with an AWS profile that sets `role_arn`\. Other credential sources, such as Amazon EC2 instance metadata, Amazon ECS and EKS Pod Identity credentials, access keys, `credential_process`, IAM Identity Center \(SSO\), and `credentials_file_path`, don't call STS and don't fail over\.
+
+If credentials can't be loaded in either region, the request can fail even when the secret is cached\.
+
+**Throttling** – If a primary STS call is still being retried after throttling when its time runs out, the provider fails over\. If throttling causes frequent failovers, raise `operation_timeout_ms`\.
+
+**Profiles with `role_arn` and a `credential_process` or SSO `source_profile`** – The `source_profile` helper must finish within the STS call's time, which is half of `operation_timeout_ms`, up to 5 seconds\. A slower helper, such as an IAM Roles Anywhere `credential_process`, causes a failover on every credential refresh even when STS is healthy\. Raise `operation_timeout_ms` so the helper fits\.
+
+### Logging<a name="region-failover-logging"></a>
+
+Every failover writes a `WARN` log line that starts with `failover=true`, including throttled STS calls that fail over\. We recommend alarming on repeated failover lines\.
+
+```
+failover=true operation=GetSecretValue secret_id=MySecret primary_region=us-east-1 primary_error="dispatch failure: io error: ..." failover_region=us-west-2 result=ok version_id=EXAMPLE1-90ab-cdef-fedc-ba987EXAMPLE
+```
+
+### Limitations
+
++ An endpoint set with `AWS_ENDPOINT_URL`, `AWS_ENDPOINT_URL_SECRETS_MANAGER` or `AWS_ENDPOINT_URL_STS` overrides the region, so failover doesn't reach another region\. `AWS_ENDPOINT_URL_STS` affects only credential failover\.
++ Secrets with a different name in each region aren't supported\.
++ Failover applies to the Secrets Manager capability only, not to Certificate Management\.
++ On AWS Lambda, a failover can take longer than the default function timeout of 3 seconds\. Set the function timeout to more than `operation_timeout_ms` plus a few seconds, for example 10 seconds at the default `operation_timeout_ms`\.
+
+### Example \- Failover configuration
+
+Setting `default_failover_region` or `secret_to_region_map` turns on failover for Secrets Manager calls\. Only `default_failover_region` also turns on [credential failover](#region-failover-credentials)\. For each option, see [Secrets Manager configuration](#secrets-manager-configuration)\.
+
+```toml
+[capabilities.secrets_manager]
+region = "us-east-1"
+
+[capabilities.secrets_manager.failover]
+default_failover_region = "us-west-2"
+operation_timeout_ms = 3000
+
+[capabilities.secrets_manager.failover.secret_to_region_map]
+"arn:aws:secretsmanager:us-east-1:123456789012:secret:secret-1-AbCdEf" = "eu-west-1"
+"arn:aws:secretsmanager:us-east-1:123456789012:secret:secret-2-GhIjKl" = "ap-northeast-1"
+```
+
+### The `failoverRegion` query parameter
+
+Add `failoverRegion` to a query\-based or path\-based request to set its failover region\. It takes precedence over the configuration\. The value must have the format of a region code, such as `us-west-2`, or the provider returns `400`\.
+
+```sh
+curl -v -H \
+    "X-Aws-Parameters-Secrets-Token: $(</var/run/awssmatoken)" \
+    'http://localhost:2773/secretsmanager/get?secretId=<YOUR_SECRET_ID>&failoverRegion=us-west-2'; \
+    echo
+```
+
 ## Step 4: Retrieve certificates with the Workload Credentials Provider<a name="workload-credentials-provider-acm"></a>
 
 **The following sections describe how to use the Certificate Management capability\.**
@@ -1098,7 +1187,7 @@ To start the Workload Credentials Provider with a custom configuration, create a
 
 The following sections describe the configuration options available for the Workload Credentials Provider\.
 
-**Note:** Previous flat configuration keys for Secrets Manager (e.g., `http_port = 2773` at the root level) are still supported for backward compatibility\. We recommend using the nested configuration format documented below\.
+**Note:** Previous flat configuration keys for Secrets Manager (e.g., `http_port = 2773` at the root level) are still supported for backward compatibility\. We recommend using the nested configuration format documented below\. A file can't mix the two formats: if it has nested sections, a root\-level key or section, such as `[prefetch]` or `[failover]`, fails validation\.
 
 ### Common configuration
 
@@ -1125,6 +1214,7 @@ region = "us-east-1"
 path_prefix = "/v1/"
 max_conn = 800
 max_roles = 20
+ignore_transient_errors = true
 
 [capabilities.secrets_manager.cache]
 ttl_seconds = 300
@@ -1140,6 +1230,11 @@ max_jitter_seconds = 5
 secrets = [
   { secret_id = "arn:aws:secretsmanager:us-west-2:123456789012:secret:MySecret-AbCdEf" },
 ]
+
+[capabilities.secrets_manager.failover]
+default_failover_region = "us-west-2"
+operation_timeout_ms = 3000
+secret_to_region_map = { "arn:aws:secretsmanager:us-east-1:123456789012:secret:MySecret-AbCdEf" = "eu-west-1" }
 ```
 
 + **enabled** – Whether the Secrets Manager capability is active: `true` or `false`\. The default is `true`\.
@@ -1148,11 +1243,15 @@ secrets = [
 + **path\_prefix** – The URI prefix used to determine if the request is a path based request\. The default is "/v1/"\.
 + **max\_conn** – The maximum number of connections from HTTP clients that the Workload Credentials Provider allows, in the range 1 to 1000\. The default is 800\.
 + **max\_roles** – The maximum number of IAM roles the Workload Credentials Provider can assume simultaneously for cross\-account access, in the range 1 to 20\. The default is 20\. For more information, see [Role chaining \(cross\-account access\)](#role-chaining-cross-account-access)\.
++ **ignore\_transient\_errors** – Whether to return the cached value when a refresh fails with a transient error \(a 5XX error, timeout, connection failure, or throttling\): `true` or `false`\. The default is `true`\. While the errors last, the cached value's TTL is renewed, so a rotated secret isn't picked up until Secrets Manager recovers\.
 + **ttl\_seconds** – The TTL in seconds for the cached items, in the range 0 to 3600\. The default is 300\. 0 indicates that there is no caching\.
 + **cache\_size** – The maximum number of secrets that can be stored in the cache, in the range 1 to 1000\. The default is 1000\.
 + **ssrf\_headers** – A list of header names the Workload Credentials Provider checks for the SSRF token\. The default is "X\-Aws\-Parameters\-Secrets\-Token, X\-Vault\-Token"\.
 + **ssrf\_env\_variables** – A list of environment variable names the Workload Credentials Provider checks in sequential order for the SSRF token\. The environment variable can contain the token or a reference to the token file as in: `AWS_TOKEN=file:///var/run/awssmatoken`\. The default is "AWS\_TOKEN, AWS\_SESSION\_TOKEN, AWS\_CONTAINER\_AUTHORIZATION\_TOKEN"\.
 + **credentials\_file\_path** – The path to a file containing AWS credentials in the standard AWS credentials file format\. When set, the provider reads credentials from this file instead of using the default SDK credential provider chain\. The provider automatically reloads credentials when the file changes, making it compatible with credential rotation systems such as [IAM Roles Anywhere](https://docs.aws.amazon.com/rolesanywhere/latest/userguide/introduction.html) that deliver refreshed credentials to the filesystem\. This parameter is optional\.
++ **default\_failover\_region** – The AWS region to fail over to for secrets without a `secret_to_region_map` entry\. It can't be empty or equal to `region`\. This is the only option that turns on [credential failover](#region-failover-credentials)\. There is no default\. For more information, see [Region failover](#region-failover)\.
++ **operation\_timeout\_ms** – The longest a primary call can take, in milliseconds, before the provider fails over, in the range 2000 to 25000\. The default is 3000\. Applies only to requests that have a failover region\.
++ **secret\_to\_region\_map** – Per\-secret failover regions, keyed by secret ARN\. An entry replaces `default_failover_region` for that secret\. Each region can't be empty or equal to `region`\.
 
 ### Certificate Management configuration
 
@@ -1325,11 +1424,15 @@ The provider itself doesn't send logs to Secrets Manager, ACM, CloudTrail, or Cl
 
 You can configure logging in the [Configuration file](#workload-credentials-provider-config)\. 
 
+Region failover writes a `WARN` line that starts with `failover=true` each time it fails over\. For an example, see [Region failover logging](#region-failover-logging)\.
+
 ## Security considerations<a name="workload-credentials-provider-security"></a>
 
 For a local provider architecture, the domain of trust is where the provider endpoint, SSRF token, and credential outputs (such as certificate files) are accessible, which is usually the entire host\. The domain of trust for the Workload Credentials Provider should match the domain where the AWS credentials are available in order to maintain the same security posture\. For example, on Amazon EC2 the domain of trust for the Workload Credentials Provider would be the same as the domain of the credentials when using roles for Amazon EC2\.
 
 Security conscious applications that are not already using a similar solution with the Secrets Manager credentials locked down to the application should consider using the language\-specific AWS SDKs or caching solutions\. For more information, see [Get secrets](https://docs.aws.amazon.com/secretsmanager/latest/userguide/retrieving-secrets.html)\.
+
+With [region failover](#region-failover), any local caller that holds the SSRF token can send the provider's signed Secrets Manager calls to any region by setting `failoverRegion`\. This is the same trust boundary that already lets that caller read any secret the provider can access\. To keep calls in approved regions, use IAM conditions such as `aws:RequestedRegion`\.
 
 For the Certificate Management capability, the provider runs as a dedicated system user with no login shell\. On Linux, it uses `CAP_DAC_OVERRIDE` to write certificate files without requiring root, and executes refresh commands via `sudo -n` with a generated sudoers entry that permits only the exact configured commands\. Private key files are written with `0600` permissions by default\. All configured paths must be absolute, and paths containing symlinks or traversal components are rejected\. The provider's base credentials only need `sts:AssumeRole`, while `acm:ExportCertificate` is scoped to a separate role\. For environments where elevated privileges are not acceptable, the install script supports `--no-privileges` and `--no-sudoers` modes\.
 
@@ -1364,13 +1467,15 @@ Your AWS credentials must have the following permissions:
 
 ### Required IAM Roles (for role chaining tests)
 
-The role chaining integration tests require two IAM roles in the same account:
+The role chaining and region failover integration tests require two IAM roles in the same account:
 
 1. **`asm-role-chaining-role`** — Must be assumable by the test runner's identity and have `secretsmanager:GetSecretValue`, `secretsmanager:DescribeSecret`, and `secretsmanager:BatchGetSecretValue` permissions.
 
 2. **`provider-no-access-role`** — Must be assumable by the test runner's identity but have *no* Secrets Manager permissions. Used to verify access-denied behavior.
 
 Both roles must have a trust policy that allows the identity running the tests to call `sts:AssumeRole`. The account ID is discovered automatically via `sts:GetCallerIdentity`.
+
+The region failover tests need no second region set up. They start the provider with its primary region set to `us-fake-1`, a region that doesn't exist, so every primary call fails, and the test runner's own region serves as the failover region.
 
 ### Running Tests
 
@@ -1411,3 +1516,5 @@ The integration tests are organized into the following modules:
 - **`prefetch.rs`** - Tests pre\-fetching secrets into the cache at startup, including explicit secrets, tag\-based discovery, inline TOML syntax, cross\-account pre\-fetching via role chaining, and resilience to nonexistent secrets
 - **`certificate_provider.rs`** - Tests the Certificate Management capability including certificate export, file writing, fullchain mode, refresh command execution, and file permission configuration
 - **`file_credentials.rs`** - Tests file\-based credential loading including valid/invalid/missing credentials, session token gate enforcement \(rejecting credentials that lack `aws_session_token` to prevent use of long\-term IAM User keys\), self\-healing \(credentials appearing after startup\), and credential rotation
+- **`sm_failover.rs`** - Tests Secrets Manager region failover, including failover on a cache miss, a cache refresh, and `refreshNow`, the `failoverRegion` query parameter and its format check, `secret_to_region_map`, no failover when failover isn't configured or the secret isn't found, both regions down with and without `refreshNow`, pre\-fetch while the primary region is down, failover of the provider's own credentials from STS, and no failover for a slow `credential_process` while the primary region is healthy
+- **`role_failover.rs`** - Tests role credential failover for `roleArn` requests, including STS and Secrets Manager failing over together, no failover when failover isn't configured, both STS regions down, no failover on access denied or a healthy primary, a failover region that denies the secret read, file\-based credentials, a configured `region` that differs from the SDK region, ARN rewriting, serving the cached value when every region is down, and no STS failover with only the query parameter or `secret_to_region_map`

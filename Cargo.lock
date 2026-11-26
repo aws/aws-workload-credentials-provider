@@ -732,6 +732,7 @@ dependencies = [
  "aws-smithy-runtime",
  "aws-smithy-runtime-api",
  "aws-smithy-types",
+ "aws-types",
  "aws_secretsmanager_caching",
  "aws_workload_credentials_provider_common",
  "bytes",

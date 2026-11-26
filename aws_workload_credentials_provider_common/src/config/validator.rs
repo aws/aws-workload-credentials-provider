@@ -13,7 +13,8 @@ use super::error::{ErrorCollector, ValidationError, ValidationErrorCode, Validat
 use super::error_messages::{
     BAD_MAX_CONN_MSG, BAD_MAX_ROLES_MSG, BAD_PREFIX_MSG, EMPTY_ENV_LIST_MSG, EMPTY_SSRF_LIST_MSG,
     FLAT_KEY_WITH_CAPABILITIES_ERR_MSG, INVALID_CACHE_BUFFER_RATIO_MSG, INVALID_CACHE_SIZE_ERR_MSG,
-    INVALID_HTTP_PORT_ERR_MSG, INVALID_MAX_JITTER_MSG, INVALID_TTL_SECONDS_ERR_MSG,
+    INVALID_FAILOVER_REGION_MSG, INVALID_HTTP_PORT_ERR_MSG, INVALID_MAX_JITTER_MSG,
+    INVALID_OPERATION_TIMEOUT_MSG, INVALID_TTL_SECONDS_ERR_MSG,
     MISSING_REFRESH_COMMAND_FOR_WATCHER_ERR_MSG,
 };
 use super::field_validators::{
@@ -23,9 +24,10 @@ use super::field_validators::{
 };
 use super::types::{
     AcmConfig, AcmConfigInput, CapabilitiesConfig, CertificateConfig, CertificateConfigInput,
-    ConfigInput, LogLevel, LoggingConfig, LoggingConfigInput, PrefetchConfig, PrefetchConfigInput,
-    SecretPrefetchConfig, SecretsManagerConfig, SecretsManagerConfigInput, TagFilter,
-    ValidatedConfig, DEFAULT_WATCHER_CONFIG_DIR, DEFAULT_WATCHER_REQUESTS_DIR,
+    ConfigInput, FailoverConfig, FailoverConfigInput, LogLevel, LoggingConfig, LoggingConfigInput,
+    PrefetchConfig, PrefetchConfigInput, SecretPrefetchConfig, SecretsManagerConfig,
+    SecretsManagerConfigInput, TagFilter, ValidatedConfig, DEFAULT_WATCHER_CONFIG_DIR,
+    DEFAULT_WATCHER_REQUESTS_DIR,
 };
 use super::watcher_config;
 use crate::filesystem::{FileSystem, RealFileSystem};
@@ -228,6 +230,16 @@ impl<F: FileSystem> ConfigValidator<F> {
             "capabilities.secrets_manager.credentials_file_path",
         );
         reject(
+            "prefetch",
+            config_file.prefetch.is_some(),
+            "capabilities.secrets_manager.prefetch",
+        );
+        reject(
+            "failover",
+            config_file.failover.is_some(),
+            "capabilities.secrets_manager.failover",
+        );
+        reject(
             "log_level",
             config_file.log_level.is_some(),
             "logging.log_level",
@@ -407,6 +419,15 @@ impl<F: FileSystem> ConfigValidator<F> {
             );
         }
 
+        if let Some(failover_input) = secrets_manager_config_input.failover {
+            secrets_manager_config.failover = Self::validate_failover_config(
+                "capabilities.secrets_manager.failover",
+                failover_input,
+                secrets_manager_config.region.as_deref(),
+                collector,
+            );
+        }
+
         secrets_manager_config
     }
 
@@ -495,6 +516,61 @@ impl<F: FileSystem> ConfigValidator<F> {
                 role_arn: s.role_arn,
             })
             .collect();
+
+        config
+    }
+
+    /// Validate failover configuration fields.
+    fn validate_failover_config(
+        prefix: &str,
+        input: FailoverConfigInput,
+        primary_region: Option<&str>,
+        collector: &mut ErrorCollector,
+    ) -> FailoverConfig {
+        let mut config = FailoverConfig::default();
+
+        // A failover region must be set and differ from the primary region.
+        let is_usable_region = |region: &str| !region.is_empty() && Some(region) != primary_region;
+
+        if let Some(timeout) = input.operation_timeout_ms {
+            // The minimum leaves room for a credential refresh, which runs inside the same timeout
+            match RangeValidator::validate_range(
+                &format!("{}.operation_timeout_ms", prefix),
+                timeout as usize,
+                2000,
+                25000,
+                INVALID_OPERATION_TIMEOUT_MSG,
+            ) {
+                Ok(()) => config.operation_timeout_ms = timeout,
+                Err(e) => collector.add(e),
+            }
+        }
+
+        if let Some(region) = input.default_failover_region {
+            if is_usable_region(&region) {
+                config.default_failover_region = Some(region);
+            } else {
+                collector.add(ValidationError::with_guidance(
+                    format!("{}.default_failover_region", prefix),
+                    ValidationErrorCode::InvalidValue,
+                    INVALID_FAILOVER_REGION_MSG.to_string(),
+                    format!("Got: '{}'", region),
+                ));
+            }
+        }
+
+        for (arn, region) in input.secret_to_region_map {
+            if is_usable_region(&region) {
+                config.secret_to_region_map.insert(arn, region);
+            } else {
+                collector.add(ValidationError::with_guidance(
+                    format!("{}.secret_to_region_map.{}", prefix, arn),
+                    ValidationErrorCode::InvalidValue,
+                    INVALID_FAILOVER_REGION_MSG.to_string(),
+                    format!("Got: '{}'", region),
+                ));
+            }
+        }
 
         config
     }
@@ -640,6 +716,15 @@ impl<F: FileSystem> ConfigValidator<F> {
         if let Some(prefetch_input) = config_file.prefetch.clone() {
             secrets_manager_config.prefetch =
                 Self::validate_prefetch_config("prefetch", prefetch_input, collector);
+        }
+
+        if let Some(failover_input) = config_file.failover.clone() {
+            secrets_manager_config.failover = Self::validate_failover_config(
+                "failover",
+                failover_input,
+                secrets_manager_config.region.as_deref(),
+                collector,
+            );
         }
 
         secrets_manager_config
@@ -1445,10 +1530,33 @@ mod tests {
             assert_eq!(config.secrets_manager.prefetch.cache_buffer_ratio, 0.8);
             assert_eq!(config.secrets_manager.prefetch.max_jitter_seconds, 0);
         }
+
+        // A legacy [failover] section is read when the whole config uses flat keys.
+        #[test]
+        fn test_failover_valid_legacy() {
+            let validator = ConfigValidator::with_filesystem(mock_fs());
+            let toml = r#"
+                region = "us-east-1"
+
+                [failover]
+                default_failover_region = "us-west-2"
+            "#;
+            let result = validator.validate_toml_config_str(toml);
+            assert!(result.is_ok(), "Errors: {}", result.unwrap_err());
+            let failover = result.unwrap().secrets_manager.failover;
+            assert!(failover.is_enabled());
+            assert_eq!(
+                failover.default_failover_region,
+                Some("us-west-2".to_string())
+            );
+        }
     }
 
     mod nested_secrets_manager {
         use super::*;
+
+        const ARN_1: &str = "arn:aws:secretsmanager:us-east-1:123456789012:secret:secret-1-AbCdEf";
+        const ARN_2: &str = "arn:aws:secretsmanager:us-east-1:123456789012:secret:secret-2-GhIjKl";
 
         #[test]
         fn test_valid_all_fields() {
@@ -1602,6 +1710,194 @@ mod tests {
                 .errors
                 .iter()
                 .any(|e| e.code == ValidationErrorCode::InvalidValue));
+        }
+
+        // No failover section leaves failover disabled with the default timeout.
+        #[test]
+        fn test_failover_defaults() {
+            let validator = ConfigValidator::with_filesystem(mock_fs());
+            let toml = r#"
+                [capabilities.secrets_manager]
+                region = "us-east-1"
+            "#;
+            let config = validator.validate_toml_config_str(toml).unwrap();
+            let failover = &config.secrets_manager.failover;
+            assert!(!failover.is_enabled());
+            assert_eq!(failover.operation_timeout_ms, 3000);
+        }
+
+        // A full failover section is read into FailoverConfig.
+        #[test]
+        fn test_failover_valid_nested() {
+            let validator = ConfigValidator::with_filesystem(mock_fs());
+            let toml = format!(
+                r#"
+                [capabilities.secrets_manager]
+                region = "us-east-1"
+
+                [capabilities.secrets_manager.failover]
+                default_failover_region = "us-west-2"
+                operation_timeout_ms = 2000
+
+                [capabilities.secrets_manager.failover.secret_to_region_map]
+                "{ARN_1}" = "eu-west-1"
+                "{ARN_2}" = "ap-northeast-1"
+            "#
+            );
+            let result = validator.validate_toml_config_str(&toml);
+            assert!(result.is_ok(), "Errors: {}", result.unwrap_err());
+            let failover = result.unwrap().secrets_manager.failover;
+            assert!(failover.is_enabled());
+            assert_eq!(
+                failover.default_failover_region,
+                Some("us-west-2".to_string())
+            );
+            assert_eq!(failover.operation_timeout_ms, 2000);
+            assert_eq!(failover.secret_to_region_map[ARN_1], "eu-west-1");
+            assert_eq!(failover.secret_to_region_map[ARN_2], "ap-northeast-1");
+        }
+
+        // A misspelled key fails the whole config instead of silently leaving failover disabled.
+        #[test]
+        fn test_failover_unknown_key_rejected() {
+            let validator = ConfigValidator::with_filesystem(mock_fs());
+            let toml = r#"
+                [capabilities.secrets_manager]
+                region = "us-east-1"
+
+                [capabilities.secrets_manager.failover]
+                default_failover_regoin = "us-west-2"
+            "#;
+            let errors = validator.validate_toml_config_str(toml).unwrap_err();
+            assert_eq!(errors.len(), 1);
+            assert_eq!(errors.errors[0].code, ValidationErrorCode::TomlSyntaxError);
+        }
+
+        // An empty default failover region, or one that matches the primary region, is rejected.
+        #[test]
+        fn test_failover_unusable_default_region_rejected() {
+            let validator = ConfigValidator::with_filesystem(mock_fs());
+            for region in ["", "us-east-1"] {
+                let toml = format!(
+                    r#"
+                    [capabilities.secrets_manager]
+                    region = "us-east-1"
+
+                    [capabilities.secrets_manager.failover]
+                    default_failover_region = "{region}"
+                "#
+                );
+                let errors = validator.validate_toml_config_str(&toml).unwrap_err();
+                assert_eq!(errors.len(), 1, "{region}");
+                assert_eq!(errors.errors[0].code, ValidationErrorCode::InvalidValue);
+                assert_eq!(
+                    errors.errors[0].field,
+                    "capabilities.secrets_manager.failover.default_failover_region"
+                );
+            }
+        }
+
+        // An unusable per-secret region is reported against its ARN; usable entries are not.
+        #[test]
+        fn test_failover_unusable_map_region_rejected() {
+            let validator = ConfigValidator::with_filesystem(mock_fs());
+            let toml = format!(
+                r#"
+                [capabilities.secrets_manager]
+                region = "us-east-1"
+
+                [capabilities.secrets_manager.failover.secret_to_region_map]
+                "{ARN_1}" = "eu-west-1"
+                "{ARN_2}" = "us-east-1"
+            "#
+            );
+            let errors = validator.validate_toml_config_str(&toml).unwrap_err();
+            assert_eq!(errors.len(), 1);
+            assert_eq!(errors.errors[0].code, ValidationErrorCode::InvalidValue);
+            assert_eq!(
+                errors.errors[0].field,
+                format!("capabilities.secrets_manager.failover.secret_to_region_map.{ARN_2}")
+            );
+        }
+
+        // Per-secret failover regions enable failover without a default failover region.
+        #[test]
+        fn test_failover_map_without_default() {
+            let validator = ConfigValidator::with_filesystem(mock_fs());
+            let toml = format!(
+                r#"
+                [capabilities.secrets_manager]
+                region = "us-east-1"
+
+                [capabilities.secrets_manager.failover.secret_to_region_map]
+                "{ARN_1}" = "eu-west-1"
+            "#
+            );
+            let result = validator.validate_toml_config_str(&toml);
+            assert!(result.is_ok(), "Errors: {}", result.unwrap_err());
+            let failover = result.unwrap().secrets_manager.failover;
+            assert!(failover.is_enabled());
+            assert_eq!(failover.default_failover_region, None);
+            assert_eq!(failover.secret_to_region_map[ARN_1], "eu-west-1");
+        }
+
+        // The operation timeout accepts 2000 to 25000; anything outside is rejected.
+        #[test]
+        fn test_failover_operation_timeout_bounds() {
+            let validator = ConfigValidator::with_filesystem(mock_fs());
+            for (value, valid) in [
+                (2000, true),
+                (25000, true),
+                (1999, false),
+                (100, false),
+                (25001, false),
+            ] {
+                let toml = format!(
+                    r#"
+                    [capabilities.secrets_manager]
+                    region = "us-east-1"
+
+                    [capabilities.secrets_manager.failover]
+                    default_failover_region = "us-west-2"
+                    operation_timeout_ms = {value}
+                "#
+                );
+                match validator.validate_toml_config_str(&toml) {
+                    Ok(config) => {
+                        assert!(valid, "{value} should be rejected");
+                        assert_eq!(config.secrets_manager.failover.operation_timeout_ms, value);
+                    }
+                    Err(errors) => {
+                        assert!(!valid, "{value} should be accepted: {errors}");
+                        assert_eq!(errors.errors[0].code, ValidationErrorCode::ValueOutOfRange);
+                    }
+                }
+            }
+        }
+
+        // A non-integer operation timeout fails TOML parsing.
+        #[test]
+        fn test_failover_operation_timeout_not_an_integer() {
+            let validator = ConfigValidator::with_filesystem(mock_fs());
+            for value in [r#""abc""#, "2000.5", "true"] {
+                let toml = format!(
+                    r#"
+                    [capabilities.secrets_manager]
+                    region = "us-east-1"
+
+                    [capabilities.secrets_manager.failover]
+                    default_failover_region = "us-west-2"
+                    operation_timeout_ms = {value}
+                "#
+                );
+                let errors = validator.validate_toml_config_str(&toml).unwrap_err();
+                assert_eq!(errors.len(), 1, "{value}");
+                assert_eq!(
+                    errors.errors[0].code,
+                    ValidationErrorCode::TomlSyntaxError,
+                    "{value}"
+                );
+            }
         }
     }
 
@@ -2747,6 +3043,40 @@ mod tests {
             let errors = result.unwrap_err();
             assert!(errors.errors.iter().any(|e| e.field == "log_level"));
             assert!(errors.errors.iter().any(|e| e.field == "http_port"));
+        }
+
+        // A root [failover] next to nested config is rejected instead of being silently ignored.
+        #[test]
+        fn test_flat_failover_with_nested_rejected() {
+            let validator = ConfigValidator::with_filesystem(mock_fs());
+            let toml = r#"
+                [capabilities.secrets_manager]
+                region = "us-east-1"
+
+                [failover]
+                default_failover_region = "us-west-2"
+            "#;
+            let errors = validator.validate_toml_config_str(toml).unwrap_err();
+            assert_eq!(errors.len(), 1);
+            assert_eq!(errors.errors[0].field, "failover");
+            assert_eq!(errors.errors[0].code, ValidationErrorCode::FormatConflict);
+        }
+
+        // A root [prefetch] next to nested config is rejected instead of being silently ignored.
+        #[test]
+        fn test_flat_prefetch_with_nested_rejected() {
+            let validator = ConfigValidator::with_filesystem(mock_fs());
+            let toml = r#"
+                [capabilities.secrets_manager]
+                region = "us-east-1"
+
+                [prefetch]
+                secrets = [{ secret_id = "MySecret" }]
+            "#;
+            let errors = validator.validate_toml_config_str(toml).unwrap_err();
+            assert_eq!(errors.len(), 1);
+            assert_eq!(errors.errors[0].field, "prefetch");
+            assert_eq!(errors.errors[0].code, ValidationErrorCode::FormatConflict);
         }
 
         #[test]
