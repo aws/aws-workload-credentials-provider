@@ -819,6 +819,15 @@ fn nt_open_relative(parent: &File, name: &OsStr, directory: bool) -> io::Result<
             0,
         )
     };
+    // `RtlNtStatusToDosError` maps this to `ERROR_ACCESS_DENIED`, which can't
+    // be told apart from a real permission failure.
+    const STATUS_FILE_IS_A_DIRECTORY: i32 = 0xC000_00BA_u32 as i32;
+    if status == STATUS_FILE_IS_A_DIRECTORY {
+        return Err(io::Error::new(
+            io::ErrorKind::IsADirectory,
+            "the name is a directory",
+        ));
+    }
     if status < 0 {
         let error = unsafe { RtlNtStatusToDosError(status) };
         return Err(io::Error::from_raw_os_error(error as i32));
@@ -887,7 +896,13 @@ fn open_outbox(requests_dir: &Path, watcher_id: &str) -> io::Result<OpenOutbox> 
 
 #[cfg(windows)]
 fn open_status(directory: &File, name: &OsStr, _path: &Path) -> Result<File, StatusReadError> {
-    let file = open_relative_status(directory, name).map_err(StatusReadError::Io)?;
+    let file = open_relative_status(directory, name).map_err(|error| {
+        if error.kind() == io::ErrorKind::IsADirectory {
+            StatusReadError::Directory
+        } else {
+            StatusReadError::Io(error)
+        }
+    })?;
     let directory_path = final_path(directory).map_err(StatusReadError::Io)?;
     let file_path = final_path(&file).map_err(StatusReadError::Io)?;
     // A link out of the outbox: never readable, so not retried.
