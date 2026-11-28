@@ -3,6 +3,8 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use aws_workload_credentials_provider_common::refresh_executor::MAX_STARTUP_HOLD;
+
 use log::warn;
 
 use aws_workload_credentials_provider_common::config::watcher_config::WATCHER_CONFIG_FILE_NAME;
@@ -18,6 +20,7 @@ use crate::error::{InboxCheckError, StartupError};
 /// The watcher's sibling of `inbox/`. Watcher implementation detail: the ACM
 /// provider never uses it.
 const WATCHER_PENDING_SUBDIR: &str = "pending";
+const WATCHER_OUTBOX_SUBDIR: &str = "outbox";
 
 /// Identity of the watcher this process is.
 pub const WATCHER_ID_VAR: &str = "WCP_WATCHER_ID";
@@ -37,12 +40,6 @@ pub const STARTUP_HOLD_MS_VAR: &str = "WCP_WATCHER_STARTUP_HOLD_MS";
 /// Smallest accepted [`STARTUP_HOLD_MS_VAR`]: release held requests
 /// immediately, with no startup window at all.
 pub const MIN_STARTUP_HOLD: Duration = Duration::from_millis(0);
-
-/// Largest accepted [`STARTUP_HOLD_MS_VAR`].
-///
-/// Five minutes: well past any plausible TLS server start, and short enough
-/// that a mistyped value cannot park a genuine renewal for an hour.
-pub const MAX_STARTUP_HOLD: Duration = Duration::from_secs(300);
 
 /// Where this watcher reads its configuration and its requests.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,7 +131,8 @@ impl WatcherEnv {
             .join(WATCHER_CONFIG_FILE_NAME)
     }
 
-    /// `<requests_dir>/<watcher_id>`, the parent of `inbox/` and `pending/`.
+    /// `<requests_dir>/<watcher_id>`, the parent of `inbox/`, `pending/` and
+    /// `outbox/`.
     pub fn watcher_requests_dir(&self) -> PathBuf {
         self.requests_dir.join(&self.watcher_id)
     }
@@ -145,6 +143,15 @@ impl WatcherEnv {
     /// Created by the watcher at startup if missing.
     pub fn inbox_dir(&self) -> PathBuf {
         inbox_path(&self.requests_dir, &self.watcher_id)
+    }
+
+    /// `<requests_dir>/<watcher_id>/outbox`, where the watcher writes status
+    /// records for WCP to consume.
+    ///
+    /// Created and validated by the watcher at startup. The ACM provider reads
+    /// and deletes records in this shared directory.
+    pub fn outbox_dir(&self) -> PathBuf {
+        self.watcher_requests_dir().join(WATCHER_OUTBOX_SUBDIR)
     }
 
     /// `<requests_dir>/<watcher_id>/pending`, where the watcher keeps the
@@ -242,6 +249,12 @@ impl WatcherEnv {
     /// The same checks on `<requests_dir>/<watcher_id>/pending`.
     pub fn verify_pending_leaf(&self, filesystem: &impl FileSystem) -> Result<(), InboxCheckError> {
         check_leaf(filesystem, self.pending_dir())
+    }
+
+    /// The checks on `<requests_dir>/<watcher_id>/outbox`, which the watcher
+    /// writes and the ACM provider consumes.
+    pub fn verify_outbox_leaf(&self, filesystem: &impl FileSystem) -> Result<(), InboxCheckError> {
+        check_leaf(filesystem, self.outbox_dir())
     }
 }
 
@@ -701,6 +714,12 @@ mod tests {
             Path::new(DEFAULT_WATCHER_REQUESTS_DIR)
                 .join(TEST_WATCHER_ID)
                 .join("pending")
+        );
+        assert_eq!(
+            resolved.outbox_dir(),
+            Path::new(DEFAULT_WATCHER_REQUESTS_DIR)
+                .join(TEST_WATCHER_ID)
+                .join("outbox")
         );
     }
 

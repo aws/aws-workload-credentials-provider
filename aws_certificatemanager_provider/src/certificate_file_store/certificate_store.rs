@@ -119,7 +119,8 @@ impl UpdateStoreFile for CertificateFileStore {
     /// writes to temp all input paths and contents. then atomic renames overwriting existing paths with created temp files
     ///
     /// Immediately returns error on the first filesystem error.
-    /// If this happens during the rename process some files may be updated and some left as is
+    /// If this happens during the rename process some files may be updated and some left as is,
+    /// reported as `StoreError::PartialUpdate` when at least one file was already replaced
     /// Temp files will be cleaned up regardless
     fn update_store_files(
         &self,
@@ -134,9 +135,14 @@ impl UpdateStoreFile for CertificateFileStore {
         }
         let changed = temps.iter().any(|t| t.is_some());
         // Rename temp files to final locations
+        let mut replaced = false;
         for (i, temp) in temps.iter().enumerate() {
             if let Some(t) = temp {
-                self.atomic_rename(&t.path, paths_contents[i].0)?;
+                match self.atomic_rename(&t.path, paths_contents[i].0) {
+                    Ok(()) => replaced = true,
+                    Err(e) if replaced => return Err(StoreError::PartialUpdate(Box::new(e))),
+                    Err(e) => return Err(e),
+                }
             }
         }
         Ok(changed)
@@ -1018,7 +1024,65 @@ mod tests {
             )],
             false,
         );
-        assert!(result.is_err());
+        // Nothing was replaced, so the error is not a partial update.
+        assert!(matches!(result, Err(StoreError::Io(_))));
+    }
+
+    /// A mock FileSystem whose first rename succeeds and later renames fail.
+    struct FailSecondRenameFs(std::sync::atomic::AtomicUsize);
+    impl FileSystem for FailSecondRenameFs {
+        fn exists(&self, _: &Path) -> bool {
+            false
+        }
+        fn is_dir(&self, _: &Path) -> bool {
+            false
+        }
+        fn read_to_string(&self, _: &Path) -> std::io::Result<String> {
+            Ok(String::new())
+        }
+        fn write_string_to_temp(&self, _: &Path, _: &str) -> std::io::Result<PathBuf> {
+            Ok(PathBuf::from("/tmp/fake_temp_file"))
+        }
+        fn atomic_rename(&self, _: &Path, _: &Path) -> std::io::Result<()> {
+            match self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                0 => Ok(()),
+                _ => Err(std::io::Error::from(std::io::ErrorKind::StorageFull)),
+            }
+        }
+        fn remove_file(&self, _: &Path) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn canonicalize(&self, path: &Path) -> std::io::Result<PathBuf> {
+            Ok(path.to_path_buf())
+        }
+        fn grant_permissions(&self, _: &Path, _: &PathPermission) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn is_read_only_mount(&self, _: &Path) -> std::io::Result<bool> {
+            Ok(false)
+        }
+    }
+
+    #[test]
+    fn test_update_store_files_reports_partial_update() {
+        let store =
+            CertificateFileStore::new(Box::new(FailSecondRenameFs(Default::default()))).unwrap();
+
+        let result = store.update_store_files(
+            &[
+                (Path::new("/any/cert.pem"), "c", None),
+                (Path::new("/any/key.pem"), "k", None),
+            ],
+            false,
+        );
+        match result {
+            Err(StoreError::PartialUpdate(inner)) => {
+                assert!(
+                    matches!(*inner, StoreError::Io(ref e) if e.kind() == std::io::ErrorKind::StorageFull)
+                );
+            }
+            other => panic!("expected StoreError::PartialUpdate, got: {other:?}"),
+        }
     }
 
     #[test]

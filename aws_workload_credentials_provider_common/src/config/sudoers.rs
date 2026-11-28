@@ -129,6 +129,7 @@ mod tests {
         AcmConfig {
             enabled: true,
             certificates,
+            discovery: None,
             ..Default::default()
         }
     }

@@ -21,13 +21,14 @@
 //! 1. Verify the roots ([`env::WatcherEnv::verify_roots_present`]: config
 //!    read-only, requests read-write), then load and validate the
 //!    configuration. Any failure refuses to start.
-//! 2. Prepare `inbox/` and `pending/`, and recover what a previous run left in
+//! 2. Prepare `inbox/`, `pending/`, and `outbox/`, and recover what a previous run left in
 //!    `pending/` ([`inbox::prepare_startup_state`]).
 //! 3. Watch and scan `inbox/`, holding reloads for the startup hold window
 //!    ([`run::STARTUP_HOLD_WINDOW`]); then each distinct command runs once.
 //! 4. Per request: claim it into `pending/`, run its command (at most one
-//!    reload per command at a time), and delete it when the reload completes,
-//!    successfully or not ([`inbox`]). Windows runs the command through
+//!    reload per command at a time), delete it when the reload completes,
+//!    successfully or not, and write one atomic status file per request
+//!    ([`inbox`] and [`status`]). Windows runs the command through
 //!    `powershell.exe -EncodedCommand`, as EC2 installs do ([`reload`]).
 //! 5. Rescan every [`run::PERIODIC_RESCAN_INTERVAL`], re-verifying the
 //!    directories first ([`env::WatcherEnv::verify_inbox`]). A lost watch is
@@ -38,14 +39,13 @@
 //!
 //! - No heartbeat file: a non-zero exit is the liveness signal.
 //! - The configuration is not watched; a change needs a container restart.
-//! - No `outbox/` handling. `pending/` is the watcher's own directory.
 //! - No retry of a failed reload, and no poison-request handling ([`inbox`]).
 
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use aws_workload_credentials_provider_common::config::types::LogLevel;
+use aws_workload_credentials_provider_common::config::types::{LogLevel, LoggingConfig};
 use aws_workload_credentials_provider_common::filesystem::{FileSystem, RealFileSystem};
 use aws_workload_credentials_provider_common::logging::init_logger;
 use log::{error, info};
@@ -56,6 +56,7 @@ mod inbox;
 mod plan;
 mod reload;
 mod run;
+mod status;
 mod types;
 mod watch;
 
@@ -63,6 +64,7 @@ use crate::env::{FileSystemValidator, WatcherEnv};
 use crate::error::{RunError, StartupError};
 use crate::plan::ReloadPlan;
 use crate::reload::DirectReloadSink;
+use crate::status::FileStatusSink;
 use crate::watch::InboxWatch;
 
 #[tokio::main]
@@ -70,7 +72,9 @@ async fn main() -> ExitCode {
     // Console, not a file: this runs in a container, where stdout and stderr
     // are the log. `log_to_file = false` takes log4rs's console appender and
     // touches no filesystem, so the log directory argument is never used.
-    if let Err(e) = init_logger(LogLevel::Info, false, "wcp_watcher", Path::new(".")) {
+    let mut log_conf = LoggingConfig::default();
+    log_conf.log_to_file = false;
+    if let Err(e) = init_logger(&log_conf, "wcp_watcher", Path::new(".")) {
         eprintln!("wcp-watcher: failed to initialize logging: {e}");
         return ExitCode::FAILURE;
     }
@@ -99,12 +103,14 @@ async fn start() -> Result<(), Box<dyn std::error::Error>> {
     let (plan, mut watch, recovered) = prepare(&env, &RealFileSystem)?;
 
     let sink = Arc::new(DirectReloadSink::new());
+    let status = Arc::new(FileStatusSink::new(env.outbox_dir()));
 
     let result = run::run(
         &env,
         &FileSystemValidator(&RealFileSystem),
         plan,
         sink,
+        status,
         &mut watch,
         recovered,
         wait_for_shutdown(),
@@ -372,6 +378,7 @@ mod tests {
         assert!(recovered.is_empty());
         assert!(fixture.env.inbox_dir().is_dir());
         assert!(fixture.env.pending_dir().is_dir());
+        assert!(fixture.env.outbox_dir().is_dir());
     }
 
     /// A missing `<watcher_id>/` is created, with the inbox and the pending
@@ -387,6 +394,7 @@ mod tests {
         assert!(recovered.is_empty());
         assert!(fixture.env.inbox_dir().is_dir());
         assert!(fixture.env.pending_dir().is_dir());
+        assert!(fixture.env.outbox_dir().is_dir());
     }
 
     #[cfg(unix)]
@@ -405,6 +413,27 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o700, "{mode:o}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_refuses_a_symlinked_outbox_directory() {
+        let fixture = PrepareFixture::new();
+        fixture.write_config(&fixture.valid_config());
+        let elsewhere = fixture.env.requests_dir().join("elsewhere-outbox");
+        fs::create_dir(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, fixture.env.outbox_dir()).unwrap();
+
+        let err = prepare_error(&fixture.env, &fixture.filesystem);
+        assert!(
+            matches!(
+                &err,
+                StartupError::RequestDirInvalid {
+                    source: InboxCheckError::NotCanonical { path, .. },
+                } if *path == fixture.env.outbox_dir()
+            ),
+            "{err}"
+        );
     }
 
     #[test]

@@ -10,7 +10,11 @@ name = "aws-workload-credentials-provider"
 path = "src/main.rs"
 
 [features]
-fips = ["aws_certificatemanager_provider/fips", "aws_secretsmanager_provider/fips"]
+fips = [
+    "aws_certificatemanager_provider/fips",
+    "aws_secretsmanager_provider/fips",
+    "aws_workload_credentials_provider_common/fips",
+]
 
 [dependencies]
 aws_workload_credentials_provider_common = { version = "3.2.0", path = "../aws_workload_credentials_provider_common" }

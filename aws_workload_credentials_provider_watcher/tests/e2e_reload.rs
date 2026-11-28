@@ -35,10 +35,10 @@ use tempfile::TempDir;
 
 use support::namespace::{skip_without_namespaces, MountMode, NamespaceSetup};
 use support::{
-    request_body, request_name, wait_for_empty_pending, wait_for_marker, watcher_config,
-    write_request, ChildGuard, Layout, Transcript, CONFIG_DIR_VAR, READY_TIMEOUT,
-    RECOVERED_ONE_LINE, REQUESTS_DIR_VAR, STARTUP_HOLD_MS, STARTUP_HOLD_MS_VAR, TEST_WATCHER_ID,
-    WATCHER_ID_VAR,
+    assert_outbox_empty, request_body, request_name, wait_for_empty_pending, wait_for_marker,
+    wait_for_status, watcher_config, write_request, ChildGuard, Layout, Transcript, COMMAND_ID,
+    CONFIG_DIR_VAR, READY_TIMEOUT, RECOVERED_ONE_LINE, REQUESTS_DIR_VAR, STARTUP_HOLD_MS,
+    STARTUP_HOLD_MS_VAR, TEST_WATCHER_ID, WATCHER_ID_VAR,
 };
 
 /// How long the watcher sits idle, with no request, before one is written.
@@ -66,6 +66,9 @@ fn a_request_in_the_inbox_makes_the_watcher_binary_run_the_reload_command(
         return Ok(());
     };
 
+    // Startup does not consume or supersede outbox entries.
+    assert_outbox_empty(&watcher.in_child(&watcher.layout.outbox));
+
     // Idle first, so a watcher that spins on its own inbox directory has time
     // to show it. Counted after the reload, below.
     std::thread::sleep(IDLE_WINDOW);
@@ -84,6 +87,13 @@ fn a_request_in_the_inbox_makes_the_watcher_binary_run_the_reload_command(
     );
     // Deleted on complete: gone from `pending/` once the reload has finished.
     watcher.wait_for_empty_pending();
+    let status = watcher.wait_for_status();
+    assert_eq!(status["command_id"], support::COMMAND_ID);
+    assert_eq!(status["cert_arn"], support::ARN);
+    assert_eq!(status["request_created_at"], "2024-05-01T12:00:00Z");
+    assert_eq!(status["outcome"], "success");
+    assert_eq!(status["exit_code"], 0);
+    assert!(status["error_detail"].is_null());
 
     // Covers the idle window and the request's own events.
     let unparseable = watcher.log.count(UNPARSEABLE_LINE);
@@ -107,8 +117,13 @@ fn a_request_left_in_pending_is_reloaded_and_deleted_at_startup() -> Result<(), 
         return Ok(());
     };
 
+    // Recovery keeps startup behavior unchanged and does not emit superseded.
+    assert_outbox_empty(&watcher.in_child(&watcher.layout.outbox));
     watcher.wait_for_marker();
     watcher.wait_for_empty_pending();
+    let status = watcher.wait_for_status();
+    assert_eq!(status["outcome"], "success");
+    assert_eq!(status["command_id"], COMMAND_ID);
     assert_eq!(
         watcher.log.count(RECOVERED_ONE_LINE),
         1,
@@ -273,6 +288,10 @@ impl Watcher {
     /// is empty, or fails the test.
     fn wait_for_empty_pending(&self) {
         wait_for_empty_pending(&self.in_child(&self.layout.pending), &self.log);
+    }
+
+    fn wait_for_status(&self) -> serde_json::Value {
+        wait_for_status(&self.in_child(&self.layout.outbox), COMMAND_ID, &self.log)
     }
 
     /// Stops the watcher and prints its transcript, which `--nocapture`

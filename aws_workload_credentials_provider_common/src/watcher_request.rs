@@ -50,6 +50,13 @@ impl RefreshRequest {
         {
             return Some("certificate_arn");
         }
+        // Copied unchanged into the status, whose reader requires RFC 3339 UTC.
+        if !crate::watcher_status::is_valid_timestamp(&self.created_at)
+            || chrono::DateTime::parse_from_rfc3339(&self.created_at)
+                .is_ok_and(|time| time.offset().local_minus_utc() != 0)
+        {
+            return Some("created_at");
+        }
         None
     }
 }
@@ -105,17 +112,65 @@ impl RequestsRoot {
 
 /// Flags for a directory the walk only passes through. On Linux `O_PATH`
 /// needs search permission alone, as a path lookup does, so a provider that
-/// may only search `<watcher_id>/` (mode 0o710) still reaches the inbox.
+/// may only search `<watcher_id>/` (mode 0o710) still reaches the inbox, and
+/// the provider's status scanner the outbox beside it.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-const WALK: rustix::fs::OFlags = rustix::fs::OFlags::PATH;
+pub const WALK: rustix::fs::OFlags = rustix::fs::OFlags::PATH;
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
-const WALK: rustix::fs::OFlags = rustix::fs::OFlags::RDONLY;
+pub const WALK: rustix::fs::OFlags = rustix::fs::OFlags::RDONLY;
 
-/// Writes one refresh request for `certificate_arn` into the inbox of watcher
-/// `watcher_id` under `root` and returns the request's file name. The watcher
-/// owns the inbox, so it must exist. Fails, writing nothing, when a symlink or
-/// (on Windows) a junction sits at `<watcher_id>` or `inbox`.
-pub fn enqueue(root: &RequestsRoot, watcher_id: &str, certificate_arn: &str) -> io::Result<String> {
+/// A request prepared for publication into a watcher's inbox.
+///
+/// Preparation is separate from publication so a provider can register the
+/// command with its in-memory status consumer before the request becomes
+/// visible to the watcher.
+pub struct PreparedRequest {
+    request: RefreshRequest,
+    name: String,
+    body: Vec<u8>,
+}
+
+impl PreparedRequest {
+    /// Returns the exact request body that will be published.
+    pub fn request(&self) -> &RefreshRequest {
+        &self.request
+    }
+
+    /// Returns the exact file name that will be published.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+/// Creates a request without publishing it.
+pub fn prepare_request(certificate_arn: &str) -> io::Result<PreparedRequest> {
+    let now = Utc::now();
+    let request = RefreshRequest {
+        command_id: uuid_v4()?,
+        certificate_arn: certificate_arn.to_string(),
+        created_at: now.to_rfc3339_opts(SecondsFormat::Secs, true),
+    };
+    let name = request_name(
+        now,
+        SEQUENCE.fetch_add(1, Ordering::Relaxed),
+        &request.command_id,
+    );
+    let body = serde_json::to_vec(&request)?;
+    Ok(PreparedRequest {
+        request,
+        name,
+        body,
+    })
+}
+
+/// Publishes a prepared request into the inbox of `watcher_id` under `root`.
+/// The watcher owns the inbox, so it must exist. Fails, writing nothing, when
+/// a symlink or (on Windows) a junction sits at `<watcher_id>` or `inbox`.
+pub fn publish_prepared_request(
+    root: &RequestsRoot,
+    watcher_id: &str,
+    prepared: &PreparedRequest,
+) -> io::Result<()> {
     // The walk refuses a link at each component it opens, so the ID must be
     // exactly one component.
     if validate_watcher_id("watcher_id", watcher_id).is_err() {
@@ -124,17 +179,24 @@ pub fn enqueue(root: &RequestsRoot, watcher_id: &str, certificate_arn: &str) -> 
             "watcher_id is not a valid single path segment",
         ));
     }
-    let now = Utc::now();
-    let command_id = uuid_v4()?;
-    let name = request_name(now, SEQUENCE.fetch_add(1, Ordering::Relaxed), &command_id);
-    let body = serde_json::to_vec(&RefreshRequest {
-        command_id,
-        certificate_arn: certificate_arn.to_string(),
-        created_at: now.to_rfc3339_opts(SecondsFormat::Secs, true),
-    })?;
     let temp = format!(".{}.tmp", hex(&random_bytes()?));
-    write_atomically(root, watcher_id, &temp, &name, &body)?;
-    Ok(name)
+    write_atomically(root, watcher_id, &temp, &prepared.name, &prepared.body)
+}
+
+/// Writes one refresh request and returns the exact request and file name.
+pub fn enqueue_request(
+    root: &RequestsRoot,
+    watcher_id: &str,
+    certificate_arn: &str,
+) -> io::Result<(RefreshRequest, String)> {
+    let prepared = prepare_request(certificate_arn)?;
+    publish_prepared_request(root, watcher_id, &prepared)?;
+    Ok((prepared.request, prepared.name))
+}
+
+/// Writes one refresh request and returns its file name.
+pub fn enqueue(root: &RequestsRoot, watcher_id: &str, certificate_arn: &str) -> io::Result<String> {
+    enqueue_request(root, watcher_id, certificate_arn).map(|(_, name)| name)
 }
 
 /// True when `command_id` is a UUIDv4 in canonical form: 32 hex digits in
@@ -458,6 +520,18 @@ mod tests {
     }
 
     #[test]
+    fn enqueue_request_returns_the_published_request() {
+        let root = tempfile::tempdir().unwrap();
+        let inbox = inbox_path(root.path(), "nginx");
+        std::fs::create_dir_all(&inbox).unwrap();
+
+        let (request, name) = enqueue_request(&open(root.path()), "nginx", ARN).unwrap();
+        let published: RefreshRequest =
+            serde_json::from_slice(&std::fs::read(inbox.join(&name)).unwrap()).unwrap();
+        assert_eq!(request, published);
+        assert!(name.ends_with(&format!("-{}.{REQUEST_EXTENSION}", request.command_id)));
+    }
+    #[test]
     fn the_watcher_reads_back_what_the_provider_writes() {
         let root = tempfile::tempdir().unwrap();
         let inbox = inbox_path(root.path(), "nginx");
@@ -502,9 +576,28 @@ mod tests {
             let request = RefreshRequest {
                 command_id: command_id.to_string(),
                 certificate_arn: certificate_arn.to_string(),
-                created_at: String::new(),
+                created_at: "2025-10-20T17:06:40Z".to_string(),
             };
             assert_eq!(request.invalid_field(), expected);
+        }
+    }
+
+    #[test]
+    fn invalid_field_requires_a_utc_rfc3339_created_at() {
+        let request = |created_at: &str| RefreshRequest {
+            command_id: "00000000-0000-4000-8000-000000000001".to_string(),
+            certificate_arn: ARN.to_string(),
+            created_at: created_at.to_string(),
+        };
+        assert_eq!(request("2025-10-20T17:06:40Z").invalid_field(), None);
+        assert_eq!(request("2025-10-20T17:06:40+00:00").invalid_field(), None);
+        let long = format!("2025-10-20T17:06:40.{}Z", "1".repeat(200));
+        for invalid in ["", "yesterday", "2025-10-20T17:06:40+02:00", long.as_str()] {
+            assert_eq!(
+                request(invalid).invalid_field(),
+                Some("created_at"),
+                "{invalid}"
+            );
         }
     }
 

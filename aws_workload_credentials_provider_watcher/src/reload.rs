@@ -16,25 +16,36 @@
 //!   `common.ps1`, no scheduled task is created: the watcher runs as the
 //!   container user inside the customer's container.
 //!
-//! Both spawn through `common`'s `execute_child_cmd`: killed on drop, bounded
-//! by `REFRESH_COMMAND_TIMEOUT` (15 minutes), and a non-zero exit is an error.
-//! On Windows, PowerShell reports any native non-zero exit as 1, and a native
-//! process it started can outlive a timeout kill.
+//! Both paths spawn with `kill_on_drop(true)`, are bounded by
+//! `REFRESH_COMMAND_TIMEOUT` (15 minutes), and wait only for the command to
+//! exit. Stdout is inherited; stderr is read in its own task, which keeps the
+//! first `MAX_ERROR_DETAIL_BYTES` for the result and the watcher log and
+//! drains the rest, so a background child holding the pipe can't stall the
+//! reload. On Windows, PowerShell reports any native non-zero exit as 1, and
+//! a native process it started can outlive a timeout kill.
 
 use std::future::Future;
 use std::io;
+use std::process::Stdio;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use base64::Engine as _;
+use log::{error, warn};
+use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::process::Command;
+use tokio::time::timeout;
 
-#[cfg(windows)]
-use aws_workload_credentials_provider_common::refresh_executor::execute_child_cmd;
-use aws_workload_credentials_provider_common::refresh_executor::DirectRefreshExecutor;
+use aws_workload_credentials_provider_common::refresh_executor::REFRESH_COMMAND_TIMEOUT;
+
+use crate::status::{cap_error_detail, timestamp_now, MAX_ERROR_DETAIL_BYTES};
+
+/// How long stderr is still read after the command exits, for output that was
+/// written just before exit.
+const STDERR_GRACE: Duration = Duration::from_secs(1);
+
 #[cfg(windows)]
 use log::debug;
-
-// TODO: drop once `DirectRefreshExecutor::execute_argv` lands in `common`.
-#[cfg(not(windows))]
-use crate::types::DirectRefreshExecutorArgv;
 
 /// The program Windows reloads run through, resolved by search as in
 /// `common.ps1`.
@@ -85,12 +96,133 @@ pub fn powershell_args(argv: &[String]) -> io::Result<Vec<String>> {
     ])
 }
 
+/// The broad result of one command execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReloadOutcome {
+    Success,
+    Failure,
+    Timeout,
+}
+
+/// A command result with the data needed by the status protocol.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReloadResult {
+    pub outcome: ReloadOutcome,
+    pub exit_code: Option<i32>,
+    pub error_detail: Option<String>,
+    pub started_at: String,
+    pub completed_at: String,
+}
+
+impl ReloadResult {
+    fn new(
+        outcome: ReloadOutcome,
+        exit_code: Option<i32>,
+        error_detail: Option<String>,
+        started_at: String,
+    ) -> Self {
+        Self {
+            outcome,
+            exit_code,
+            error_detail,
+            started_at,
+            completed_at: timestamp_now(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn success() -> Self {
+        let started_at = timestamp_now();
+        Self::new(ReloadOutcome::Success, Some(0), None, started_at)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn failure(message: &str) -> Self {
+        let started_at = timestamp_now();
+        Self::new(
+            ReloadOutcome::Failure,
+            None,
+            Some(message.to_string()),
+            started_at,
+        )
+    }
+}
+
+/// Reads `pipe` to EOF, keeping the first `MAX_ERROR_DETAIL_BYTES` in `kept`.
+async fn drain_stderr(mut pipe: impl AsyncRead + Unpin, kept: Arc<Mutex<Vec<u8>>>) {
+    let mut chunk = [0u8; 4096];
+    loop {
+        match pipe.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(read) => {
+                let mut kept = kept.lock().unwrap();
+                let room = MAX_ERROR_DETAIL_BYTES.saturating_sub(kept.len());
+                kept.extend_from_slice(&chunk[..read.min(room)]);
+            }
+        }
+    }
+}
+
+/// Runs a prepared command, waiting only for it to exit.
+async fn execute_command(command: Command) -> ReloadResult {
+    execute_command_within(command, REFRESH_COMMAND_TIMEOUT).await
+}
+
+/// [`execute_command`] with the time limit as a parameter, for tests.
+async fn execute_command_within(mut command: Command, limit: std::time::Duration) -> ReloadResult {
+    let started_at = timestamp_now();
+    let program = command.as_std().get_program().to_os_string();
+    command.stdout(Stdio::inherit()).stderr(Stdio::piped());
+
+    let mut child = match command.kill_on_drop(true).spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            error!("Could not start reload command {:?}: {}", program, e);
+            return ReloadResult::new(ReloadOutcome::Failure, None, None, started_at);
+        }
+    };
+    let kept = Arc::new(Mutex::new(Vec::new()));
+    // Detached once the grace period ends, so it keeps draining for a background child.
+    let reader = child
+        .stderr
+        .take()
+        .map(|pipe| tokio::spawn(drain_stderr(pipe, Arc::clone(&kept))));
+
+    let status = match timeout(limit, child.wait()).await {
+        Err(_) => {
+            // What it wrote before the deadline is often why it hung, so it's kept.
+            let stderr = cap_error_detail(&kept.lock().unwrap());
+            warn!(
+                "Reload command {:?} timed out after {:?}; stderr: {}",
+                program,
+                limit,
+                stderr.as_deref().unwrap_or("none")
+            );
+            return ReloadResult::new(ReloadOutcome::Timeout, None, stderr, started_at);
+        }
+        Ok(Err(e)) => {
+            error!("Could not wait for reload command {:?}: {}", program, e);
+            return ReloadResult::new(ReloadOutcome::Failure, None, None, started_at);
+        }
+        Ok(Ok(status)) => status,
+    };
+    if let Some(reader) = reader {
+        let _ = timeout(STDERR_GRACE, reader).await;
+    }
+    let stderr = cap_error_detail(&kept.lock().unwrap());
+    if let Some(stderr) = &stderr {
+        warn!("Reload command {:?} wrote to stderr: {}", program, stderr);
+    }
+
+    let exit_code = status.code();
+    if status.success() {
+        ReloadResult::new(ReloadOutcome::Success, exit_code, None, started_at)
+    } else {
+        ReloadResult::new(ReloadOutcome::Failure, exit_code, stderr, started_at)
+    }
+}
+
 /// Runs reload commands.
-///
-/// Mirrors `common`'s `RefreshExecutor` on purpose — return-position `impl
-/// Future`, so not object-safe, with consumers generic over the concrete type.
-/// It exists so the event loop can be tested without spawning processes, which
-/// is what makes the hold-window and merge tests deterministic.
 pub trait ReloadSink: Send + Sync + 'static {
     /// Runs `command`. `label` names the certificates this reload covers and is
     /// used only in log lines.
@@ -98,22 +230,17 @@ pub trait ReloadSink: Send + Sync + 'static {
         &self,
         command: Vec<String>,
         label: String,
-    ) -> impl Future<Output = Result<(), io::Error>> + Send;
+    ) -> impl Future<Output = ReloadResult> + Send;
 }
 
 /// Runs the command in this container, as the container user, without `sudo`
-/// and without a scheduled task: directly on Unix, through `powershell.exe
-/// -EncodedCommand` on Windows. See the module docs.
-pub struct DirectReloadSink {
-    #[cfg_attr(windows, allow(dead_code))]
-    executor: DirectRefreshExecutor,
-}
+/// and without a scheduled task. Unix runs directly; Windows uses
+/// `powershell.exe -EncodedCommand`.
+pub struct DirectReloadSink;
 
 impl DirectReloadSink {
     pub fn new() -> Self {
-        Self {
-            executor: DirectRefreshExecutor,
-        }
+        Self
     }
 }
 
@@ -125,36 +252,33 @@ impl Default for DirectReloadSink {
 
 impl ReloadSink for DirectReloadSink {
     #[cfg(not(windows))]
-    async fn reload(&self, command: Vec<String>, label: String) -> Result<(), io::Error> {
-        // `execute_argv`, not the `RefreshExecutor::execute` string method: the
-        // command is already an argv array, split by the ACM provider, and
-        // runs as-is.
-        //
-        // The executor's second parameter is named `certificate_arn` but
-        // receives the whole set of ARNs this reload covers, which follows from
-        // merging by command rather than by certificate. It is a log label
-        // either way.
-        //
-        // Bounded by `REFRESH_COMMAND_TIMEOUT` inside the executor, so a hung
-        // reload command cannot wedge this command's slot forever.
-        self.executor.execute_argv(&command, &label).await
+    async fn reload(&self, command: Vec<String>, _label: String) -> ReloadResult {
+        let Some((program, args)) = command.split_first() else {
+            let started_at = timestamp_now();
+            return ReloadResult::new(ReloadOutcome::Failure, None, None, started_at);
+        };
+        let mut cmd = Command::new(program);
+        cmd.args(args);
+        execute_command(cmd).await
     }
 
     #[cfg(windows)]
-    async fn reload(&self, command: Vec<String>, label: String) -> Result<(), io::Error> {
-        // The script is rebuilt from the validated argv, split by the ACM
-        // provider.
-        // Log the plain-text script, never the Base64 value.
-        let script = powershell_script(&command)?;
+    async fn reload(&self, command: Vec<String>, label: String) -> ReloadResult {
+        let started_at = timestamp_now();
+        let script = match powershell_script(&command) {
+            Ok(script) => script,
+            Err(_) => return ReloadResult::new(ReloadOutcome::Failure, None, None, started_at),
+        };
         debug!(
             "Running reload for {label} through {POWERSHELL_PROGRAM} -EncodedCommand: \
              {command:?} as script {script}"
         );
-        let mut cmd = tokio::process::Command::new(POWERSHELL_PROGRAM);
-        cmd.args(powershell_args(&command)?);
-        // Bounded by `REFRESH_COMMAND_TIMEOUT` inside `execute_child_cmd`, so a
-        // hung reload command cannot wedge this command's slot forever.
-        execute_child_cmd(cmd).await
+        let mut cmd = Command::new(POWERSHELL_PROGRAM);
+        match powershell_args(&command) {
+            Ok(args) => cmd.args(args),
+            Err(_) => return ReloadResult::new(ReloadOutcome::Failure, None, None, started_at),
+        };
+        execute_command(cmd).await
     }
 }
 
@@ -283,7 +407,87 @@ mod tests {
         );
     }
 
-    /// Reloads through the real `powershell.exe`, calling the sink directly,
+    #[cfg(unix)]
+    mod execution {
+        use super::*;
+
+        #[tokio::test]
+        async fn successful_execution_captures_exit_code() {
+            let mut command = Command::new("/bin/sh");
+            command.args(["-c", "printf stdout; exit 0"]);
+            let result = execute_command(command).await;
+            assert_eq!(result.outcome, ReloadOutcome::Success);
+            assert_eq!(result.exit_code, Some(0));
+            assert_eq!(result.error_detail, None);
+        }
+
+        #[tokio::test]
+        async fn failed_execution_captures_stderr_and_exit_code() {
+            let mut command = Command::new("/bin/sh");
+            command.args(["-c", "printf stderr >&2; exit 7"]);
+            let result = execute_command(command).await;
+            assert_eq!(result.outcome, ReloadOutcome::Failure);
+            assert_eq!(result.exit_code, Some(7));
+            assert_eq!(result.error_detail.as_deref(), Some("stderr"));
+        }
+
+        #[tokio::test]
+        async fn spawn_failure_has_no_fabricated_error_detail() {
+            let command = Command::new("/no/such/reload-command");
+            let result = execute_command(command).await;
+            assert_eq!(result.outcome, ReloadOutcome::Failure);
+            assert_eq!(result.exit_code, None);
+            assert_eq!(result.error_detail, None);
+        }
+
+        /// A background child holding stderr open doesn't hold the reload.
+        #[tokio::test]
+        async fn background_child_holding_stderr_does_not_delay_success() {
+            let mut command = Command::new("/bin/sh");
+            command.args(["-c", "sleep 30 & exit 0"]);
+            let result = timeout(Duration::from_secs(10), execute_command(command))
+                .await
+                .expect("the reload must finish when the command exits");
+            assert_eq!(result.outcome, ReloadOutcome::Success);
+            assert_eq!(result.exit_code, Some(0));
+        }
+
+        #[tokio::test]
+        async fn stderr_is_capped_while_the_rest_is_drained() {
+            let mut command = Command::new("/bin/sh");
+            command.args(["-c", "head -c 100000 /dev/zero | tr '\\0' x >&2; exit 3"]);
+            let result = execute_command(command).await;
+            assert_eq!(result.outcome, ReloadOutcome::Failure);
+            assert_eq!(result.exit_code, Some(3));
+            let detail = result.error_detail.unwrap();
+            assert!(detail.len() <= MAX_ERROR_DETAIL_BYTES);
+            assert!(detail.starts_with("xxxx"));
+        }
+
+        /// Stderr written before the deadline is kept on a timeout.
+        #[tokio::test]
+        async fn timeout_keeps_the_stderr_written_before_it() {
+            let mut command = Command::new("/bin/sh");
+            command.args(["-c", "printf hung-here >&2; sleep 30"]);
+            let result = execute_command_within(command, Duration::from_secs(2)).await;
+            assert_eq!(result.outcome, ReloadOutcome::Timeout);
+            assert_eq!(result.exit_code, None);
+            assert_eq!(result.error_detail.as_deref(), Some("hung-here"));
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn timeout_returns_timeout_outcome() {
+            let mut command = Command::new("/bin/sleep");
+            command.arg("600");
+            let task = tokio::spawn(execute_command(command));
+            tokio::time::advance(REFRESH_COMMAND_TIMEOUT).await;
+            let result = task.await.unwrap();
+            assert_eq!(result.outcome, ReloadOutcome::Timeout);
+            assert_eq!(result.exit_code, None);
+            assert_eq!(result.error_detail, None);
+        }
+    }
+
     /// so no command validation runs.
     ///
     /// The `.ps1` cases need an ExecutionPolicy that allows local scripts;
@@ -346,7 +550,7 @@ mod tests {
                 .to_string()
         }
 
-        async fn reload(command: Vec<String>) -> io::Result<()> {
+        async fn reload(command: Vec<String>) -> ReloadResult {
             DirectReloadSink::new()
                 .reload(command, "arn:test".to_string())
                 .await
@@ -357,9 +561,12 @@ mod tests {
             let (_tmp, root) = temp_root();
             let marker = root.join("marker");
 
-            reload(argv(&[&cmd_exe(), "/c", "mkdir", &path_arg(&marker)]))
-                .await
-                .expect("cmd.exe should run through powershell.exe");
+            let result = reload(argv(&[&cmd_exe(), "/c", "mkdir", &path_arg(&marker)])).await;
+            assert_eq!(
+                result.outcome,
+                ReloadOutcome::Success,
+                "cmd.exe should run through powershell.exe"
+            );
 
             assert!(marker.is_dir(), "'{}' should exist", marker.display());
         }
@@ -370,9 +577,12 @@ mod tests {
             let script = write_script(&root, MARKER_SCRIPT);
             let marker = root.join("marker.txt");
 
-            reload(argv(&[&path_arg(&script), &path_arg(&marker)]))
-                .await
-                .expect("the .ps1 should run through powershell.exe");
+            let result = reload(argv(&[&path_arg(&script), &path_arg(&marker)])).await;
+            assert_eq!(
+                result.outcome,
+                ReloadOutcome::Success,
+                "the .ps1 should run through powershell.exe"
+            );
 
             assert_eq!(read_marker(&marker), "ok");
         }
@@ -385,9 +595,12 @@ mod tests {
             let script = write_script(&dir, MARKER_SCRIPT);
             let marker = dir.join("marker.txt");
 
-            reload(argv(&[&path_arg(&script), &path_arg(&marker)]))
-                .await
-                .expect("a .ps1 under a spaced path should run");
+            let result = reload(argv(&[&path_arg(&script), &path_arg(&marker)])).await;
+            assert_eq!(
+                result.outcome,
+                ReloadOutcome::Success,
+                "a .ps1 under a spaced path should run"
+            );
 
             assert_eq!(read_marker(&marker), "ok");
         }
@@ -401,9 +614,12 @@ mod tests {
             fs::create_dir(&dir).unwrap();
             let marker = dir.join("marker");
 
-            reload(argv(&[&cmd_exe(), "/c", "mkdir", &path_arg(&marker)]))
-                .await
-                .expect("cmd.exe should run through powershell.exe");
+            let result = reload(argv(&[&cmd_exe(), "/c", "mkdir", &path_arg(&marker)])).await;
+            assert_eq!(
+                result.outcome,
+                ReloadOutcome::Success,
+                "cmd.exe should run through powershell.exe"
+            );
 
             assert!(marker.is_dir(), "'{}' should exist", marker.display());
             assert!(
@@ -429,9 +645,12 @@ mod tests {
                 "the case must exercise the quote doubling: {script_text}"
             );
 
-            reload(command)
-                .await
-                .expect("the quoted .ps1 should run through powershell.exe");
+            let result = reload(command).await;
+            assert_eq!(
+                result.outcome,
+                ReloadOutcome::Success,
+                "the quoted .ps1 should run through powershell.exe: {result:?}"
+            );
 
             assert_eq!(read_marker(&marker), "a  b|it's café");
         }
@@ -440,24 +659,19 @@ mod tests {
         /// 3 here is lost. See the module docs.
         #[tokio::test]
         async fn a_native_non_zero_exit_is_reported_as_exit_code_1() {
-            let err = reload(argv(&[&cmd_exe(), "/c", "exit", "3"]))
-                .await
-                .expect_err("a non-zero exit must be an error");
-
-            assert_eq!(err.kind(), io::ErrorKind::Other, "{err}");
-            assert_eq!(err.to_string(), "command exited with exit code: 1");
+            let result = reload(argv(&[&cmd_exe(), "/c", "exit", "3"])).await;
+            assert_eq!(result.outcome, ReloadOutcome::Failure);
+            assert_eq!(result.exit_code, Some(1));
+            assert_eq!(result.error_detail, None);
         }
 
         /// `powershell.exe` itself starts, so this is not a spawn `NotFound`
         /// as it is on Unix: PowerShell fails the command and exits 1.
         #[tokio::test]
         async fn a_missing_program_fails_inside_powershell() {
-            let err = reload(argv(&[r"C:\does\not\exist.exe"]))
-                .await
-                .expect_err("a missing program must be an error");
-
-            assert_ne!(err.kind(), io::ErrorKind::NotFound, "{err}");
-            assert_eq!(err.to_string(), "command exited with exit code: 1");
+            let result = reload(argv(&[r"C:\does\not\exist.exe"])).await;
+            assert_eq!(result.outcome, ReloadOutcome::Failure);
+            assert_eq!(result.exit_code, Some(1));
         }
     }
 }

@@ -3,7 +3,7 @@
 The AWS Workload Credentials Provider (formerly the AWS Secrets Manager Agent) is a client\-side solution that helps you standardize how you consume credentials from AWS services across your compute environments\. It includes the following capabilities:
 
 - **Secrets Manager** — An HTTP interface for retrieving and caching secrets from AWS Secrets Manager\. Supported on AWS Lambda, Amazon ECS, Amazon EKS, and Amazon EC2\. Enabled by default\.
-- **Certificate Management** — Automatic export and refresh of certificates from AWS Certificate Manager to the local filesystem\. Supported on Amazon EC2, on\-premise hosts, and container environments \(Docker on Amazon EC2, Amazon ECS, Amazon EKS\)\. Opt\-in via [configuration](#certificate-management-configuration)\.
+- **Certificate Management** — Automatic export and refresh of certificates from AWS Certificate Manager to the local filesystem\. Supported on Amazon EC2, on\-premise hosts, and container environments \(Docker on Amazon EC2, Amazon ECS, Amazon EKS\)\. Opt\-in via [configuration](#certificate-management-configuration)\. Includes optional [certificate discovery and telemetry](#workload-credentials-provider-discovery), which reports the TLS certificates your workloads present and the result of each certificate refresh\.
 
 ## Secrets Manager capability
 
@@ -21,6 +21,8 @@ The Workload Credentials Provider exports certificates from AWS Certificate Mana
 
 The Certificate Management capability supports Linux and Windows, and works with web servers such as NGINX and Apache\.
 
+When a certificate uses a WCP watcher, the provider and watcher share the configured requests directory\. The watcher owns `<requests_dir>/<watcher_id>/outbox`: it creates and validates `inbox/`, `pending/`, and `outbox/` at startup, writes status records atomically to `outbox/`, and the provider consumes and deletes those records\. The shared volume must allow both processes to access `outbox/`; a missing or unsafe directory causes the watcher to refuse startup rather than silently lose status records\.
+
 The Workload Credentials Provider uses the AWS credentials you provide in your environment to assume the role you have configured for each certificate, and then calls ACM to export the certificate\.
 
 **Important**  
@@ -29,6 +31,8 @@ The Certificate Management capability requires elevated permissions for the prov
 You can provide a custom configuration by passing `--config /path/to/config.toml` on startup or on reload while the provider is running\. On Windows, use `-Config C:\path\to\config.toml` when invoking the PowerShell scripts and `--Config C:\path\to\config.toml` when executing the binary command\. The reload re\-applies permissions and restarts the ACM service\.
 
 For full configuration details, see [Configure the Workload Credentials Provider](#workload-credentials-provider-config)\.
+
+The Certificate Management capability also includes optional certificate discovery and telemetry\. For details, see [Step 5: Turn on certificate discovery and telemetry](#workload-credentials-provider-discovery)\.
 
 To download the source code, see [https://github\.com/aws/aws\-workload\-credentials\-provider](https://github.com/aws/aws-workload-credentials-provider) on GitHub\.
 
@@ -62,6 +66,12 @@ To download the source code, see [https://github\.com/aws/aws\-workload\-credent
   - [Pre-fetching](#pre-fetching)
   - [Region failover](#region-failover)
   - [Step 4: Retrieve certificates with the Workload Credentials Provider](#step-4-retrieve-certificates-with-the-workload-credentials-provider)
+  - [Step 5: Turn on certificate discovery and telemetry](#step-5-turn-on-certificate-discovery-and-telemetry)
+    - [Benefits](#benefits)
+    - [How certificate discovery works](#how-certificate-discovery-works)
+    - [What telemetry is sent](#what-telemetry-is-sent)
+    - [Set up certificate discovery and telemetry](#set-up-certificate-discovery-and-telemetry)
+    - [Troubleshoot certificate discovery](#troubleshoot-certificate-discovery)
   - [Configure the Workload Credentials Provider](#configure-the-workload-credentials-provider)
   - [File-based credentials](#file-based-credentials)
   - [Optional features](#optional-features)
@@ -240,7 +250,13 @@ Based on the type of compute, you have several options for installing the Worklo
    - `--no-privileges` — (Optional) Skip Linux capabilities on ACM service
    - `--no-sudoers` — (Optional) Skip sudoers generation
 
-   The script generates a random SSRF token on startup and stores it in the file `/var/run/awssmatoken`\. The token is readable by the `aws-wcp-token` group that the install script creates\. 
+   The script generates a random SSRF token on startup and stores it in the file `/var/run/awssmatoken`\. The token is readable by the `aws-wcp-token` group that the install script creates\.
+
+   **Upgrading:** the install script starts services that aren't running and leaves running ones as they are, so after an upgrade restart the services, or the host, to run the new version\. Restarting the token service creates a new token and also restarts the Secrets Manager service, which requires it; applications that keep the token must then read the file again\.
+
+   ```sh
+   sudo systemctl restart aws-workload-credentials-provider-token aws-workload-credentials-provider-acm
+   ``` 
 
 1. To allow your application to read the token file, you need to add the user account that your application runs under to the `aws-wcp-token` group\. For example, you can grant permissions for your application to read the token file with the following usermod command, where *<APP\_USER>* is the user ID under which your application runs\.
 
@@ -268,7 +284,14 @@ Based on the type of compute, you have several options for installing the Worklo
 
    The script generates a random SSRF token on startup and stores it in the file `C:\ProgramData\AWS\WorkloadCredentialsProvider\awssmatoken`\. The token is readable by the Secrets Manager service account (`NT SERVICE\AWSWorkloadCredentialsProvider-SecretsManager`) that the install script configures\.
 
-1. To allow your application to read the token file, you need to grant read access to the user account that your application runs under\. For example, you can grant permissions for your application to read the token file with the following icacls command, where *<APP\_USER>* is the user account under which your application runs\.
+   **Upgrading:** the install script makes no changes while either provider service is running, so stop both services first, then run it again\. It replaces the token file, so then grant your application read access again, as in the next step\.
+
+   ```powershell
+   Stop-Service AWSWorkloadCredentialsProvider-SecretsManager, AWSWorkloadCredentialsProvider-ACM
+   .\install.ps1
+   ```
+
+1. To allow your application to read the token file, you need to grant read access to the user account that your application runs under\. For example, you can grant permissions for your application to read the token file with the following icacls command, where *<APP\_USER>* is the user account under which your application runs\. The install script creates a new token file each time it runs, so run this command again after every install\.
 
    ```powershell
    icacls "C:\ProgramData\AWS\WorkloadCredentialsProvider\awssmatoken" /grant "<APP_USER>:(R)"
@@ -280,6 +303,8 @@ Based on the type of compute, you have several options for installing the Worklo
 #### [ Running as a Secrets Manager Sidecar ]
 
 You can run the Workload Credentials Provider as a sidecar container alongside your application by using Docker\. Then your application can retrieve secrets from the local HTTP server the Workload Credentials Provider provides\. For information about Docker, see the [Docker documentation](https://docs.docker.com)\. 
+
+**Note:** For Certificate Manager sidecar deployment , see [Running as a Certificate Manager Sidecar](#-running-as-a-certificate-manager-sidecar-)\.
 
 **To create a sidecar container for the Workload Credentials Provider with Docker**
 
@@ -359,6 +384,8 @@ You can run the Workload Credentials Provider as a sidecar container alongside y
 You can run the Workload Credentials Provider as a sidecar container that runs `acm start`, exports your ACM certificates to a shared volume, and (optionally) drives a reload of your TLS server when a certificate rotates. Linux and Windows containers are supported on Docker on Amazon EC2 (Compose), Amazon ECS, and Amazon EKS. The steps are the same across platforms. Only the volume and identity wiring differs, and Windows differences are noted inline.
 
 **How it works.** The provider runs in its own container and exports each certificate's PEM files to a shared volume. For a TLS server that does not reload its certificate files on its own, `wcp-watcher` — a small companion binary that runs inside the TLS container, reads only local files, and needs no AWS credentials or SDK — performs the reload. For each certificate that sets `watcher_id`, the provider writes a per-watcher config (`<watcher_config_dir>/<watcher_id>/watcher.config.toml`) mapping the certificate ARN to its `refresh_command`. After writing a renewed certificate and key, the provider drops a refresh request naming that ARN into the watcher's request directory, and the watcher runs the configured command.
+
+The provider correlates each watcher status with the request and waits for that status before completing the certificate refresh or emitting certificate automation telemetry\. A successful watcher command reports `DEPLOYED` when the attempt replaced certificate files and `RELOADED` when it did not\. Watcher failure, not-found, and superseded outcomes report stage `RELOAD` with code `CommandFailed`\. A reload command that runs out its time, on the watcher or the direct path, and a watcher that does not answer in time report stage `RELOAD` with code `TimeoutError`\. A watcher that predates status reports \(it has an `inbox/` but no `outbox/`\) is not waited for: the provider reports `WRITTEN_NOT_RELOADED` when the attempt replaced files and `UNCHANGED` when it did not\. Failure telemetry reports `filesOnDisk` as `REPLACED` only when that attempt wrote files, and as `NOT_REPLACED` otherwise\. Watcher ID, command ID, exit code, timestamps, and error detail stay in bounded local logs and are not sent in telemetry\. Status correlation is kept in memory and is reset when the provider restarts\. The provider waits up to 2,130 seconds for a status, longer than the 15-minute command timeout: a request can wait behind a reload that is already running, then run its own, and a starting watcher can hold requests for up to 5 minutes\.
 
 **Choose your path.** Pick one before you start; each is followable on its own.
 - **Self-reloading TLS server** — Envoy, Traefik, Caddy, or any server that reloads its certificate and key files on its own. Omit `watcher_id` and `refresh_command` from the config, mount only the certificate-and-key volume into the TLS container, and skip the watcher entirely: no `wcp-watcher` in `Dockerfile.tls`, no `WCP_WATCHER_ID` env var, no watcher-requests volume, and no watcher line in the TLS entrypoint. You deploy only the provider container writing the cert volume (Certificate Management Sidecar step 1 without the watcher keys, and step 2).
@@ -709,7 +736,116 @@ key_permission = { mode = "0640" }
 
 The key file takes the provider's group, so run the provider with the shared group as its primary GID (on Amazon EKS, `fsGroup` sets this on the shared volume) and add the TLS server user to that group. Prefer the same-UID path above when you can — it keeps the key owner-only (`0600`). If you use the `0640` fallback, the shared group **must be a dedicated group** created for this purpose: any process in that group, now or later, can read the private key.
 
-**Note:** In this release the watcher runs the reload command only; it does not report reload status back to the provider. A failed reload surfaces only in the watcher's logs while the server keeps serving the previous certificate, so verify your `refresh_command` during setup.
+------
+#### [ Running ACM as a Discovery-Only Container Sidecar ]
+
+You can run the Certificate Management \(ACM\) capability as a sidecar container alongside your application on Amazon ECS or Amazon EKS\. The sidecar runs `acm start` in its own container, separate from the Secrets Manager sidecar, so a failure in one does not stop the other\. In a container, the ACM capability supports certificate discovery\. You build the image with `Dockerfile.acm` and pass your configuration file with the `CONFIG` build argument\. The build copies the file into the image at `/etc/aws-workload-credentials-provider/config.toml`, which `acm start` reads at startup\. To change the configuration, rebuild the image\.
+
+**Note:** This sidecar does certificate discovery only\. Do not configure certificates in its configuration\. To export certificates to a shared volume and reload a TLS server when they rotate, use [Running as a Certificate Manager Sidecar](#-running-as-a-certificate-manager-sidecar-) instead\.
+
+**To create an ACM sidecar container**
+
+1. Create a configuration file inside the Workload Credentials Provider source directory, for example `config.toml`\. The file must be inside the Docker build context\. Set `log_to_file = false` so the container runtime collects the logs\. For the discovery options, see [Certificate discovery configuration](#certificate-discovery-configuration)\.
+
+   ```toml
+   [logging]
+   log_to_file = false
+
+   [capabilities.acm]
+   enabled = true
+
+   [capabilities.acm.discovery]
+   enabled = true
+
+   [capabilities.acm.discovery.discovery_targets]
+   443 = ["api.example.com"]
+   8443 = []
+   ```
+
+1. Build the image, passing the path to your configuration file\. The build fails if `CONFIG` is not set\.
+
+   ```sh
+   docker build -f Dockerfile.acm --build-arg CONFIG=config.toml -t workload-credentials-provider-acm .
+   ```
+
+1. Push the image to a registry your tasks or nodes can pull from, such as an Amazon ECR repository in your account\.
+
+1. Run the image next to your application, following these network requirements\. Discovery reaches your application only through loopback, so the ACM container must share your application's network namespace\.
+
+   + On Amazon ECS, add the ACM container to your application's task definition and use the `awsvpc` network mode\. The provider reads the network mode from the task metadata, and in any other mode it logs a warning and discovery does not start: with `bridge` mode discovery would reach only the ACM container itself, and with `host` mode every service listening on the host's loopback\.
+   + On Amazon EKS, add the ACM container to your application's pod\. Do not set `hostNetwork: true`: discovery would then reach every service listening on the host's loopback and report them under the pod's identity\. The provider does not check `hostNetwork`\. A separate pod or a DaemonSet cannot reach your application through loopback\.
+   + The ACM container opens no listener, so it needs no port mapping, Kubernetes Service, or inbound security group rule\.
+   + The image runs as the non-root user `65532`, so it starts in pods that require `runAsNonRoot`\.
+   + The provider detects the compute it runs on to choose the discovery mode\. On Amazon ECS it reads the task metadata endpoint that the ECS agent provides\. On Amazon EKS it needs a service account token in the pod: the default token, or an IAM Roles for Service Accounts \(IRSA\) or EKS Pod Identity token\. Without one, discovery does not start and the provider logs a warning\.
+
+   The following Amazon ECS task definition runs your application and the ACM container in one task\. Replace the placeholders with your values\. With `"essential": false`, the task keeps running your application if the ACM container stops\.
+
+   ```json
+   {
+     "family": "my-application",
+     "networkMode": "awsvpc",
+     "requiresCompatibilities": ["FARGATE"],
+     "cpu": "256",
+     "memory": "512",
+     "executionRoleArn": "arn:aws:iam::<ACCOUNT_ID>:role/<TASK_EXECUTION_ROLE>",
+     "containerDefinitions": [
+       {
+         "name": "client-application",
+         "image": "<APPLICATION_IMAGE>",
+         "essential": true
+       },
+       {
+         "name": "workload-credentials-provider-acm",
+         "image": "<ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/workload-credentials-provider-acm:latest",
+         "essential": false,
+         "dependsOn": [{ "containerName": "client-application", "condition": "START" }],
+         "logConfiguration": {
+           "logDriver": "awslogs",
+           "options": {
+             "awslogs-group": "<LOG_GROUP>",
+             "awslogs-region": "<REGION>",
+             "awslogs-stream-prefix": "acm"
+           }
+         }
+       }
+     ]
+   }
+   ```
+
+   The following Amazon EKS pod runs your application and the ACM container in one pod\. In a Deployment, add the ACM container to the pod template the same way\.
+
+   ```yaml
+   apiVersion: v1
+   kind: Pod
+   metadata:
+     name: client-application
+   spec:
+     containers:
+       - name: client-application
+         image: <APPLICATION_IMAGE>
+       - name: workload-credentials-provider-acm
+         image: <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/workload-credentials-provider-acm:latest
+   ```
+
+   With Docker Compose, attach the ACM container to your application's network namespace\. Docker Compose works only on Amazon EC2: outside Amazon ECS and Amazon EKS, the provider identifies the compute through the EC2 instance metadata service \(IMDS\), so on other hosts discovery does not start\. The provider uses IMDSv2, which a container reaches only when the instance's metadata response hop limit is 2 or more\. For more information, see [Configure instance metadata options for existing instances](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/configuring-IMDS-existing-instances.html) in the *Amazon EC2 User Guide*\.
+
+   ```yaml
+   services:
+       client-application:
+           container_name: client-application
+           build:
+               context: .
+               dockerfile: Dockerfile.client
+
+       workload-credentials-provider-acm:
+           container_name: workload-credentials-provider-acm
+           image: workload-credentials-provider-acm
+           network_mode: "container:client-application"  # Share the application's network namespace
+           depends_on:
+               - client-application
+   ```
+
+1. Check the ACM container logs for `Certificate discovery starting`\. On Amazon ECS, the logs are in the CloudWatch Logs group from the task definition\. On Amazon EKS, run `kubectl logs <pod> -c workload-credentials-provider-acm`\. The provider logs this line after it identifies the compute, which takes at most a few seconds\. The first discovery cycle starts within 5 minutes of that line and then repeats about once every 24 hours\.
 
 ------
 #### [ AWS Lambda ]
@@ -1181,6 +1317,99 @@ After certificates are written to the filesystem, any user with read access to t
 
 For full configuration details, see [Configure the Workload Credentials Provider](#workload-credentials-provider-config)\.
 
+## Step 5: Turn on certificate discovery and telemetry<a name="workload-credentials-provider-discovery"></a>
+
+**The following sections describe certificate discovery and telemetry, optional features of the Certificate Management capability\.**
+
+Certificate discovery reports the TLS certificates that your workloads present on the local ports you configure, including certificates that ACM doesn't issue or manage\. Telemetry sends the discovery results, and the result of each ACM certificate export and refresh, to AWS\.
+
+With the AWS Certificate Manager enterprise premium plan, these results populate your certificate inventory in ACM\. You can then see the certificates discovered across your workloads in one place, whichever certificate authority issued them\.
+
+Both features are off by default\. Discovery works whether or not you configure any certificates for export, but the Certificate Management capability must be enabled\.
+
+Discovery and telemetry run on Amazon EC2, Amazon ECS, and Amazon EKS, where the provider can identify the compute it runs on\. On on\-premise hosts, AWS Lambda, and other compute that the provider can't identify, the provider sends no telemetry and doesn't run discovery\. Certificate export and refresh still work there\.
+
+**Required permissions:**
++ `workload-telemetry:PutCertificateTelemetry` — Required on the provider's own AWS credentials: the Amazon EC2 instance profile, the Amazon ECS task role, or the Amazon EKS service account or Pod Identity role\. It isn't needed on the certificate's `role_arn`\. For an example policy, see [Telemetry configuration](#telemetry-configuration)\.
+
+**Important**  
+Discovery reports the public certificate of every TLS server listening on the configured ports, not only certificates from ACM\. Review the data with `[telemetry] dry_run = true` before you send it\. Telemetry never contains private keys\.
+
+### Benefits
+
++ **Find certificates on your configured ports** – Discovery reports the certificate each configured local port and SNI hostname presents, including certificates from other certificate authorities and self\-signed certificates\.
++ **Find certificates that are close to expiring** – Each reported certificate includes its chain and validity dates, so you can renew certificates before they cause an outage\.
++ **See the TLS settings of each connection** – Each observation includes the TLS version, cipher suite, and signature scheme negotiated for that handshake, and whether the server asked for a client certificate\. Discovery records one handshake per port and hostname\. It doesn't list every version or cipher a server accepts, so it isn't a full TLS configuration audit\. Discovery offers only TLS 1\.2 and TLS 1\.3: a server that accepts only older versions fails the handshake and appears only in the failed\-probe count\.
++ **Confirm ACM certificate deployment** – Export and refresh results show, for each configured ACM certificate, whether the new certificate was deployed or unchanged, or at which step it failed: export, write to disk, or the refresh command\.
++ **No extra software** – Discovery runs inside the provider you already deploy for certificate export\. It connects only to the local loopback address and reads only what any TLS client sees\.
+
+### How certificate discovery works
+
+When discovery is on, the provider:
+
+1. Identifies the compute it runs on: an Amazon EC2 instance, an Amazon ECS task, or an Amazon EKS pod\.
+1. Within 5 minutes of starting, and then every 24 hours plus up to 5 minutes, connects over TLS to each configured local port, once without a server name \(SNI\) and once for each configured hostname\. It connects only to loopback \(`127.0.0.1`, then `::1`\), completes the handshake without sending a client certificate, and records the certificate the server presents\.
+1. Sends the results to the AWS workload telemetry service\. Ports that refuse the connection, don't use TLS, or fail the handshake are counted in the scan summary but not reported individually\.
+
+Discovery doesn't read private keys or certificate files from disk, and it doesn't send application data to the servers it probes\. It finds only certificates served on the configured ports in its own network namespace\. It doesn't reach other hosts, load balancers, or unconfigured ports\.
+
+On Amazon ECS and Amazon EKS, the provider runs as a sidecar and must share a network namespace with the application container\. For the requirements, see [Certificate discovery configuration](#certificate-discovery-configuration)\.
+
+### What telemetry is sent
+
+The provider sends each kind of telemetry only when you turn it on:
+
++ **Discovery results** – Sent when you turn on certificate discovery\. Turning on discovery is your consent to send its results\.
++ **Export and refresh results** – Sent when you set `enabled = true` under `[telemetry.acm]`\.
+
+Telemetry is best effort\. Records are held in memory, and some can be lost if the provider is stopped abruptly, its queue fills, or AWS can't be reached\. Don't use telemetry as an audit log\. Certificate export and refresh never wait for telemetry\. For the full list of fields, the endpoint, and retries, see [Telemetry configuration](#telemetry-configuration)\.
+
+### Set up certificate discovery and telemetry
+
+1. Grant the provider's credentials `workload-telemetry:PutCertificateTelemetry` \(see [Required permissions](#workload-credentials-provider-discovery)\)\.
+1. In your configuration file, enable the Certificate Management capability, turn on discovery, and list the ports your TLS servers listen on and the hostnames they serve:
+
+   ```toml
+   [capabilities.acm]
+   enabled = true
+
+   [capabilities.acm.discovery]
+   enabled = true
+
+   [capabilities.acm.discovery.discovery_targets]
+   443 = ["api.example.com", "www.example.com"]
+   8443 = []
+   ```
+
+1. \(Recommended\) Review the data before you send it\. Set `dry_run = true` under `[telemetry]` and apply the configuration\. Each request is written as JSON to `logs/acm_provider_telemetry_dryrun.log`, or to the container's console output when `log_to_file = false`\. A dry run still needs AWS credentials and a Region, but not the IAM permission\. Discovery requests appear after each scan; export and refresh results appear when the queue is flushed, about once an hour, and when the provider stops\. When you are ready to send, set `dry_run = false`\.
+1. \(Optional\) To also send export and refresh results for your ACM certificates, add the following:
+
+   ```toml
+   [telemetry.acm]
+   enabled = true
+   ```
+
+1. Apply the configuration\. On Amazon EC2 and on\-premise hosts, run `acm reload` \(see [Configuration reload](#configuration-reload-certificate-management)\)\. In a container deployment, update the configuration and restart the provider container\.
+1. Check the provider log, `logs/acm_provider.log`, or the container's console output\. After a successful scan, it contains lines like the following:
+
+   ```
+   Certificate discovery starting: 2 ports, timeout 300s
+   Discovery cycle completed: 4 observations in 412ms (4 targets, 0 failed)
+   Discovery: submitted 1 batch(es) for cycle <cycle-id>
+   ```
+
+1. Confirm that the data is being sent\. `Discovery: submitted ...` means the provider handed the batch to its sender, not that AWS received it\. Check that the log has no `Telemetry is off:`, `Telemetry (stub):`, or `Telemetry dry run for` lines\. To confirm that AWS accepted a request, set `log_level = "debug"` under `[logging]`\. Each accepted request then logs `Telemetry: request <id> sent on attempt <n> of 3`\.
+
+### Troubleshoot certificate discovery
+
++ **A target failed** – The summary line counts failed targets but doesn't name them\. With `log_level = "debug"`, each probe logs `<address>:<port> (sni=<hostname>): probe completed with <outcome>`, where the outcome is, for example, `connection_refused`, `not_tls`, `timeout`, or `handshake_error`\.
++ **`Discovery: identity detection failed`** – The provider couldn't identify its compute, so discovery doesn't run\. On Amazon EC2, check that the instance metadata service is reachable\.
++ **`Discovery disabled: ...`** – The compute isn't supported for discovery, for example AWS Lambda, or an Amazon ECS task that doesn't use the `awsvpc` network mode\. The message gives the reason\.
++ **`Telemetry is off: the AWS SDK config has no credentials or region`** – The provider found no AWS credentials or Region, so it sends nothing\. Set the Region, for example with `AWS_REGION`\.
++ **`Discovery: failed to submit batch ...`** – AWS didn't accept the request after three attempts\. Check the permission and network access to `https://workload-telemetry.<region>.api.aws`\.
+
+For all options, see [Certificate discovery configuration](#certificate-discovery-configuration) and [Telemetry configuration](#telemetry-configuration)\.
+
 ## Configure the Workload Credentials Provider<a name="workload-credentials-provider-config"></a>
 
 To start the Workload Credentials Provider with a custom configuration, create a [TOML](https://toml.io/en/) config file, and then run `./aws-workload-credentials-provider sm start --config /path/to/config.toml` for Secrets Manager or `./aws-workload-credentials-provider acm start --config /path/to/config.toml` for Certificate Management\.
@@ -1247,7 +1476,7 @@ secret_to_region_map = { "arn:aws:secretsmanager:us-east-1:123456789012:secret:M
 + **ttl\_seconds** – The TTL in seconds for the cached items, in the range 0 to 3600\. The default is 300\. 0 indicates that there is no caching\.
 + **cache\_size** – The maximum number of secrets that can be stored in the cache, in the range 1 to 1000\. The default is 1000\.
 + **ssrf\_headers** – A list of header names the Workload Credentials Provider checks for the SSRF token\. The default is "X\-Aws\-Parameters\-Secrets\-Token, X\-Vault\-Token"\.
-+ **ssrf\_env\_variables** – A list of environment variable names the Workload Credentials Provider checks in sequential order for the SSRF token\. The environment variable can contain the token or a reference to the token file as in: `AWS_TOKEN=file:///var/run/awssmatoken`\. The default is "AWS\_TOKEN, AWS\_SESSION\_TOKEN, AWS\_CONTAINER\_AUTHORIZATION\_TOKEN"\.
++ **ssrf\_env\_variables** – A list of environment variable names the Workload Credentials Provider checks in sequential order for the SSRF token\. The environment variable can contain the token or a reference to the token file as in: `AWS_TOKEN=file:///var/run/awssmatoken`\. The first variable that is set is used; if it is empty, or refers to an empty file, the provider doesn't start\. In the file, white space around the token is dropped, along with any byte order mark in it\. The default is "AWS\_TOKEN, AWS\_SESSION\_TOKEN, AWS\_CONTAINER\_AUTHORIZATION\_TOKEN"\.
 + **credentials\_file\_path** – The path to a file containing AWS credentials in the standard AWS credentials file format\. When set, the provider reads credentials from this file instead of using the default SDK credential provider chain\. The provider automatically reloads credentials when the file changes, making it compatible with credential rotation systems such as [IAM Roles Anywhere](https://docs.aws.amazon.com/rolesanywhere/latest/userguide/introduction.html) that deliver refreshed credentials to the filesystem\. This parameter is optional\.
 + **default\_failover\_region** – The AWS region to fail over to for secrets without a `secret_to_region_map` entry\. It can't be empty or equal to `region`\. This is the only option that turns on [credential failover](#region-failover-credentials)\. There is no default\. For more information, see [Region failover](#region-failover)\.
 + **operation\_timeout\_ms** – The longest a primary call can take, in milliseconds, before the provider fails over, in the range 2000 to 25000\. The default is 3000\. Applies only to requests that have a failover region\.
@@ -1317,6 +1546,76 @@ key_permission = { trustee_type = "User", trustee_name = "NT SERVICE\\MyWebServe
 + **watcher\_id** – (Optional) ID of the `wcp-watcher` that runs this certificate's `refresh_command` in a container deployment\. When set, `refresh_command` is required and is carried into that watcher's config rather than run by the provider\. Must match `^[a-z0-9][a-z0-9._-]{0,63}$`\. On Windows it can't be a reserved device name (such as `con`, `nul`, or `com1`) or end with a period\. See [Running as a Certificate Manager Sidecar](#-running-as-a-certificate-manager-sidecar-)\.
 + **watcher\_config\_dir** – (Optional, ACM\-level under `[capabilities.acm]`) Directory the provider writes generated per\-watcher `watcher.config.toml` files to, shared read\-only with the watcher's container\. Default `/shared/wcp-watchers/config` (Linux), `C:\shared\wcp-watchers\config` (Windows)\.
 + **watcher\_requests\_dir** – (Optional, ACM\-level) Directory holding the per\-watcher refresh\-request queue, shared read\-write with the watcher's container\. Default `/shared/wcp-watchers/requests` (Linux), `C:\shared\wcp-watchers\requests` (Windows)\.
+
+### Certificate discovery configuration
+
+Certificate discovery is part of the Certificate Management capability\. When enabled, the provider identifies the compute it runs on, which takes at most a few seconds, then connects to local TLS ports within 5 minutes and then about once every 24 hours, and records the certificate each port presents\. These options go under `[capabilities.acm.discovery]`\.
+
+```toml
+[capabilities.acm.discovery]
+enabled = true
+timeout_secs_override = 300
+
+[capabilities.acm.discovery.discovery_targets]
+443 = ["api.example.com", "www.example.com"]
+8443 = []
+```
+
++ **enabled** – Whether certificate discovery is active: `true` or `false`\. The default is `false`\.
++ **timeout\_secs\_override** – (Optional) The maximum time in seconds for one discovery cycle, at least 60\. The default is 300\.
++ **discovery\_targets** – (Optional) A map from port to SNI hostnames\. Each port is probed once without SNI, then once per hostname\. Up to 32 ports and 32 hostnames per port\. If omitted or empty, ports 443, 8443, and 4443 are probed without SNI\.
+
+The provider detects the compute it runs on and selects the discovery mode from it:
+
+| Compute | Discovery mode | Addresses probed |
+| ------- | --------- | ---------------- |
+| Amazon EC2 | Host agent | `127.0.0.1`, then `::1` if the connection is refused |
+| Amazon ECS, Amazon EKS | Sidecar | `127.0.0.1`, then `::1` if the connection is refused |
+| AWS Lambda, or compute that cannot be identified | None | Discovery does not start |
+
+**Important**  
+In sidecar mode, the provider container must share a network namespace with the application container, because it reaches the application only through loopback\. On Amazon ECS, use the `awsvpc` network mode and run both containers in the same task\. The provider reads the task's network mode from the task metadata and, in any mode other than `awsvpc`, logs a warning and does not start discovery\. On Amazon EKS, run both containers in the same pod without `hostNetwork: true`\. The provider does not check `hostNetwork`: with `hostNetwork: true`, discovery reaches every service listening on the host's loopback and reports them under the provider's own identity\.
+
+### Telemetry configuration
+
+These options control what the Certificate Management capability sends to the AWS workload telemetry service\. For an overview, see [Certificate discovery and telemetry](#workload-credentials-provider-discovery)\.
+
+```toml
+[telemetry]
+dry_run = false
+
+[telemetry.acm]
+enabled = true
+```
+
++ **dry\_run** – (Optional) When `true`, the provider sends nothing\. Instead it writes each request, with the same fields it would send, as JSON to `logs/acm_provider_telemetry_dryrun.log`, or to stdout when `log_to_file` is `false`\. Use it to review the data before you turn on sending\. Live requests carry the same fields in CBOR\. The default is `false`\.
++ **\[telemetry\.acm\] enabled** – (Optional) Whether to send the results of certificate export and refresh: `true` or `false`\. The default is `false`\. This option doesn't affect discovery results, which are sent whenever discovery is on\.
+
+Each request identifies the compute and describes the provider's environment:
+
++ **Compute** – The compute type \(Amazon EC2, Amazon ECS, or Amazon EKS\) and its ID: the EC2 instance ID, the ECS task ARN, or the EKS pod's namespace, name, and UID\.
++ **Environment** – The operating system, the CPU architecture, and a random ID generated each time the provider starts, so the service can tell restarts apart\.
+
+Discovery results contain, for each port and SNI hostname probed: the certificate and chain the server presented \(public certificates only, never private keys\), the negotiated TLS version and cipher suite, the handshake signature scheme, and whether the server asked for a client certificate\. Each scan also reports how many targets it probed, how many succeeded and failed, and how many certificates are configured for export\. Ports that refuse the connection, don't speak TLS, or fail the handshake are counted but not reported individually\.
+
+Export and refresh results contain, for each certificate: its ARN, the time, whether the export, write, and refresh command succeeded or at which step it failed, the deployed certificate and chain, how long the refresh took, and how many times in a row it has failed\.
+
+The provider signs requests with the AWS credentials from its environment \(the instance profile, task role, or service account role\), the same credentials it uses to assume each certificate's role, not the certificate's `role_arn`, and sends them to `https://workload-telemetry.<region>.api.aws` in the Region from its AWS configuration \(for example, `AWS_REGION`\)\. When the AWS configuration asks for FIPS endpoints \(for example, `AWS_USE_FIPS_ENDPOINT=true`\), it sends them to `https://workload-telemetry-fips.<region>.api.aws` instead\. The credentials need permission for `workload-telemetry:PutCertificateTelemetry`\. If the provider has no credentials or Region, it logs a warning and sends nothing\. Discovery results are sent at the end of each scan\. Export and refresh results are queued and sent about once an hour and when the provider stops\. Each request is tried up to three times\. Telemetry failures never stop certificate export or refresh\. Delivery is best effort: queued export and refresh results are dropped, oldest first, when the in\-memory queue is full, and can be lost if the provider is stopped abruptly\. Requests honor the `HTTPS_PROXY` and `NO_PROXY` environment variables\.
+
+The following example IAM policy allows the provider's credentials to send telemetry\.
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "workload-telemetry:PutCertificateTelemetry",
+      "Resource": "*"
+    }
+  ]
+}
+```
 
 ### Configuration reload (Certificate Management)
 
@@ -1415,12 +1714,13 @@ The Workload Credentials Provider can be built with optional features by passing
 The Workload Credentials Provider logs locally to the following files, or to stdout/stderr depending on the `log_to_file` config variable:
 + **Secrets Manager:** `logs/secrets_manager_provider.log`
 + **Certificate Management:** `logs/acm_provider.log`
++ **Telemetry dry run \(Certificate Management\):** `logs/acm_provider_telemetry_dryrun.log`, one JSON request per line, when `[telemetry] dry_run = true`
 
 When your application calls the Workload Credentials Provider to get a secret, those calls appear in the local log\. When the provider exports a certificate, writes it to disk, and runs a refresh command, those actions also appear in the local log\. They do not appear in the CloudTrail logs\.
 
 The Workload Credentials Provider creates a new log file when the file reaches 10 MB, and it stores up to five log files per capability\. 
 
-The provider itself doesn't send logs to Secrets Manager, ACM, CloudTrail, or CloudWatch\. In a container with `log_to_file = false`, logs go to stdout and follow your container's log driver; for example, they reach CloudWatch Logs when an ECS task uses the `awslogs` driver\. When the Workload Credentials Provider makes a call to Secrets Manager or ACM, that call is recorded in CloudTrail with a user agent string containing `aws-workload-credentials-provider`\. 
+The provider itself doesn't send logs to Secrets Manager, ACM, CloudTrail, or CloudWatch\. Telemetry, when you turn it on, is separate from the logs; see [Certificate discovery and telemetry](#workload-credentials-provider-discovery)\. In a container with `log_to_file = false`, logs go to stdout and follow your container's log driver; for example, they reach CloudWatch Logs when an ECS task uses the `awslogs` driver\. When the Workload Credentials Provider makes a call to Secrets Manager or ACM, that call is recorded in CloudTrail with a user agent string containing `aws-workload-credentials-provider`\. 
 
 You can configure logging in the [Configuration file](#workload-credentials-provider-config)\. 
 
@@ -1438,6 +1738,8 @@ For the Certificate Management capability, the provider runs as a dedicated syst
 
 In a container deployment, the Certificate Management capability uses no install script or sudoers entry. The trust boundary is the shared volumes: any container that mounts the certificate volume can read the certificate, and the private key is protected by running the provider and TLS containers with the same UID, or with a dedicated group if you use the permission fallback (see [Running as a Certificate Manager Sidecar](#-running-as-a-certificate-manager-sidecar-))\.
 
+Certificate discovery connects only to loopback addresses and reads only what any TLS client sees during a handshake\. It doesn't send a client certificate, read files, or send data to the servers it probes\. Discovery results include the public certificates of every local TLS server on the configured ports, not only certificates from ACM\. Review the data with `[telemetry] dry_run = true` before you turn on discovery on hosts whose certificates you don't want to report\. Telemetry requests never contain private keys\.
+
 ## Running Integration Tests Locally<a name="integration-tests-local"></a>
 
 The AWS Workload Credentials Provider includes a comprehensive integration test suite that validates functionality against real AWS Secrets Manager. These tests cover caching behavior, security features, configuration options, version management, and error handling scenarios.
@@ -1447,9 +1749,23 @@ The AWS Workload Credentials Provider includes a comprehensive integration test 
 - AWS credentials with permissions to create, read, update, and delete secrets in AWS Secrets Manager
 - Rust toolchain installed
 - Access to an AWS account for testing
-- (For ACM tests) An exportable ACM certificate and IAM role with export permissions\. Set the following environment variables:
+- (For ACM tests) An exportable ACM certificate and IAM role with export permissions\. Use usable least-privilege AWS credentials and set:
   - `ACM_TEST_CERTIFICATE_ARN` — ARN of the certificate to export
   - `ACM_TEST_ROLE_ARN` — IAM role the provider assumes when exporting, requires `acm:ExportCertificate` permission
+  - `AWS_REGION` — Region containing `ACM_TEST_CERTIFICATE_ARN`
+- (For the real provider-plus-watcher test) Build both debug binaries with `cargo build` before running the test\. On Linux, the host must permit an unprivileged user and mount namespace so the fixture can bind-mount the watcher configuration read-only\. A host that lacks this support reports the test as skipped; set `WCP_WATCHER_E2E_REQUIRE_MOUNTS=1` to require it instead\.
+
+The provider-plus-watcher test is conditional because it exports the configured real certificate\. With all prerequisites available, run it serially from the workspace root:
+
+```sh
+cargo test -p integration-tests --test provider_watcher -- --test-threads=1
+```
+
+To compile this test without AWS access or host namespace setup, use:
+
+```sh
+cargo test -p integration-tests --test provider_watcher --no-run
+```
 
 ### Required AWS Permissions
 
@@ -1515,6 +1831,7 @@ The integration tests are organized into the following modules:
 - **`role_chaining.rs`** - Tests cross\-account secret retrieval via IAM role assumption, including invalid role ARN handling, access denied scenarios, refreshNow with role chaining, and separate per\-role cache isolation
 - **`prefetch.rs`** - Tests pre\-fetching secrets into the cache at startup, including explicit secrets, tag\-based discovery, inline TOML syntax, cross\-account pre\-fetching via role chaining, and resilience to nonexistent secrets
 - **`certificate_provider.rs`** - Tests the Certificate Management capability including certificate export, file writing, fullchain mode, refresh command execution, and file permission configuration
+- **`discovery.rs`** - Tests certificate discovery against local TLS and plain TCP listeners, with a mock instance metadata service and the telemetry dry run: the reported certificate, SNI, mTLS, TLS version and cipher suite, failed probes, identity detection, and unsupported compute. No AWS credentials are needed\. Set `DISCOVERY_INTEG_REAL_IMDS=1` to use the real instance metadata service on Amazon EC2\.
 - **`file_credentials.rs`** - Tests file\-based credential loading including valid/invalid/missing credentials, session token gate enforcement \(rejecting credentials that lack `aws_session_token` to prevent use of long\-term IAM User keys\), self\-healing \(credentials appearing after startup\), and credential rotation
 - **`sm_failover.rs`** - Tests Secrets Manager region failover, including failover on a cache miss, a cache refresh, and `refreshNow`, the `failoverRegion` query parameter and its format check, `secret_to_region_map`, no failover when failover isn't configured or the secret isn't found, both regions down with and without `refreshNow`, pre\-fetch while the primary region is down, failover of the provider's own credentials from STS, and no failover for a slow `credential_process` while the primary region is healthy
 - **`role_failover.rs`** - Tests role credential failover for `roleArn` requests, including STS and Secrets Manager failing over together, no failover when failover isn't configured, both STS regions down, no failover on access denied or a healthy primary, a failover region that denies the secret read, file\-based credentials, a configured `region` that differs from the SDK region, ARN rewriting, serving the cached value when every region is down, and no STS failover with only the query parameter or `secret_to_region_map`

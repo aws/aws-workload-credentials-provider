@@ -29,7 +29,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::Duration;
 #[cfg(target_os = "linux")]
-use std::{ffi::CString, io, os::unix::ffi::OsStrExt, os::unix::process::CommandExt};
+use std::{
+    ffi::CString,
+    io,
+    os::unix::{ffi::OsStrExt, fs::PermissionsExt, process::CommandExt},
+};
 
 use common::{locate_watcher_binary, AcmProviderProcess, TestCertificate};
 
@@ -88,7 +92,17 @@ impl TestDirs {
     }
 
     fn marker(&self) -> PathBuf {
-        self.root.join("reloaded")
+        self.root.join("reload-started")
+    }
+
+    #[cfg(target_os = "linux")]
+    fn reload_release(&self) -> PathBuf {
+        self.root.join("reload-release")
+    }
+
+    #[cfg(target_os = "linux")]
+    fn reload_failure_mode(&self) -> PathBuf {
+        self.root.join("reload-failure")
     }
 
     fn provider_log(&self) -> PathBuf {
@@ -99,20 +113,30 @@ impl TestDirs {
         self.root.join("watcher.log")
     }
 
-    /// The watcher's reload command, which creates the marker.
+    /// The watcher's reload command. On Linux the fixture marks that it started,
+    /// waits for the test to release it, and can then return a fixed failure.
     fn reload_command(&self) -> String {
         #[cfg(target_os = "linux")]
-        let program = if Path::new("/usr/bin/touch").exists() {
-            "/usr/bin/touch".to_string()
-        } else {
-            "/bin/touch".to_string()
-        };
+        {
+            let program = self.root.join("reload-fixture");
+            let script = format!(
+                "#!/bin/sh\nset -eu\n: > '{}'\nwhile [ ! -e '{}' ]; do sleep 0.1; done\nif [ -e '{}' ]; then exit 42; fi\n",
+                self.marker().display(),
+                self.reload_release().display(),
+                self.reload_failure_mode().display(),
+            );
+            std::fs::write(&program, script).unwrap();
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+            return program.display().to_string();
+        }
         #[cfg(windows)]
-        let program = format!(
-            r"{}\System32\cmd.exe /c mkdir",
-            std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into())
-        );
-        format!("{program} {}", self.marker().display())
+        {
+            let program = format!(
+                r"{}\System32\cmd.exe /c mkdir",
+                std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into())
+            );
+            format!("{program} {}", self.marker().display())
+        }
     }
 
     /// Writes the provider's config for `cert`, routed to the watcher, whose
@@ -390,6 +414,12 @@ fn entries(dir: &Path) -> Vec<PathBuf> {
         .unwrap_or_default()
 }
 
+fn watcher_directories_are_empty(dirs: &TestDirs) -> bool {
+    ["inbox", "pending", "outbox"]
+        .into_iter()
+        .all(|name| entries(&dirs.watcher_dir(name)).is_empty())
+}
+
 mod requests {
     use super::*;
 
@@ -429,12 +459,13 @@ mod requests {
             return;
         };
         wait_until("the watcher's inbox", WATCHER_READY_TIMEOUT, &dirs, || {
-            dirs.watcher_dir("inbox").is_dir()
+            dirs.watcher_dir("inbox").is_dir() && dirs.watcher_dir("outbox").is_dir()
         })
         .await;
 
         // Second run: a restart queues a request even though the files are
-        // unchanged, and the watcher reloads.
+        // unchanged. On Linux the reload fixture pauses before returning so
+        // the provider's completion can be proven to wait for watcher status.
         let mut provider = AcmProviderProcess::start(&config, &dirs.root).await;
         wait_until("the watcher's reload", RELOAD_TIMEOUT, &dirs, || {
             assert!(
@@ -444,14 +475,40 @@ mod requests {
             dirs.marker().exists()
         })
         .await;
+        #[cfg(target_os = "linux")]
+        {
+            let provider_log = read(&dirs.provider_log());
+            assert!(
+                !provider_log.contains("Watcher refresh command completed")
+                    && !provider_log.contains("Certificate refresh successful"),
+                "the provider completed before the watcher returned status:\n{provider_log}"
+            );
+            std::fs::write(dirs.reload_release(), b"").unwrap();
+        }
         wait_until(
-            "the request to be deleted",
-            WATCHER_READY_TIMEOUT,
+            "the provider to consume the successful watcher outcome",
+            RELOAD_TIMEOUT,
             &dirs,
             || {
-                entries(&dirs.watcher_dir("inbox")).is_empty()
-                    && entries(&dirs.watcher_dir("pending")).is_empty()
+                assert!(
+                    provider.is_running(),
+                    "the provider exited; see its output above"
+                );
+                let log = read(&dirs.provider_log());
+                log.lines().any(|line| {
+                    line.contains("Watcher refresh command completed:")
+                        && line.contains(&format!("watcher={WATCHER_ID}"))
+                        && line.contains(cert.arn())
+                        && line.contains("outcome=success")
+                }) && log.contains("Certificate refresh successful")
             },
+        )
+        .await;
+        wait_until(
+            "the successful request and status to be deleted",
+            WATCHER_READY_TIMEOUT,
+            &dirs,
+            || watcher_directories_are_empty(&dirs),
         )
         .await;
 
@@ -462,6 +519,58 @@ mod requests {
                 && provider_log.contains(&format!("to watcher {WATCHER_ID}:")),
             "the provider didn't queue the request:\n{provider_log}"
         );
+
+        #[cfg(target_os = "linux")]
+        {
+            drop(provider);
+            std::fs::remove_file(dirs.marker()).unwrap();
+            std::fs::remove_file(dirs.reload_release()).unwrap();
+            std::fs::write(dirs.reload_failure_mode(), b"").unwrap();
+            let prior_failures = provider_log.matches("outcome=failure").count();
+
+            let mut failing_provider = AcmProviderProcess::start(&config, &dirs.root).await;
+            wait_until("the failing reload to start", RELOAD_TIMEOUT, &dirs, || {
+                assert!(
+                    failing_provider.is_running(),
+                    "the provider exited; see its output above"
+                );
+                dirs.marker().exists()
+            })
+            .await;
+            std::fs::write(dirs.reload_release(), b"").unwrap();
+            wait_until(
+                "the provider to consume the failed watcher outcome",
+                RELOAD_TIMEOUT,
+                &dirs,
+                || {
+                    assert!(
+                        failing_provider.is_running(),
+                        "the provider exited; see its output above"
+                    );
+                    let log = read(&dirs.provider_log());
+                    let correlated_failure = log.lines().any(|line| {
+                        line.contains("Watcher refresh command completed:")
+                            && line.contains(&format!("watcher={WATCHER_ID}"))
+                            && line.contains(cert.arn())
+                            && line.contains("outcome=failure")
+                            && line.contains("exit_code=Some(42)")
+                    });
+                    log.matches("outcome=failure").count() == prior_failures + 1
+                        && correlated_failure
+                        && log.contains("Error refreshing certificate")
+                        && log.contains("Watcher refresh command failed")
+                },
+            )
+            .await;
+            wait_until(
+                "the failed request and status to be deleted",
+                WATCHER_READY_TIMEOUT,
+                &dirs,
+                || watcher_directories_are_empty(&dirs),
+            )
+            .await;
+        }
+
         let watcher_log = read(&dirs.watcher_log());
         for line in [
             "1 certificate(s), 1 distinct reload command(s)",

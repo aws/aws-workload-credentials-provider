@@ -189,6 +189,58 @@ Register-ProviderService `
     -Account $ASM_SERVICE_ACCOUNT `
     -BinPath "$providerExePath sm start"
 
+Write-Step "Configure provider directory ACLs"
+
+# Remove inherited ACLs (e.g., Users read access from ProgramData) so only
+# SYSTEM, Administrators, and the two service accounts can access this directory.
+# The directory itself is locked down first, so no other user can create a file
+# in it while the files inside are taken over and reset below; a file created
+# during that reset would stay its creator's. Take ownership first to neutralize
+# pre-creation attacks via implicit owner DACL-write.
+takeown /f $PROVIDER_DIR /a | Out-Null
+if ($LASTEXITCODE -ne 0) { Write-Error "Failed to take ownership of $PROVIDER_DIR" }
+
+# Replace the folder's whole access list in one step, so it never inherits from
+# C:\ProgramData\AWS, where Users can add files, and no older entry is left to
+# pass down.
+Set-AdminOnlyDirectoryAcl -Path $PROVIDER_DIR
+
+icacls $PROVIDER_DIR /grant "${ASM_SERVICE_ACCOUNT}:(OI)(CI)RX" /Q | Out-Null
+if ($LASTEXITCODE -ne 0) { Write-Error "Failed to grant $ASM_SERVICE_ACCOUNT access to $PROVIDER_DIR" }
+Write-Host "  Granted Read+Execute ACL to $ASM_SERVICE_ACCOUNT on $PROVIDER_DIR"
+
+icacls $PROVIDER_DIR /grant "${ACM_SERVICE_ACCOUNT}:(OI)(CI)RX" /Q | Out-Null
+if ($LASTEXITCODE -ne 0) { Write-Error "Failed to grant $ACM_SERVICE_ACCOUNT access to $PROVIDER_DIR" }
+Write-Host "  Granted Read+Execute ACL to $ACM_SERVICE_ACCOUNT on $PROVIDER_DIR"
+
+# Remove the seed task and token file an earlier install left before the reset
+# below would give the file the directory's ACL. The Secrets Manager step
+# creates both again, so an install that fails in between leaves no token.
+if (Get-ScheduledTask -TaskName $SEED_TOKEN_TASK -ErrorAction SilentlyContinue) {
+    Unregister-ScheduledTask -TaskName $SEED_TOKEN_TASK -Confirm:$false
+}
+if (Test-Path -LiteralPath $SSRF_TOKEN_FILE) {
+    # Someone else may own the file and its ACL; take it over and let
+    # Administrators delete it, without the directory's ACL. It loses its
+    # inherited entries first, so if the removal fails, for example on a file
+    # something holds open, the service accounts' directory grants no longer
+    # reach the old token.
+    takeown /f $SSRF_TOKEN_FILE | Out-Null
+    if ($LASTEXITCODE -ne 0) { Write-Error "Failed to take ownership of $SSRF_TOKEN_FILE" }
+    icacls $SSRF_TOKEN_FILE /inheritance:r /grant "BUILTIN\Administrators:F" /Q | Out-Null
+    if ($LASTEXITCODE -ne 0) { Write-Error "Failed to grant Administrators access to $SSRF_TOKEN_FILE" }
+    Remove-Item -LiteralPath $SSRF_TOKEN_FILE -Force
+}
+
+# Now take ownership of everything inside, and reset it to inherit only the
+# directory's ACEs above.
+if (Get-ChildItem -LiteralPath $PROVIDER_DIR -Force) {
+    takeown /f $PROVIDER_DIR /a /r /d y | Out-Null
+    if ($LASTEXITCODE -ne 0) { Write-Error "Failed to take ownership of the files in $PROVIDER_DIR" }
+    icacls "$PROVIDER_DIR\*" /reset /T /Q | Out-Null
+    if ($LASTEXITCODE -ne 0) { Write-Error "Failed to reset ACLs in $PROVIDER_DIR" }
+}
+
 if ($secretsManagerEnabled) {
     # Set the SSRF token env var for the service process so it can locate the token file.
     $regPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$ASM_SERVICE"
@@ -197,15 +249,21 @@ if ($secretsManagerEnabled) {
 
     Write-Step "Create SSRF token file"
 
-    # Create the token file with locked-down ACLs. The seed token service
-    # (running as SYSTEM) writes the value at boot. The ASM service account
-    # gets read-only access — only SYSTEM can write the token.
-    New-Item -ItemType File -Path $SSRF_TOKEN_FILE -Force | Out-Null
+    # Create a new token file with locked-down ACLs, now that the directory is
+    # locked down too. The seed token task (running as SYSTEM) writes the value
+    # at boot. The ASM service account gets read-only access; only SYSTEM can
+    # write the token.
+    if (Test-Path -LiteralPath $SSRF_TOKEN_FILE) { Remove-Item -LiteralPath $SSRF_TOKEN_FILE -Force }
+    New-Item -ItemType File -Path $SSRF_TOKEN_FILE | Out-Null
 
     icacls $SSRF_TOKEN_FILE /inheritance:r /Q | Out-Null
+    if ($LASTEXITCODE -ne 0) { Write-Error "Failed to remove inherited ACLs on $SSRF_TOKEN_FILE" }
     icacls $SSRF_TOKEN_FILE /grant "SYSTEM:F" /Q | Out-Null
+    if ($LASTEXITCODE -ne 0) { Write-Error "Failed to grant SYSTEM access to $SSRF_TOKEN_FILE" }
     icacls $SSRF_TOKEN_FILE /grant "BUILTIN\Administrators:F" /Q | Out-Null
+    if ($LASTEXITCODE -ne 0) { Write-Error "Failed to grant Administrators access to $SSRF_TOKEN_FILE" }
     icacls $SSRF_TOKEN_FILE /grant "${ASM_SERVICE_ACCOUNT}:R" /Q | Out-Null
+    if ($LASTEXITCODE -ne 0) { Write-Error "Failed to grant $ASM_SERVICE_ACCOUNT access to $SSRF_TOKEN_FILE" }
     Write-Host "  Created $SSRF_TOKEN_FILE (read-only for $ASM_SERVICE_ACCOUNT)"
 
     # Generate the initial token value. Install proceeds only if this succeeds.
@@ -218,30 +276,6 @@ if ($secretsManagerEnabled) {
     Register-SeedTokenTask -TaskName $SEED_TOKEN_TASK -ScriptPath $SEED_TOKEN_SCRIPT_PATH
     Write-Host "  Registered boot-time seed task: $SEED_TOKEN_TASK"
 }
-
-Write-Step "Configure provider directory ACLs"
-
-# Remove inherited ACLs (e.g., Users read access from ProgramData) so only
-# SYSTEM, Administrators, and the two service accounts can access this directory.
-# Take ownership first to neutralize pre-creation attacks via implicit owner DACL-write.
-takeown /f $PROVIDER_DIR /a /r /d y | Out-Null
-if ($LASTEXITCODE -ne 0) { Write-Error "Failed to take ownership of $PROVIDER_DIR" }
-
-# Replace the folder's whole access list first, so it never inherits from
-# C:\ProgramData\AWS, where Users can add files, and no older entry is left to pass
-# down. Then reset only its contents, which wipes their explicit ACEs and lets them
-# inherit from the locked folder.
-Set-AdminOnlyDirectoryAcl -Path $PROVIDER_DIR
-if (Get-ChildItem -LiteralPath $PROVIDER_DIR -Force) {
-    icacls "$PROVIDER_DIR\*" /reset /T /Q | Out-Null
-    if ($LASTEXITCODE -ne 0) { Write-Error "Failed to reset ACLs in $PROVIDER_DIR" }
-}
-
-icacls $PROVIDER_DIR /grant "${ASM_SERVICE_ACCOUNT}:(OI)(CI)RX" /T /Q | Out-Null
-Write-Host "  Granted Read+Execute ACL to $ASM_SERVICE_ACCOUNT on $PROVIDER_DIR"
-
-icacls $PROVIDER_DIR /grant "${ACM_SERVICE_ACCOUNT}:(OI)(CI)RX" /T /Q | Out-Null
-Write-Host "  Granted Read+Execute ACL to $ACM_SERVICE_ACCOUNT on $PROVIDER_DIR"
 
 
 $LOGS_DIR = "$PROVIDER_DIR\logs"

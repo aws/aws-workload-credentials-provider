@@ -71,29 +71,34 @@ pub fn err_response(err_code: &str, msg: &str) -> String {
 /// # Returns
 ///
 /// * `Ok(String)` - The SSRF token value.
-/// * `Err(Error)` - Error indicating that the variable is not set or could not be read.
+/// * `Err(Error)` - Error indicating that the variable is not set, could not be read, or is empty.
 #[doc(hidden)]
 pub fn get_token(ssrf_env_variables: &[String]) -> Result<String, Box<dyn std::error::Error>> {
     // Iterate through the env name list looking for the first variable set
-    #[allow(clippy::redundant_closure)]
     let found = ssrf_env_variables
         .iter()
-        .map(|n| var(n))
-        .filter_map(|r| r.ok())
-        .next();
-    if found.is_none() {
+        .find_map(|n| var(n).ok().map(|val| (n, val)));
+    let Some((name, val)) = found else {
         return Err(Box::new(VarError::NotPresent));
-    }
-    let val = found.unwrap();
+    };
 
-    // If the variable is not a reference to a file, just return the value.
-    if !val.starts_with("file://") {
-        return Ok(val);
-    }
+    // The value itself, or the contents of the file it refers to without the
+    // white space around it and any byte order mark a Windows editor may have
+    // added, wherever the mark sits in that white space.
+    let token = match val.strip_prefix("file://") {
+        None => val,
+        Some(file) => fs::read_to_string(file)?
+            .trim_matches(|c: char| c == '\u{feff}' || c.is_whitespace())
+            .to_string(),
+    };
 
-    // Read and return the contents of the file.
-    let file = val.strip_prefix("file://").unwrap();
-    Ok(fs::read_to_string(file)?.trim().to_string())
+    // An empty token would let through every request whose token header is
+    // empty. A set but empty variable is an error rather than skipped, so the
+    // provider and its clients don't end up using different variables.
+    if token.trim().is_empty() {
+        return Err(format!("{name} is set, but the SSRF token is empty").into());
+    }
+    Ok(token)
 }
 
 #[doc(hidden)]
@@ -788,6 +793,54 @@ pub mod tests {
                 .to_string(),
             NO_SUCH_FILE_ERROR_MSG
         );
+    }
+
+    // Verify an empty or blank token is refused, from a variable or a file,
+    // even when a later variable in the list is set.
+    #[test]
+    fn test_empty_token_is_refused() {
+        let tmpfile = tmpfile_name("test_empty_token_is_refused");
+        let _cleanup = CleanUp {
+            file: Some(&tmpfile),
+        };
+        std::fs::write(&tmpfile, " \u{feff}\n").expect("could not write");
+        let file: &'static str = Box::leak(Box::new(format!("file://{tmpfile}")));
+        for value in ["", "  ", file] {
+            set_test_vars(vec![("AWS_TOKEN", value), ("AWS_SESSION_TOKEN", "abc123")]);
+            let cfg = ConfigValidator::new()
+                .validate(None)
+                .expect("config failed");
+            assert_eq!(
+                get_token(&cfg.secrets_manager.security.ssrf_env_variables)
+                    .err()
+                    .map(|e| e.to_string()),
+                Some("AWS_TOKEN is set, but the SSRF token is empty".to_string()),
+                "{value:?}"
+            );
+        }
+    }
+
+    // Verify a byte order mark in the white space around the token file's
+    // token is dropped, at the start of the file or after other white space.
+    #[test]
+    fn test_byte_order_mark_is_dropped() {
+        let tmpfile = tmpfile_name("test_byte_order_mark_is_dropped");
+        let _cleanup = CleanUp {
+            file: Some(&tmpfile),
+        };
+        let file: &'static str = Box::leak(Box::new(format!("file://{tmpfile}")));
+        for contents in ["\u{feff}abc\n", " \u{feff}abc \n"] {
+            std::fs::write(&tmpfile, contents).expect("could not write");
+            set_test_vars(vec![("AWS_TOKEN", file)]);
+            let cfg = ConfigValidator::new()
+                .validate(None)
+                .expect("config failed");
+            assert_eq!(
+                get_token(&cfg.secrets_manager.security.ssrf_env_variables).expect("token fail"),
+                "abc",
+                "{contents:?}"
+            );
+        }
     }
 
     // Verify the first variable in the list takes precedence

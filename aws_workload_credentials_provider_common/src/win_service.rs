@@ -150,15 +150,11 @@ fn init_service_logger(kind: ServiceKind, logging: &LoggingConfig) -> ServiceRes
     let dir = log_dir().map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
         format!("failed to resolve log dir: {e}").into()
     })?;
-    init_logger(
-        logging.log_level,
-        logging.log_to_file,
-        kind.log_file_name(),
-        &dir,
+    init_logger(logging, kind.log_file_name(), &dir).map_err(
+        |e| -> Box<dyn std::error::Error + Send + Sync> {
+            format!("failed to initialize logger: {e}").into()
+        },
     )
-    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-        format!("failed to initialize logger: {e}").into()
-    })
 }
 
 /// Returns true when `e` indicates the process wasn't launched by SCM (Win32

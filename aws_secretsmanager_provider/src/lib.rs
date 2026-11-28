@@ -129,7 +129,7 @@ mod tests {
     use super::*;
     use aws_sdk_secretsmanager as secretsmanager;
     use aws_workload_credentials_provider_common::config::types::{
-        LoggingConfig, SecretsManagerConfig, SecurityConfig,
+        SecretsManagerConfig, SecurityConfig,
     };
     use aws_workload_credentials_provider_common::config::validator::ConfigValidator;
     use bytes::Bytes;
@@ -192,15 +192,11 @@ mod tests {
         headers: Vec<(&str, &str)>,
         opt_client: Option<secretsmanager::Client>,
     ) -> Result<Vec<(StatusCode, Bytes)>, Box<dyn std::error::Error>> {
-        let cfg = ValidatedConfig {
-            logging: LoggingConfig::default(),
-            secrets_manager: SecretsManagerConfig {
-                http_port: 0,
-                max_conn: 1,
-                ..Default::default()
-            },
-            acm: None,
-            warnings: Vec::new(),
+        let mut cfg = ValidatedConfig::default();
+        cfg.secrets_manager = SecretsManagerConfig {
+            http_port: 0,
+            max_conn: 1,
+            ..Default::default()
         };
         let (tx_addr, rx_addr) = mpsc::channel(); // Open channel for server to report the port
         let token = CancellationToken::new();
@@ -357,18 +353,14 @@ mod tests {
     // Verify the correct error is returned when the token env var is not set.
     #[tokio::test]
     async fn no_token_env() {
-        let cfg = ValidatedConfig {
-            logging: LoggingConfig::default(),
-            secrets_manager: SecretsManagerConfig {
-                http_port: 0,
-                security: SecurityConfig {
-                    ssrf_env_variables: vec!["FAIL_TOKEN".to_string()],
-                    ..Default::default()
-                },
+        let mut cfg = ValidatedConfig::default();
+        cfg.secrets_manager = SecretsManagerConfig {
+            http_port: 0,
+            security: SecurityConfig {
+                ssrf_env_variables: vec!["FAIL_TOKEN".to_string()],
                 ..Default::default()
             },
-            acm: None,
-            warnings: Vec::new(),
+            ..Default::default()
         };
 
         let err = init_listener(&cfg)
@@ -417,14 +409,10 @@ mod tests {
             .expect("Could not bind to port");
         let port = listener.local_addr().expect("can not find port").port();
 
-        let cfg = ValidatedConfig {
-            logging: LoggingConfig::default(),
-            secrets_manager: SecretsManagerConfig {
-                http_port: port,
-                ..Default::default()
-            },
-            acm: None,
-            warnings: Vec::new(),
+        let mut cfg = ValidatedConfig::default();
+        cfg.secrets_manager = SecretsManagerConfig {
+            http_port: port,
+            ..Default::default()
         };
 
         let err = init_listener(&cfg)

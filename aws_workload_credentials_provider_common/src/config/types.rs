@@ -22,8 +22,10 @@ use super::error::{ValidationError, ValidationErrorCode};
 // Validated Configuration Types
 // ============================================================================
 
-/// Validated configuration result.
-#[derive(Debug, Clone)]
+/// Validated configuration result. Callers start from
+/// `ValidatedConfig::default()` and override what they need.
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct ValidatedConfig {
     /// Logging configuration
     pub logging: LoggingConfig,
@@ -35,9 +37,40 @@ pub struct ValidatedConfig {
     /// initialized. Validation runs before any logger exists, so a `log`
     /// call made during validation would be dropped.
     pub warnings: Vec<String>,
+    /// Telemetry configuration (opt-in, per capability)
+    pub telemetry: TelemetryConfig,
+}
+
+/// What telemetry the customer consented to send, and whether to dry-run it.
+/// All fields default to `false`. `secrets_manager_enabled` and `acm_enabled`
+/// come from `[telemetry.<capability>] enabled`.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct TelemetryConfig {
+    /// Whether `[telemetry.secrets_manager]` is enabled. Nothing sends Secrets
+    /// Manager telemetry, so it has no effect.
+    pub secrets_manager_enabled: bool,
+
+    /// ACM telemetry enabled (opt-in, default off). Covers automation records
+    /// and everything else the ACM process sends, except discovery records.
+    pub acm_enabled: bool,
+
+    /// Whether certificate discovery is on (`[capabilities.acm] enabled` and
+    /// `[capabilities.acm.discovery] enabled`). Turning discovery on is the
+    /// customer's consent to send its records, so this, not `acm_enabled`,
+    /// gates them. Set from the ACM config, not `[telemetry]`.
+    pub acm_discovery_enabled: bool,
+
+    /// Log each request's JSON instead of sending it, so an operator can audit
+    /// the output before enabling. A request holds one discovery batch or up to
+    /// 100 automation records. Each request is one line in
+    /// `acm_provider_telemetry_dryrun.log` in the log directory, or on the
+    /// console when `log_to_file` is false, whatever `log_level` is.
+    pub dry_run: bool,
 }
 
 /// Logging configuration for the provider.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct LoggingConfig {
     /// The level of logging the provider provides (debug, info, warn, error, or none)
@@ -45,6 +78,11 @@ pub struct LoggingConfig {
 
     /// Where logs are written (file or stdout)
     pub log_to_file: bool,
+
+    /// Whether `[telemetry] dry_run` is on. The logger then logs telemetry
+    /// records at any `log_level`, to their own file when `log_to_file` is set.
+    /// Set from `[telemetry]`, not `[logging]`.
+    pub telemetry_dry_run: bool,
 }
 
 impl Default for LoggingConfig {
@@ -52,6 +90,7 @@ impl Default for LoggingConfig {
         Self {
             log_level: LogLevel::Info,
             log_to_file: true,
+            telemetry_dry_run: false,
         }
     }
 }
@@ -169,6 +208,8 @@ pub struct AcmConfig {
     /// Certificate configurations keyed by certificate ARN
     pub certificates: HashMap<String, CertificateConfig>,
 
+    /// Discovery configuration (`None` means discovery is not configured)
+    pub discovery: Option<DiscoveryConfig>,
     /// Directory the provider writes the generated per-watcher configuration
     /// files to, shared read-only with the watcher's container.
     pub watcher_config_dir: PathBuf,
@@ -178,6 +219,38 @@ pub struct AcmConfig {
     pub watcher_requests_dir: PathBuf,
 }
 
+/// Default time budget for one discovery cycle.
+pub const DEFAULT_DISCOVERY_TIMEOUT_SECS: u64 = 300;
+/// Default TLS ports probed when no targets are configured.
+pub const DEFAULT_DISCOVERY_PORTS: &[u16] = &[443, 8443, 4443];
+
+/// Validated discovery configuration for the certificate discovery capability.
+#[derive(Debug, Clone)]
+pub struct DiscoveryConfig {
+    /// Whether discovery is enabled. In the config file, turning it on also
+    /// consents to sending what it finds: the validator sets
+    /// `TelemetryConfig::acm_discovery_enabled` from it.
+    pub enabled: bool,
+    /// Max time for one discovery cycle in seconds.
+    pub timeout_secs: u64,
+    /// Port → SNI hostnames. Each port is probed once without SNI,
+    /// then once per hostname.
+    pub discovery_targets: HashMap<u16, Vec<String>>,
+}
+
+impl Default for DiscoveryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            timeout_secs: DEFAULT_DISCOVERY_TIMEOUT_SECS,
+            discovery_targets: DEFAULT_DISCOVERY_PORTS
+                .iter()
+                .map(|&port| (port, Vec::new()))
+                .collect(),
+        }
+    }
+}
+
 impl Default for AcmConfig {
     fn default() -> Self {
         Self {
@@ -185,6 +258,7 @@ impl Default for AcmConfig {
             certificates: HashMap::new(),
             watcher_config_dir: PathBuf::from(DEFAULT_WATCHER_CONFIG_DIR),
             watcher_requests_dir: PathBuf::from(DEFAULT_WATCHER_REQUESTS_DIR),
+            discovery: None,
         }
     }
 }
@@ -415,6 +489,9 @@ pub struct ConfigInput {
 
     // Nested logging
     pub logging: Option<LoggingConfigInput>,
+
+    // Top-level telemetry section
+    pub telemetry: Option<TelemetryConfigInput>,
 }
 
 /// Capabilities section containing Secrets Manager and ACM configurations.
@@ -469,6 +546,34 @@ pub struct LoggingConfigInput {
     pub log_to_file: Option<bool>,
 }
 
+/// Telemetry configuration in TOML (`[telemetry]` section). Each capability has
+/// its own switch, mirroring `[capabilities.X]`. Certificate discovery is the
+/// exception: turning it on (`[capabilities.acm.discovery] enabled`) is the
+/// consent for its records, and `[telemetry.acm]` doesn't affect them.
+/// `dry_run` applies to them too.
+///
+/// ```toml
+/// [telemetry]
+/// dry_run = false
+///
+/// [telemetry.acm]
+/// enabled = true
+/// ```
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct TelemetryConfigInput {
+    pub secrets_manager: Option<TelemetryCapabilityInput>,
+    pub acm: Option<TelemetryCapabilityInput>,
+    pub dry_run: Option<bool>,
+}
+
+/// Per-capability telemetry switch in TOML (`[telemetry.<capability>]`).
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct TelemetryCapabilityInput {
+    pub enabled: Option<bool>,
+}
+
 /// Pre-fetch configuration input from TOML.
 #[derive(Debug, Deserialize, Default, Clone)]
 #[serde(deny_unknown_fields)]
@@ -521,6 +626,32 @@ pub struct AcmConfigInput {
     /// Override for the watcher refresh request directory.
     /// Defaults to [`DEFAULT_WATCHER_REQUESTS_DIR`] when omitted.
     pub watcher_requests_dir: Option<String>,
+    pub discovery: Option<DiscoveryConfigInput>,
+}
+
+/// Raw TOML input for the certificate discovery capability.
+///
+/// When `enabled = true` and no `discovery_targets` are provided, the default
+/// ports (443, 8443, 4443) are probed without SNI. Turning discovery on also
+/// consents to sending what it finds to the telemetry service;
+/// `[telemetry.acm]` doesn't affect it.
+///
+/// ```toml
+/// [capabilities.acm.discovery]
+/// enabled = true
+/// timeout_secs_override = 300
+///
+/// [capabilities.acm.discovery.discovery_targets]
+/// 443 = ["api.example.com", "www.example.com"]
+/// 8443 = []
+/// ```
+#[derive(Debug, Deserialize, Default, Clone)]
+// No `deny_unknown_fields`: unknown keys are ignored so newer config keys can
+// ship before the binary that reads them.
+pub struct DiscoveryConfigInput {
+    pub enabled: Option<bool>,
+    pub timeout_secs_override: Option<u64>,
+    pub discovery_targets: Option<HashMap<u16, Vec<String>>>,
 }
 
 #[cfg(unix)]
@@ -585,6 +716,29 @@ mod tests {
             config.watcher_requests_dir,
             PathBuf::from(DEFAULT_WATCHER_REQUESTS_DIR)
         );
+        assert!(config.discovery.is_none());
+    }
+
+    /// Discovery defaults to off, the default timeout and three default ports.
+    #[test]
+    fn test_discovery_config_defaults() {
+        let config = DiscoveryConfig::default();
+
+        assert!(!config.enabled);
+        assert_eq!(config.timeout_secs, DEFAULT_DISCOVERY_TIMEOUT_SECS);
+        assert_eq!(
+            config.discovery_targets,
+            HashMap::from([(443, Vec::new()), (4443, Vec::new()), (8443, Vec::new())])
+        );
+    }
+
+    #[test]
+    fn test_telemetry_config_defaults() {
+        let config = TelemetryConfig::default();
+        assert!(!config.secrets_manager_enabled);
+        assert!(!config.acm_enabled);
+        assert!(!config.acm_discovery_enabled);
+        assert!(!config.dry_run);
     }
 
     #[test]

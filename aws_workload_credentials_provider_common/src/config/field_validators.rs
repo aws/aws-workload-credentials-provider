@@ -146,12 +146,34 @@ impl<F: FileSystem> FilePathValidator<F> {
     /// Validates a file path for certificate output files.
     ///
     /// Ensures the path is:
+    /// - Valid UTF-8 and free of control characters
     /// - Absolute
     /// - Parent directory exists
     /// - Parent directory resolves to itself (no symlinks or `..` indirection)
     ///
+    /// Both are rejected because the parent directory is written into the
+    /// root-owned systemd drop-in: a newline would start a new directive, and
+    /// a non-UTF-8 name cannot be written as the same directory.
+    ///
     /// Note: Does not check if the file itself exists (it will be created).
     pub fn validate(&self, field_name: &str, path: &Path) -> Result<(), ValidationError> {
+        let Some(path_str) = path.to_str() else {
+            return Err(ValidationError::with_guidance(
+                field_name.to_string(),
+                ValidationErrorCode::UnsafePath,
+                INVALID_FILE_PATH_ERR_MSG.to_string(),
+                format!("Path must be valid UTF-8, got: {:?}", path),
+            ));
+        };
+        if path_str.chars().any(char::is_control) {
+            return Err(ValidationError::with_guidance(
+                field_name.to_string(),
+                ValidationErrorCode::UnsafePath,
+                INVALID_FILE_PATH_ERR_MSG.to_string(),
+                format!("Path must not contain control characters, got: {:?}", path),
+            ));
+        }
+
         // Check if path is absolute
         if !path.is_absolute() {
             return Err(ValidationError::with_guidance(
@@ -769,6 +791,51 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert_eq!(err.code, ValidationErrorCode::RelativePath);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_file_path_validator_rejects_control_characters() {
+        // Parent directories exist, so only the control-character check fails.
+        let injected = "/tmp/holder\nUser=root\nExecStartPre=/tmp/pwn.sh\n#";
+        let fs = MockFileSystem::new()
+            .with_dir(injected)
+            .with_dir("/etc/a\rb")
+            .with_dir("/etc/a\0b")
+            .with_dir("/etc/a\tb");
+        let validator = FilePathValidator::new(Arc::new(fs));
+
+        for path in [
+            format!("{injected}/cert.pem"),
+            "/etc/a\rb/cert.pem".to_string(),
+            "/etc/a\0b/cert.pem".to_string(),
+            "/etc/a\tb/cert.pem".to_string(),
+            "/etc/certs/cert\n.pem".to_string(),
+        ] {
+            let err = validator
+                .validate("test", Path::new(&path))
+                .expect_err(&format!("expected {path:?} to be rejected"));
+            assert_eq!(err.code, ValidationErrorCode::UnsafePath, "{path:?}");
+            assert!(err.guidance.unwrap().contains("control characters"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_file_path_validator_rejects_non_utf8() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        // Rejected before the parent is looked up, so the mock needs no
+        // directory.
+        let validator = FilePathValidator::new(Arc::new(MockFileSystem::new()));
+
+        let path = Path::new(OsStr::from_bytes(b"/etc/a\xffb/cert.pem"));
+        let err = validator
+            .validate("test", path)
+            .expect_err("a non-UTF-8 path must be rejected");
+        assert_eq!(err.code, ValidationErrorCode::UnsafePath);
+        assert!(err.guidance.unwrap().contains("valid UTF-8"));
     }
 
     #[cfg(unix)]

@@ -176,9 +176,37 @@ pub fn wait_for_marker(marker: &Path, config: &str, log: &Transcript) {
     }
 }
 
-/// Blocks until `pending` exists and is empty, or fails the test. The
-/// reload's requests are deleted just after it completes, which is just
-/// after the marker appears.
+/// Blocks until the status file is present and contains complete JSON.
+pub fn wait_for_status(outbox: &Path, command_id: &str, log: &Transcript) -> serde_json::Value {
+    let path = outbox.join(format!("{command_id}.status"));
+    let deadline = Instant::now() + MARKER_TIMEOUT;
+    loop {
+        if let Ok(bytes) = std::fs::read(&path) {
+            if let Ok(value) = serde_json::from_slice(&bytes) {
+                return value;
+            }
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "status '{}' did not contain complete JSON within {:?}.\n{}",
+                path.display(),
+                MARKER_TIMEOUT,
+                log.render()
+            );
+        }
+        std::thread::sleep(MARKER_POLL_INTERVAL);
+    }
+}
+
+/// Asserts that startup did not create or consume any outbox entries.
+pub fn assert_outbox_empty(outbox: &Path) {
+    let entries: Vec<_> = std::fs::read_dir(outbox)
+        .expect("the outbox directory should exist")
+        .filter_map(|entry| entry.ok())
+        .collect();
+    assert!(entries.is_empty(), "unexpected outbox entries: {entries:?}");
+}
+
 pub fn wait_for_empty_pending(pending: &Path, log: &Transcript) {
     let deadline = Instant::now() + PENDING_TIMEOUT;
     loop {

@@ -12,6 +12,9 @@ use tokio::time::{timeout, Duration};
 /// Maximum time a refresh command is allowed to run before being considered hung.
 pub const REFRESH_COMMAND_TIMEOUT: Duration = Duration::from_mins(15);
 
+/// Largest startup hold accepted by a watcher.
+pub const MAX_STARTUP_HOLD: Duration = Duration::from_mins(5);
+
 /// Interface for executing refresh actions after certificate renewal.
 pub trait RefreshExecutor: Send + Sync {
     fn execute(

@@ -1,4 +1,4 @@
-FROM rust:alpine as builder
+FROM public.ecr.aws/docker/library/rust:alpine as builder
 
 WORKDIR /app
 
