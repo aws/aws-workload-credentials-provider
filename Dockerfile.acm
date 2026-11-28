@@ -10,7 +10,7 @@
 # The provider runs as the non-root user 65532, so the image starts where Pod
 # Security Standards or admission policies require `runAsNonRoot`.
 
-FROM public.ecr.aws/docker/library/rust:alpine AS builder
+FROM rust:alpine AS builder
 
 ARG CONFIG
 
