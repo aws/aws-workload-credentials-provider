@@ -408,7 +408,7 @@ pub fn read_claimed(path: &Path) -> Option<RefreshRequest> {
         }
         Err(e) if e.is_unusable() => {
             warn!("Deleting {:?}: it isn't a usable request ({})", path, e);
-            delete(path);
+            let _ = delete(path);
             None
         }
         Err(e) => {
@@ -424,13 +424,19 @@ pub fn read_claimed(path: &Path) -> Option<RefreshRequest> {
 /// Deletes one request file from the pending directory.
 ///
 /// A missing file is success: there is nothing left to delete.
-pub fn delete(path: &Path) {
+pub fn delete(path: &Path) -> io::Result<()> {
     match fs::remove_file(path) {
-        Ok(()) => debug!("Deleted request {:?}", path),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Ok(()) => {
+            debug!("Deleted request {:?}", path);
+            Ok(())
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         // Loud: a request that cannot be deleted is recovered, and its reload
         // run again, on every start.
-        Err(e) => error!("Failed to delete request {:?}: {}", path, e),
+        Err(e) => {
+            error!("Failed to delete request {:?}: {}", path, e);
+            Err(e)
+        }
     }
 }
 
@@ -451,22 +457,25 @@ pub struct Claimed {
 ///    never created: `verify_roots_present` has already checked it.
 /// 2. Check `<watcher_id>/` ([`WatcherEnv::verify_watcher_requests_dir`])
 ///    before anything is created in it.
-/// 3. Create `inbox/` if it is missing, with [`INBOX_DIR_MODE`] on Unix.
-/// 4. Check `inbox/` ([`WatcherEnv::verify_inbox_leaf`]).
-/// 5. Create `pending/` if it is missing: owner-only on Unix, since the ACM
+/// 3. Create `outbox/` if it is missing, with [`OUTBOX_DIR_MODE`] on Unix.
+/// 4. Check `outbox/` ([`WatcherEnv::verify_outbox_leaf`]).
+/// 5. Create `inbox/` if it is missing, with [`INBOX_DIR_MODE`] on Unix.
+///    After `outbox/`, so an `inbox/` the provider can publish to means this
+///    watcher reports statuses.
+/// 6. Check `inbox/` ([`WatcherEnv::verify_inbox_leaf`]).
+/// 7. Create `pending/` if it is missing: owner-only on Unix, since the ACM
 ///    provider never uses it.
-/// 6. Check `pending/` the same way.
-/// 7. Recover its requests ([`recover`]).
+/// 8. Check `pending/` the same way.
+/// 9. Recover its requests ([`recover`]).
 ///
 /// Every create is one level only.
 ///
 /// Nothing in `inbox/` is touched. Its requests, including any left by a
 /// previous run, are claimed by the event loop's first scan, and the ACM
-/// provider's temp files are never touched at all. `outbox/` is Phase 2 and
-/// untouched.
+/// provider's temp files are never touched at all.
 ///
-/// Any failure is fatal: it means the volume this watcher exists to read is
-/// not what it should be.
+/// Any failure is fatal: it means the volume this watcher exists to read and
+/// publish on is not what it should be.
 pub fn prepare_startup_state(
     env: &WatcherEnv,
     filesystem: &impl FileSystem,
@@ -475,6 +484,18 @@ pub fn prepare_startup_state(
     // after it refuses the symlink before anything is created through it.
     create_shared_dir(&env.watcher_requests_dir(), WATCHER_REQUESTS_DIR_MODE)?;
     env.verify_watcher_requests_dir(filesystem)
+        .map_err(|source| StartupError::RequestDirInvalid { source })?;
+
+    let outbox = env.outbox_dir();
+    if create_request_dir(&outbox, OUTBOX_DIR_MODE).map_err(|source| {
+        StartupError::RequestDirUncreatable {
+            path: outbox.clone(),
+            source,
+        }
+    })? {
+        info!("Created the status outbox directory '{}'", outbox.display());
+    }
+    env.verify_outbox_leaf(filesystem)
         .map_err(|source| StartupError::RequestDirInvalid { source })?;
 
     create_shared_dir(&env.inbox_dir(), INBOX_DIR_MODE)?;
@@ -520,6 +541,10 @@ const INBOX_DIR_MODE: u32 = 0o770;
 /// The Unix mode `pending/` is created with. Owner-only: only the watcher
 /// uses it.
 const PENDING_DIR_MODE: u32 = 0o700;
+
+/// The Unix mode `outbox/` is created with. The watcher writes statuses and
+/// the ACM provider reads and deletes them, so both processes need access.
+const OUTBOX_DIR_MODE: u32 = 0o770;
 
 /// Creates `<watcher_id>/` or `inbox/` with [`create_request_dir`], logging
 /// a create.
@@ -1329,7 +1354,7 @@ mod tests {
     #[test]
     fn delete_tolerates_a_missing_file() {
         let tmp = TempDir::new().unwrap();
-        delete(&tmp.path().join(req_name(1)));
+        let _ = delete(&tmp.path().join(req_name(1)));
     }
 
     // -- recover --
@@ -1406,7 +1431,7 @@ mod tests {
         let first = recover(tmp.path()).unwrap();
         assert_eq!(first.len(), MAX_REQUESTS_PER_SCAN);
         for claimed in &first {
-            delete(&tmp.path().join(&claimed.name));
+            let _ = delete(&tmp.path().join(&claimed.name));
         }
 
         let second = recover(tmp.path()).unwrap();
@@ -1620,11 +1645,12 @@ mod tests {
         assert_eq!(fs::read_dir(&elsewhere).unwrap().count(), 0);
     }
 
-    /// An inbox that cannot be created is fatal and names it. Here
+    /// `outbox/` is created first, so one that cannot be created is fatal,
+    /// names it, and leaves no `inbox/` for the provider to publish to. Here
     /// `<watcher_id>/` is read-only.
     #[cfg(unix)]
     #[test]
-    fn startup_reports_an_inbox_directory_that_cannot_be_created() {
+    fn startup_creates_no_inbox_when_the_outbox_cannot_be_created() {
         use std::os::unix::fs::PermissionsExt;
 
         let tmp = TempDir::new().unwrap();
@@ -1643,8 +1669,9 @@ mod tests {
         let StartupError::RequestDirUncreatable { path, .. } = &err else {
             panic!("expected RequestDirUncreatable, got {err}");
         };
-        assert_eq!(*path, env.inbox_dir());
-        assert!(err.to_string().contains("inbox"), "{err}");
+        assert_eq!(*path, env.outbox_dir());
+        assert!(err.to_string().contains("outbox"), "{err}");
+        assert!(!env.inbox_dir().exists());
         assert!(!env.pending_dir().exists());
     }
 
@@ -1991,6 +2018,7 @@ mod tests {
 
         let tmp = TempDir::new().unwrap();
         let env = startup_env(&tmp);
+        fs::create_dir(env.outbox_dir()).unwrap();
         let watcher_dir = env.inbox_dir().parent().unwrap().to_path_buf();
         fs::set_permissions(&watcher_dir, fs::Permissions::from_mode(0o500)).unwrap();
         let result = prepare_startup_state(&env, &RealFileSystem);

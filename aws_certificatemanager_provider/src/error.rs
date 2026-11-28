@@ -4,6 +4,8 @@ use aws_sdk_acm::operation::export_certificate::ExportCertificateError;
 use aws_smithy_runtime_api::client::{orchestrator::HttpResponse, result::SdkError};
 use thiserror::Error;
 
+use crate::telemetry::FailureCode;
+
 /// Errors that can occur during ACM Manager operations.
 ///
 /// Callers decide retry behavior based on the variant:
@@ -14,13 +16,26 @@ use thiserror::Error;
 pub enum AcmManagerError {
     /// Retryable: server errors, timeouts, throttling, request-in-progress.
     #[error("{0}")]
-    Transient(String),
+    Transient(SdkFailure),
     /// Not retryable: bad ARN, resource not found, validation failure.
     #[error("{0}")]
-    NonTransient(String),
+    NonTransient(SdkFailure),
     /// Bug in our code or unexpected API response.
     #[error("InternalFailure: {0}")]
     InternalFailure(String),
+}
+
+/// A classified SDK failure: a closed error code plus a summary for logs.
+#[derive(Debug)]
+pub struct SdkFailure {
+    code: FailureCode,
+    summary: String,
+}
+
+impl std::fmt::Display for SdkFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.summary)
+    }
 }
 
 impl AcmManagerError {
@@ -28,22 +43,50 @@ impl AcmManagerError {
     pub fn is_transient(&self) -> bool {
         matches!(self, AcmManagerError::Transient(_))
     }
+
+    /// Error code for telemetry. It never carries the summary text.
+    pub fn telemetry_code(&self) -> FailureCode {
+        match self {
+            AcmManagerError::Transient(failure) | AcmManagerError::NonTransient(failure) => {
+                failure.code
+            }
+            AcmManagerError::InternalFailure(_) => FailureCode::AgentInternal,
+        }
+    }
 }
 
 /// Classifies an `ExportCertificate` SDK error into the appropriate `AcmManagerError` variant.
 pub(crate) fn classify_export_error(
     e: SdkError<ExportCertificateError, HttpResponse>,
 ) -> AcmManagerError {
-    let summary = summarize_sdk_error(&e);
+    let failure = SdkFailure {
+        code: sdk_error_code(&e),
+        summary: summarize_sdk_error(&e),
+    };
     if is_transient_error(&e)
         || matches!(
             e.as_service_error(),
             Some(ExportCertificateError::RequestInProgressException(_))
         )
     {
-        AcmManagerError::Transient(summary)
+        AcmManagerError::Transient(failure)
     } else {
-        AcmManagerError::NonTransient(summary)
+        AcmManagerError::NonTransient(failure)
+    }
+}
+
+/// The service code (e.g. `AccessDeniedException`), or a fixed token for a transport failure.
+fn sdk_error_code(e: &SdkError<ExportCertificateError, HttpResponse>) -> FailureCode {
+    match e {
+        SdkError::ServiceError(service_error) => {
+            FailureCode::from_sdk_code(service_error.err().meta().code().unwrap_or_default())
+        }
+        SdkError::TimeoutError(_) => FailureCode::TimeoutError,
+        SdkError::DispatchFailure(failure) if failure.is_timeout() => FailureCode::TimeoutError,
+        SdkError::DispatchFailure(failure) if failure.is_io() => FailureCode::ConnectionError,
+        SdkError::DispatchFailure(_) => FailureCode::DispatchFailure,
+        SdkError::ResponseError(_) => FailureCode::ConnectionError,
+        _ => FailureCode::Other,
     }
 }
 
@@ -112,6 +155,17 @@ where
     }
 }
 
+/// A watcher outcome that fails a certificate refresh without timing out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum WatcherFailureOutcome {
+    #[error("failure")]
+    Failure,
+    #[error("not_found")]
+    NotFound,
+    #[error("superseded")]
+    Superseded,
+}
+
 /// Errors from certificate refresh operations.
 #[derive(Debug, Error)]
 pub enum RefreshError {
@@ -135,8 +189,32 @@ pub enum RefreshError {
     #[error("Refresh command failed for {certificate_arn}: {source}")]
     CommandFailed {
         certificate_arn: String,
+        /// New certificate files were written before the command ran.
+        files_changed: bool,
         #[source]
         source: std::io::Error,
+    },
+
+    /// The watcher reported a non-timeout command failure.
+    #[error("Watcher refresh command failed for {certificate_arn}: {outcome}")]
+    WatcherFailed {
+        certificate_arn: String,
+        files_changed: bool,
+        outcome: WatcherFailureOutcome,
+    },
+
+    /// The watcher reported that the refresh command ran out its time.
+    #[error("Watcher refresh command timed out for {certificate_arn}")]
+    WatcherTimeout {
+        certificate_arn: String,
+        files_changed: bool,
+    },
+
+    /// No watcher status arrived before the provider's response deadline.
+    #[error("No watcher status for {certificate_arn} before the response deadline")]
+    WatcherNoStatus {
+        certificate_arn: String,
+        files_changed: bool,
     },
 
     /// Writing the refresh request to the certificate's watcher failed.
@@ -144,6 +222,8 @@ pub enum RefreshError {
     RequestFailed {
         certificate_arn: String,
         watcher_id: String,
+        /// New certificate files were written before the request was queued.
+        files_changed: bool,
         #[source]
         source: std::io::Error,
     },
@@ -267,6 +347,75 @@ mod tests {
         let err: SdkError<ExportCertificateError, HttpResponse> =
             SdkError::response_error("parse failed", raw);
         assert_eq!(summarize_sdk_error(&err), "ResponseError (HTTP 502)");
+    }
+
+    // -- telemetry_code tests --
+
+    #[tokio::test]
+    async fn telemetry_code_is_service_code() {
+        let rule = mock!(Client::export_certificate).then_http_response(|| {
+            aws_smithy_runtime_api::http::Response::new(
+                StatusCode::try_from(403).unwrap(),
+                SdkBody::from(r#"{"__type":"AccessDeniedException","message":"denied for arn:aws:iam::111122223333:role/x"}"#),
+            )
+        });
+        let err = make_error(rule).await;
+        assert_eq!(err.telemetry_code(), FailureCode::AccessDeniedException);
+        // Only the log summary keeps the message text.
+        assert!(err.to_string().contains("denied for"));
+    }
+
+    #[tokio::test]
+    async fn telemetry_code_is_other_without_service_code() {
+        let rule = mock!(Client::export_certificate).then_http_response(|| {
+            aws_smithy_runtime_api::http::Response::new(
+                StatusCode::try_from(404).unwrap(),
+                SdkBody::from("not found"),
+            )
+        });
+        assert_eq!(make_error(rule).await.telemetry_code(), FailureCode::Other);
+    }
+
+    #[test]
+    fn telemetry_code_tokens_for_transport_failures() {
+        use aws_smithy_runtime_api::client::result::ConnectorError;
+        use aws_smithy_types::retry::ErrorKind;
+        let raw = HttpResponse::new(StatusCode::try_from(502).unwrap(), SdkBody::from(""));
+        let cases: Vec<(SdkError<ExportCertificateError, HttpResponse>, FailureCode)> = vec![
+            (
+                SdkError::timeout_error("timed out"),
+                FailureCode::TimeoutError,
+            ),
+            (
+                SdkError::dispatch_failure(ConnectorError::timeout("connect".into())),
+                FailureCode::TimeoutError,
+            ),
+            (
+                SdkError::dispatch_failure(ConnectorError::io("reset".into())),
+                FailureCode::ConnectionError,
+            ),
+            (
+                SdkError::dispatch_failure(ConnectorError::other(
+                    "other".into(),
+                    Some(ErrorKind::TransientError),
+                )),
+                FailureCode::DispatchFailure,
+            ),
+            (
+                SdkError::response_error("parse", raw),
+                FailureCode::ConnectionError,
+            ),
+        ];
+        for (err, expected) in cases {
+            assert_eq!(sdk_error_code(&err), expected);
+        }
+    }
+
+    #[test]
+    fn telemetry_code_for_internal_failure_is_agent_internal() {
+        let err =
+            AcmManagerError::InternalFailure("no client for role arn:aws:iam::1:role/x".into());
+        assert_eq!(err.telemetry_code(), FailureCode::AgentInternal);
     }
 
     // -- is_transient_error: non-ServiceError branches --

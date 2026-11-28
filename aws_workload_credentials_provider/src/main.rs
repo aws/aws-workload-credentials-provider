@@ -1,5 +1,6 @@
 mod cli;
 
+use aws_workload_credentials_provider_common::config::types::LoggingConfig;
 use aws_workload_credentials_provider_common::config::validator::ConfigValidator;
 #[cfg(windows)]
 use aws_workload_credentials_provider_common::constants::RELOAD_SCRIPT_NAME;
@@ -52,7 +53,7 @@ fn acm_start(config_path: Option<String>) -> Result<(), Box<dyn std::error::Erro
     let config_path = resolve_config_path(config_path)?;
     let validated = ConfigValidator::new().validate(config_path.as_deref())?;
 
-    let acm_config = match validated.acm {
+    match &validated.acm {
         None => {
             eprintln!("ACM is not configured");
             return Ok(());
@@ -61,20 +62,15 @@ fn acm_start(config_path: Option<String>) -> Result<(), Box<dyn std::error::Erro
             eprintln!("ACM is explicitly disabled");
             return Ok(());
         }
-        Some(config) => config,
-    };
+        Some(_) => {}
+    }
 
     #[cfg(unix)]
     {
         let log_dir = log_dir()?;
-        init_logger(
-            validated.logging.log_level,
-            validated.logging.log_to_file,
-            "acm_provider",
-            &log_dir,
-        )?;
+        init_logger(&validated.logging, "acm_provider", &log_dir)?;
         log_validation_warnings(&validated.warnings);
-        aws_certificatemanager_provider::run_acm(acm_config)
+        aws_certificatemanager_provider::run_acm(validated)
     }
 
     #[cfg(windows)]
@@ -85,11 +81,12 @@ fn acm_start(config_path: Option<String>) -> Result<(), Box<dyn std::error::Erro
 
         let token = CancellationToken::new();
         let token_for_workload = token.clone();
-        let warnings = validated.warnings;
-        win_service::run_service(ServiceKind::Acm, validated.logging, token, move || {
+        let logging = validated.logging.clone();
+        let warnings = validated.warnings.clone();
+        win_service::run_service(ServiceKind::Acm, logging, token, move || {
             // The service logger is initialized before the workload starts.
             log_validation_warnings(&warnings);
-            aws_certificatemanager_provider::acm_workload(acm_config, token_for_workload)
+            aws_certificatemanager_provider::acm_workload(validated, token_for_workload)
         })
         .map_err(|e| -> Box<dyn std::error::Error> { e })
     }
@@ -108,8 +105,7 @@ fn sm_start(config_path: Option<String>) -> Result<(), Box<dyn std::error::Error
     {
         let log_dir = log_dir()?;
         init_logger(
-            validated.logging.log_level,
-            validated.logging.log_to_file,
+            &sm_logging(&validated.logging),
             "secrets_manager_provider",
             &log_dir,
         )?;
@@ -124,7 +120,7 @@ fn sm_start(config_path: Option<String>) -> Result<(), Box<dyn std::error::Error
 
         let token = CancellationToken::new();
         let token_for_workload = token.clone();
-        let logging = validated.logging.clone();
+        let logging = sm_logging(&validated.logging);
         win_service::run_service(ServiceKind::Sm, logging, token, move || {
             // The service logger is initialized before the workload starts.
             log_validation_warnings(&validated.warnings);
@@ -132,6 +128,14 @@ fn sm_start(config_path: Option<String>) -> Result<(), Box<dyn std::error::Error
         })
         .map_err(|e| -> Box<dyn std::error::Error> { e })
     }
+}
+
+/// The Secrets Manager process's logging: the same, but without a telemetry
+/// dry-run log, since that process sends no telemetry.
+fn sm_logging(logging: &LoggingConfig) -> LoggingConfig {
+    let mut logging = logging.clone();
+    logging.telemetry_dry_run = false;
+    logging
 }
 
 #[cfg(unix)]
@@ -254,6 +258,12 @@ fn setup_config_based_permissions(
     let acm_config = match validated.acm {
         Some(acm) if acm.enabled => acm,
         _ => {
+            // Remove what an earlier config with ACM enabled generated, so a
+            // disabled ACM leaves no sudo rule or write access behind after
+            // the ACM service is restarted. The installer intentionally leaves
+            // running services untouched.
+            sudoers::remove()?;
+            systemd::remove()?;
             println!("No ACM configuration found or ACM is disabled, skipping permissions setup");
             return Ok(());
         }
@@ -264,7 +274,8 @@ fn setup_config_based_permissions(
         sudoers::generate_and_install(&acm_config, config_path.as_deref())?;
         println!("Sudoers file written to {}", SUDOERS_PATH);
     } else {
-        println!("Skipping sudoers file generation");
+        sudoers::remove()?;
+        println!("Skipping sudoers file generation and removed any existing sudoers file");
     }
 
     // Generate systemd drop-in override with ReadWriteDirectories for cert paths
@@ -349,9 +360,20 @@ fn generate_installer_json(validated: &ValidatedConfig) -> String {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::should_copy_config;
+    use super::{should_copy_config, sm_logging, ConfigValidator};
     use std::os::unix::fs::symlink;
     use tempfile::TempDir;
+
+    #[test]
+    fn the_secrets_manager_process_gets_no_telemetry_dry_run_log() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[telemetry]\ndry_run = true\n").unwrap();
+        let validated = ConfigValidator::new().validate(path.to_str()).unwrap();
+
+        assert!(validated.logging.telemetry_dry_run);
+        assert!(!sm_logging(&validated.logging).telemetry_dry_run);
+    }
 
     #[test]
     fn skips_copy_for_identical_path() {

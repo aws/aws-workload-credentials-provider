@@ -12,4 +12,5 @@ TOKEN_SCRIPT=aws-workload-credentials-provider-token
 SM_SERVICE=aws-workload-credentials-provider-sm
 ACM_SERVICE=aws-workload-credentials-provider-acm
 PROVIDER_BIN=aws-workload-credentials-provider
-PROVIDER_SOURCE_DIR=../../target/release
+ACM_DROPIN_DIR="${SYSTEMD_FILES}/${ACM_SERVICE}.service.d"
+SUDOERS_FILE="/etc/sudoers.d/${PROVIDER_BIN}"

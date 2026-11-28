@@ -4,6 +4,11 @@ target/
 *.pdb
 logs/
 
+# Local Build Artifacts
+/build
+/rust-toolchain.toml
+build.log
+
 #######
 
 # Covers JetBrains IDEs: IntelliJ, RubyMine, PhpStorm, AppCode, PyCharm, CLion, Android Studio, WebStorm and Rider

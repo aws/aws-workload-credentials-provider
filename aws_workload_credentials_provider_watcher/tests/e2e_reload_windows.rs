@@ -18,10 +18,10 @@ use std::time::Duration;
 use tempfile::TempDir;
 
 use support::{
-    request_body, request_name, wait_for_empty_pending, wait_for_marker, watcher_config,
-    write_request, ChildGuard, Layout, Transcript, CONFIG_DIR_VAR, READY_TIMEOUT,
-    RECOVERED_ONE_LINE, REQUESTS_DIR_VAR, STARTUP_HOLD_MS, STARTUP_HOLD_MS_VAR, TEST_WATCHER_ID,
-    WATCHER_ID_VAR,
+    assert_outbox_empty, request_body, request_name, wait_for_empty_pending, wait_for_marker,
+    wait_for_status, watcher_config, write_request, ChildGuard, Layout, Transcript, COMMAND_ID,
+    CONFIG_DIR_VAR, READY_TIMEOUT, RECOVERED_ONE_LINE, REQUESTS_DIR_VAR, STARTUP_HOLD_MS,
+    STARTUP_HOLD_MS_VAR, TEST_WATCHER_ID, WATCHER_ID_VAR,
 };
 
 /// Characters, besides ASCII alphanumerics, a reload command element may
@@ -44,6 +44,9 @@ fn a_request_in_the_inbox_makes_the_watcher_binary_run_the_reload_command_on_win
 ) -> Result<(), Box<dyn Error>> {
     let watcher = Watcher::start(false)?;
 
+    // Startup does not consume or supersede outbox entries.
+    assert_outbox_empty(&watcher.layout.outbox);
+
     std::thread::sleep(STARTUP_SCAN_WINDOW);
     let request = write_request(&watcher.layout.inbox)?;
 
@@ -57,6 +60,13 @@ fn a_request_in_the_inbox_makes_the_watcher_binary_run_the_reload_command_on_win
     );
     // Deleted on complete: gone from `pending/` once the reload has finished.
     watcher.wait_for_empty_pending();
+    let status = watcher.wait_for_status();
+    assert_eq!(status["command_id"], COMMAND_ID);
+    assert_eq!(status["cert_arn"], support::ARN);
+    assert_eq!(status["request_created_at"], "2024-05-01T12:00:00Z");
+    assert_eq!(status["outcome"], "success");
+    assert_eq!(status["exit_code"], 0);
+    assert!(status["error_detail"].is_null());
 
     // At least the startup scan's per-scan directory check has run by now. It
     // repeats the root check and must not log the warning again.
@@ -74,8 +84,13 @@ fn a_request_left_in_pending_is_reloaded_and_deleted_at_startup_on_windows(
 ) -> Result<(), Box<dyn Error>> {
     let watcher = Watcher::start(true)?;
 
+    // Recovery keeps startup behavior unchanged and does not emit superseded.
+    assert_outbox_empty(&watcher.layout.outbox);
     watcher.wait_for_marker();
     watcher.wait_for_empty_pending();
+    let status = watcher.wait_for_status();
+    assert_eq!(status["outcome"], "success");
+    assert_eq!(status["command_id"], COMMAND_ID);
     assert_eq!(
         watcher.log.count(RECOVERED_ONE_LINE),
         1,
@@ -166,6 +181,10 @@ impl Watcher {
 
     fn wait_for_empty_pending(&self) {
         wait_for_empty_pending(&self.layout.pending, &self.log);
+    }
+
+    fn wait_for_status(&self) -> serde_json::Value {
+        wait_for_status(&self.layout.outbox, COMMAND_ID, &self.log)
     }
 
     /// Each root's unverifiable-mount-mode warning appears exactly once.

@@ -13,13 +13,57 @@ $ACM_SERVICE = "AWSWorkloadCredentialsProvider-ACM"
 $ASM_SERVICE_ACCOUNT = "NT SERVICE\$ASM_SERVICE"
 $ACM_SERVICE_ACCOUNT = "NT SERVICE\$ACM_SERVICE"
 
+function Get-VirtualServiceAccountSid {
+    param([Parameter(Mandatory)][string]$ServiceName)
+
+    $serviceNameBytes = [Text.Encoding]::Unicode.GetBytes($ServiceName.ToUpperInvariant())
+    $sha1 = [Security.Cryptography.SHA1]::Create()
+    try {
+        $hash = $sha1.ComputeHash($serviceNameBytes)
+    } finally {
+        $sha1.Dispose()
+    }
+
+    $parts = for ($offset = 0; $offset -lt $hash.Length; $offset += 4) {
+        ([BitConverter]::ToUInt32($hash, $offset)).ToString(
+            [Globalization.CultureInfo]::InvariantCulture)
+    }
+    return "S-1-5-80-$($parts -join '-')"
+}
+
+# The service SID remains computable after the service is deleted, so uninstall
+# followed by install can remove ACLs from the preserved previous config.
+$ACM_SERVICE_SID = "*$(Get-VirtualServiceAccountSid -ServiceName $ACM_SERVICE)"
+
 $SEED_TOKEN_TASK = "AWSWorkloadCredentialsProvider-SeedToken"
+$RELOAD_TASK_PREFIX = "AWSWorkloadCredentialsProvider-Reload-"
 $SEED_TOKEN_SCRIPT_PATH = "$BIN_DIR\aws-workload-credentials-provider-token.ps1"
 
 function Assert-Administrator {
     $current = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
     if (-not $current.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
         throw "This script must be run as Administrator."
+    }
+}
+
+<#
+.DESCRIPTION
+    Runs icacls with the given arguments and throws if it fails, so an ACL
+    that was not applied stops the script instead of leaving a gap.
+#>
+function Invoke-Icacls {
+    param([Parameter(Mandatory, ValueFromRemainingArguments)][string[]]$Arguments)
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        $output = (& icacls @Arguments 2>&1 | Out-String).Trim()
+        $exitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+    if ($exitCode -ne 0) {
+        $details = if ($output) { ": $output" } else { "" }
+        throw "icacls $($Arguments -join ' ') failed (exit $exitCode)$details"
     }
 }
 
@@ -42,7 +86,7 @@ function Stop-ProviderService {
 
 function Construct-TaskName($certificate) {
     $arnSuffix = $certificate.certificateArn -replace '[^a-zA-Z0-9\-]', '-'
-    return "AWSWorkloadCredentialsProvider-Reload-$arnSuffix"
+    return "$RELOAD_TASK_PREFIX$arnSuffix"
 }
 
 <#
@@ -104,15 +148,15 @@ function Remove-CertificatePermissions($cert) {
     $parentDirs = @($certPaths | ForEach-Object { Split-Path -Parent $_ }) | Select-Object -Unique
     foreach ($dir in $parentDirs) {
         if (Test-Path $dir) {
-            icacls $dir /remove "${ACM_SERVICE_ACCOUNT}" /Q | Out-Null
-            Write-Host "    Removed ACL for $ACM_SERVICE_ACCOUNT on $dir"
+            Invoke-Icacls $dir /remove $ACM_SERVICE_SID /Q
+            Write-Host "    Removed ACL for $ACM_SERVICE_SID on $dir"
         }
     }
 
     foreach ($filePath in $certPaths) {
         if (Test-Path $filePath) {
-            icacls $filePath /remove "${ACM_SERVICE_ACCOUNT}" /Q | Out-Null
-            Write-Host "    Removed ACL for $ACM_SERVICE_ACCOUNT on $filePath"
+            Invoke-Icacls $filePath /remove $ACM_SERVICE_SID /Q
+            Write-Host "    Removed ACL for $ACM_SERVICE_SID on $filePath"
         }
     }
 }
@@ -140,16 +184,19 @@ function Add-CertificatePermissions($cert) {
             Write-Warning "Parent directory not found, skipping ACL: $dir"
             continue
         }
-        icacls $dir /grant "${ACM_SERVICE_ACCOUNT}:(WD,R)" /Q | Out-Null
+        Invoke-Icacls $dir /grant "${ACM_SERVICE_ACCOUNT}:(WD,R)" /Q
         Write-Host "    Granted file-create and read ACL to $ACM_SERVICE_ACCOUNT on $dir"
     }
 
     foreach ($filePath in $certPaths) {
         if (-not (Test-Path $filePath)) {
-            Write-Warning "Certificate file not found, skipping ACL: $filePath"
+            # The provider creates the file on its first refresh and owns it.
+            # If another process creates it first, the service account cannot
+            # replace it until acmReloadConfig.ps1 grants access.
+            Write-Warning "Certificate file not found, skipping ACL: $filePath. If a process other than the provider creates it, run acmReloadConfig.ps1 afterwards."
             continue
         }
-        icacls $filePath /grant "${ACM_SERVICE_ACCOUNT}:M" /Q | Out-Null
+        Invoke-Icacls $filePath /grant "${ACM_SERVICE_ACCOUNT}:M" /Q
         Write-Host "    Granted Modify ACL to $ACM_SERVICE_ACCOUNT on $filePath"
     }
 
@@ -236,14 +283,14 @@ function Get-Config {
     try {
         $jsonOutput = & $ProviderBinary setup-config-based-permissions --config $Config 2>$null
         if ($LASTEXITCODE -ne 0) {
-            Write-Warning "config parsing failed (exit code $LASTEXITCODE) - will skip permission cleanup"
+            Write-Warning "The previous config at $Config could not be parsed (exit code $LASTEXITCODE). Old certificate permissions and scheduled tasks were not cleaned and may need manual removal; affected certificate paths and task names are unknown."
             return $null
         }
         $validatedConfig = ($jsonOutput -join "`n") | ConvertFrom-Json
         Write-Host "  Parsed config successfully"
         return $validatedConfig
     } catch {
-        Write-Warning "Failed to parse config: $_ - will skip permission cleanup"
+        Write-Warning "The previous config at $Config could not be parsed: $_. Old certificate permissions and scheduled tasks were not cleaned and may need manual removal; affected certificate paths and task names are unknown."
         return $null
     }
 }

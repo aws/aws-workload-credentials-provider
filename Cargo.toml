@@ -1,4 +1,4 @@
 [workspace]
 resolver = "2"
 
-members = ["aws_workload_credentials_provider", "aws_workload_credentials_provider_common", "aws_secretsmanager_provider", "aws_secretsmanager_caching", "aws_certificatemanager_provider", "integration-tests", "aws_workload_credentials_provider_watcher"]
+members = ["aws_workload_credentials_provider", "aws_workload_credentials_provider_common", "aws_secretsmanager_provider", "aws_secretsmanager_caching", "aws_certificatemanager_provider", "aws_certificatemanager_discovery", "integration-tests", "aws_workload_credentials_provider_watcher"]

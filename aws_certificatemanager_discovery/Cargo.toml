@@ -1,0 +1,21 @@
+[package]
+name = "aws_certificatemanager_discovery"
+version = "3.1.1"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+readme = "README.md"
+description = "TLS port probing for certificate discovery in the AWS Workload Credentials Provider."
+repository = "https://github.com/aws/aws-workload-credentials-provider"
+
+[features]
+fips = ["rustls/fips", "tokio-rustls/fips"]
+
+[dependencies]
+log = "0.4"
+rustls = "0.23"
+tokio = { version = "1", features = ["io-util", "net", "time"] }
+tokio-rustls = "0.26"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "time"] }

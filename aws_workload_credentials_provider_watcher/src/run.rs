@@ -16,7 +16,8 @@ use crate::env::{InboxValidator, WatcherEnv};
 use crate::error::RunError;
 use crate::inbox::{self, Claim};
 use crate::plan::{CommandId, ReloadPlan};
-use crate::reload::ReloadSink;
+use crate::reload::{ReloadOutcome, ReloadResult, ReloadSink};
+use crate::status::{StatusOutcome, StatusRecord, StatusSink};
 use crate::watch::{InboxWatcher, RescanReason, WatchEvent};
 use aws_workload_credentials_provider_common::watcher_request::RefreshRequest;
 
@@ -45,6 +46,10 @@ pub const STARTUP_HOLD_WINDOW: Duration = Duration::from_secs(30);
 /// up to this much latency instead of a missed reload.
 pub const PERIODIC_RESCAN_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Most statuses kept for a retry after their write failed; the oldest is
+/// dropped past this. Each is at most a few KiB.
+const MAX_UNPUBLISHED_STATUSES: usize = 1024;
+
 /// The shortest gap between two attempts to re-establish the watch, and the
 /// first step of the backoff after a failed one.
 ///
@@ -68,7 +73,7 @@ pub const REBIND_MAX_BACKOFF: Duration = Duration::from_secs(60);
 pub const SCAN_FAILURE_EXIT_WINDOW: Duration = Duration::from_secs(600);
 
 /// A finished reload, reported back to the loop.
-type Done = (CommandId, Result<(), io::Error>);
+type Done = (CommandId, ReloadResult);
 
 /// Runs the watcher until shutdown.
 ///
@@ -92,17 +97,20 @@ type Done = (CommandId, Result<(), io::Error>);
 ///
 /// Returns `Err` when the event channel closes, and when no scan has
 /// succeeded for [`SCAN_FAILURE_EXIT_WINDOW`].
-pub async fn run<S, F, W, V>(
+#[allow(clippy::too_many_arguments)]
+pub async fn run<S, T, F, W, V>(
     env: &WatcherEnv,
     validator: &V,
     plan: Arc<ReloadPlan>,
     sink: Arc<S>,
+    status: Arc<T>,
     watch: &mut W,
     recovered: Vec<inbox::Claimed>,
     shutdown: F,
 ) -> Result<(), RunError>
 where
     S: ReloadSink,
+    T: StatusSink,
     F: Future<Output = ()>,
     W: InboxWatcher,
     V: InboxValidator,
@@ -118,8 +126,12 @@ where
         pending_dir: env.pending_dir(),
         plan,
         sink,
+        status,
         queued: BTreeMap::new(),
         in_flight: BTreeMap::new(),
+        rejected: BTreeMap::new(),
+        deferred_statuses: BTreeMap::new(),
+        unpublished: Vec::new(),
         done_tx,
         holding: true,
         // `prepare` checked the roots just before this, so the first scan
@@ -211,6 +223,7 @@ where
 
             _ = rescan.tick() => {
                 debug!("Periodic rescan of '{}'", state.inbox.display());
+                state.retry_pending_statuses();
                 state.scan(ScanCause::Periodic)?;
             }
 
@@ -270,10 +283,11 @@ struct RebindState {
 struct Batch {
     arns: BTreeSet<String>,
     files: BTreeSet<OsString>,
+    requests: Vec<(OsString, RefreshRequest)>,
 }
 
 /// The loop's state.
-struct Loop<'a, S: ReloadSink, W, V> {
+struct Loop<'a, S: ReloadSink, T: StatusSink, W, V> {
     env: &'a WatcherEnv,
     validator: &'a V,
     watch: &'a mut W,
@@ -281,6 +295,7 @@ struct Loop<'a, S: ReloadSink, W, V> {
     pending_dir: PathBuf,
     plan: Arc<ReloadPlan>,
     sink: Arc<S>,
+    status: Arc<T>,
 
     /// Requests awaiting a reload, keyed by the command that reloads them.
     ///
@@ -310,6 +325,18 @@ struct Loop<'a, S: ReloadSink, W, V> {
     /// The batch each running reload covers. At most one per command.
     in_flight: BTreeMap<CommandId, Batch>,
 
+    /// Valid requests whose certificate has no command, waiting for the last
+    /// batch referencing their reused pending name to release that file.
+    rejected: BTreeMap<OsString, Vec<RefreshRequest>>,
+
+    /// Status records waiting for the final batch referencing a pending name
+    /// to release that file.
+    deferred_statuses: BTreeMap<OsString, Vec<StatusRecord>>,
+
+    /// Statuses whose pending file is already deleted but whose write failed,
+    /// retried by `retry_pending_statuses`. Lost on exit.
+    unpublished: Vec<StatusRecord>,
+
     done_tx: mpsc::UnboundedSender<Done>,
 
     /// True until the startup hold window closes.
@@ -327,7 +354,7 @@ struct Loop<'a, S: ReloadSink, W, V> {
     rebind: RebindState,
 }
 
-impl<S: ReloadSink, W: InboxWatcher, V: InboxValidator> Loop<'_, S, W, V> {
+impl<S: ReloadSink, T: StatusSink, W: InboxWatcher, V: InboxValidator> Loop<'_, S, T, W, V> {
     /// Handles a rescan request from the watch.
     ///
     /// A reason that needs a rebind inside [`REBIND_MIN_INTERVAL`] of the
@@ -610,9 +637,8 @@ impl<S: ReloadSink, W: InboxWatcher, V: InboxValidator> Loop<'_, S, W, V> {
                 request.certificate_arn,
                 self.inbox.display()
             );
-            if !self.is_referenced(&name) {
-                inbox::delete(&self.pending_dir.join(&name));
-            }
+            self.rejected.entry(name.clone()).or_default().push(request);
+            self.release_file(name);
             return false;
         };
 
@@ -622,8 +648,9 @@ impl<S: ReloadSink, W: InboxWatcher, V: InboxValidator> Loop<'_, S, W, V> {
         );
 
         let batch = self.queued.entry(id).or_default();
-        batch.arns.insert(request.certificate_arn);
-        batch.files.insert(name);
+        batch.arns.insert(request.certificate_arn.clone());
+        batch.files.insert(name.clone());
+        batch.requests.push((name, request));
 
         if !self.holding {
             self.maybe_start(id);
@@ -661,13 +688,36 @@ impl<S: ReloadSink, W: InboxWatcher, V: InboxValidator> Loop<'_, S, W, V> {
             // `complete` still clears `in_flight`, deletes the batch's files
             // and starts whatever queued meanwhile; otherwise the command
             // would never reload again.
-            let result = match tokio::spawn(async move { sink.reload(command, label).await }).await
-            {
-                Ok(result) => result,
-                Err(e) => Err(join_error_to_io(e)),
-            };
+            let task_label = label.clone();
+            let result =
+                match tokio::spawn(async move { sink.reload(command, task_label).await }).await {
+                    Ok(result) => result,
+                    Err(e) => {
+                        error!("Reload task for {} ended without a result: {}", label, e);
+                        ReloadResult {
+                            outcome: ReloadOutcome::Failure,
+                            exit_code: None,
+                            error_detail: None,
+                            started_at: crate::status::timestamp_now(),
+                            completed_at: crate::status::timestamp_now(),
+                        }
+                    }
+                };
             // The receiver is gone only once the loop has returned.
             let _ = done.send((id, result));
+        });
+    }
+
+    fn write_not_found(&mut self, request: RefreshRequest) {
+        self.write_status(StatusRecord {
+            command_id: request.command_id,
+            cert_arn: request.certificate_arn,
+            request_created_at: request.created_at,
+            outcome: StatusOutcome::NotFound,
+            exit_code: None,
+            started_at: None,
+            completed_at: None,
+            error_detail: None,
         });
     }
 
@@ -679,29 +729,166 @@ impl<S: ReloadSink, W: InboxWatcher, V: InboxValidator> Loop<'_, S, W, V> {
     /// batch, so they stay until the reload that covers them completes. So
     /// does a file whose name another queued or running batch also
     /// references, so that it is still recovered after a crash.
-    fn complete(&mut self, id: CommandId, result: Result<(), io::Error>) {
+    fn complete(&mut self, id: CommandId, result: ReloadResult) {
+        self.retry_pending_statuses();
         let batch = self.in_flight.remove(&id);
 
-        if let Err(e) = result {
-            // Loud, and not retried. A reload that fails because the server is
-            // still starting is expected, and Phase 1 has no alarms, so the
-            // log line is the whole of the response.
-            error!("Reload command {:?} failed: {}", self.plan.command(id), e);
+        let Some(batch) = batch else {
+            return;
+        };
+
+        if result.outcome != ReloadOutcome::Success {
+            error!(
+                "Reload command {:?} failed with outcome {:?}, exit code {:?}: {}",
+                self.plan.command(id),
+                result.outcome,
+                result.exit_code,
+                result.error_detail.as_deref().unwrap_or("no stderr")
+            );
         }
 
-        for name in batch.iter().flat_map(|batch| &batch.files) {
-            if self.is_referenced(name) {
-                debug!(
-                    "Keeping {:?}: another batch also covers it",
-                    self.pending_dir.join(name)
-                );
-            } else {
-                inbox::delete(&self.pending_dir.join(name));
-            }
+        let outcome = match result.outcome {
+            ReloadOutcome::Success => StatusOutcome::Success,
+            ReloadOutcome::Failure => StatusOutcome::Failure,
+            ReloadOutcome::Timeout => StatusOutcome::Timeout,
+        };
+        let mut statuses_by_name: BTreeMap<OsString, Vec<StatusRecord>> = BTreeMap::new();
+        for (name, request) in batch.requests {
+            statuses_by_name
+                .entry(name)
+                .or_default()
+                .push(StatusRecord {
+                    command_id: request.command_id,
+                    cert_arn: request.certificate_arn,
+                    request_created_at: request.created_at,
+                    outcome,
+                    exit_code: result.exit_code,
+                    started_at: Some(result.started_at.clone()),
+                    completed_at: Some(result.completed_at.clone()),
+                    error_detail: result.error_detail.clone(),
+                });
+        }
+
+        // Keep each status with the pending name it belongs to. If another
+        // batch still references that name, the status waits until the final
+        // owner releases it. This makes the delete-before-status ordering
+        // hold for reused names as well as ordinary requests.
+        for (name, statuses) in statuses_by_name {
+            self.deferred_statuses
+                .entry(name.clone())
+                .or_default()
+                .extend(statuses);
+            self.release_file(name);
         }
 
         if self.queued.contains_key(&id) {
             self.maybe_start(id);
+        }
+    }
+
+    /// Releases a pending name and publishes all statuses waiting on it.
+    ///
+    /// A deletion error leaves both the request and its statuses in place, and
+    /// [`Self::retry_pending_statuses`] retries the deletion, so WCP never sees
+    /// a status for a request the watcher still owns. A status whose write
+    /// fails after the deletion is kept in `unpublished` and retried.
+    fn release_file(&mut self, name: OsString) {
+        if self.is_referenced(&name) {
+            debug!(
+                "Keeping {:?}: another batch also covers it",
+                self.pending_dir.join(&name)
+            );
+            return;
+        }
+
+        if inbox::delete(&self.pending_dir.join(&name)).is_err() {
+            return;
+        }
+
+        if let Some(statuses) = self.deferred_statuses.remove(&name) {
+            for status in statuses {
+                self.write_status(status);
+            }
+        }
+        if let Some(requests) = self.rejected.remove(&name) {
+            for request in requests {
+                self.write_not_found(request);
+            }
+        }
+    }
+
+    /// Writes a status, keeping it for a retry if the write fails. Logs the
+    /// first failure of an outage, not every status in it. A status that fails
+    /// validation can never be written, so it's logged and dropped instead.
+    fn write_status(&mut self, status: StatusRecord) {
+        let Err(error) = self.status.write(&status) else {
+            return;
+        };
+        if error.kind() == io::ErrorKind::InvalidData {
+            error!("Dropping status '{}': {}", status.command_id, error);
+            return;
+        }
+        if self.unpublished.is_empty() {
+            error!(
+                "Failed to write status '{}' to '{}', retrying on later rescans: {}",
+                status.command_id,
+                self.env.outbox_dir().display(),
+                error
+            );
+        } else {
+            debug!("Failed to write status '{}': {}", status.command_id, error);
+        }
+        if self.unpublished.len() >= MAX_UNPUBLISHED_STATUSES {
+            let dropped = self.unpublished.remove(0);
+            warn!(
+                "Dropping status '{}': {} statuses are waiting to be written",
+                dropped.command_id, MAX_UNPUBLISHED_STATUSES
+            );
+        }
+        self.unpublished.push(status);
+    }
+
+    /// Retries what a failure left behind: pending files no batch references
+    /// any more but whose deletion failed, so their statuses are still held,
+    /// then the statuses whose write failed, in the order they were produced.
+    fn retry_pending_statuses(&mut self) {
+        let undeleted: Vec<OsString> = self
+            .deferred_statuses
+            .keys()
+            .chain(self.rejected.keys())
+            .filter(|name| !self.is_referenced(name))
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        for name in undeleted {
+            self.release_file(name);
+        }
+
+        if self.unpublished.is_empty() {
+            return;
+        }
+        let statuses = std::mem::take(&mut self.unpublished);
+        let mut written = 0;
+        for status in statuses {
+            match self.status.write(&status) {
+                Ok(()) => written += 1,
+                Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+                    error!("Dropping status '{}': {}", status.command_id, error);
+                }
+                Err(error) => {
+                    debug!("Retrying status '{}' failed: {}", status.command_id, error);
+                    self.unpublished.push(status);
+                }
+            }
+        }
+        if written > 0 {
+            info!(
+                "Wrote {} status(es) to '{}' that had failed to write; {} still waiting",
+                written,
+                self.env.outbox_dir().display(),
+                self.unpublished.len()
+            );
         }
     }
 
@@ -739,24 +926,6 @@ fn rebind_backoff(failures: u32) -> Duration {
     REBIND_MIN_INTERVAL
         .saturating_mul(1 << doublings)
         .min(REBIND_MAX_BACKOFF)
-}
-
-/// Turns a reload task that did not finish into a failed reload.
-///
-/// A panic payload is a `&str` or `String` for `panic!` with a literal or a
-/// format string; anything else is reported without its payload.
-fn join_error_to_io(e: tokio::task::JoinError) -> io::Error {
-    if e.is_panic() {
-        let payload = e.into_panic();
-        let message = payload
-            .downcast_ref::<&str>()
-            .map(|s| s.to_string())
-            .or_else(|| payload.downcast_ref::<String>().cloned())
-            .unwrap_or_else(|| "non-string panic payload".to_string());
-        io::Error::other(format!("reload panicked: {message}"))
-    } else {
-        io::Error::other(format!("reload task was cancelled: {e}"))
-    }
 }
 
 #[cfg(test)]
@@ -861,7 +1030,7 @@ mod tests {
     }
 
     impl ReloadSink for RecordingSink {
-        async fn reload(&self, command: Vec<String>, label: String) -> Result<(), io::Error> {
+        async fn reload(&self, command: Vec<String>, label: String) -> ReloadResult {
             // The lock is released before any panic, so it is not poisoned.
             let first = {
                 let mut calls = self.calls.lock().unwrap();
@@ -881,8 +1050,27 @@ mod tests {
             }
 
             if self.fail {
-                return Err(io::Error::other("the reload command failed"));
+                return ReloadResult::failure("the reload command failed");
             }
+            ReloadResult::success()
+        }
+    }
+
+    struct RecordingStatusSink {
+        statuses: Mutex<Vec<StatusRecord>>,
+    }
+
+    impl RecordingStatusSink {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                statuses: Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    impl StatusSink for RecordingStatusSink {
+        fn write(&self, status: &StatusRecord) -> io::Result<()> {
+            self.statuses.lock().unwrap().push(status.clone());
             Ok(())
         }
     }
@@ -1090,12 +1278,14 @@ mod tests {
             // What `prepare` would hand over: anything a test left in the
             // pending directory before the loop starts.
             let recovered = inbox::recover(&$fixture.env.pending_dir()).unwrap();
+            let status = RecordingStatusSink::new();
             let (result, ()) = tokio::join!(
                 run(
                     &$fixture.env,
                     &$validator,
                     Arc::clone(&$fixture.plan),
                     Arc::clone(&$sink),
+                    Arc::clone(&status),
                     &mut $watch,
                     recovered,
                     async {
@@ -3477,13 +3667,14 @@ mod tests {
     /// A `Loop` outside `run`, so a test can complete reloads in any order.
     /// Reloads are spawned onto `sink` as usual; nothing reads their
     /// completions.
-    fn direct_loop<'a, S: ReloadSink, W: InboxWatcher, V: InboxValidator>(
+    fn direct_loop<'a, S: ReloadSink, T: StatusSink, W: InboxWatcher, V: InboxValidator>(
         fixture: &'a Fixture,
         validator: &'a V,
         watch: &'a mut W,
         sink: Arc<S>,
+        status: Arc<T>,
         done_tx: mpsc::UnboundedSender<Done>,
-    ) -> Loop<'a, S, W, V> {
+    ) -> Loop<'a, S, T, W, V> {
         let now = Instant::now();
         Loop {
             env: &fixture.env,
@@ -3493,8 +3684,12 @@ mod tests {
             pending_dir: fixture.env.pending_dir(),
             plan: Arc::clone(&fixture.plan),
             sink,
+            status,
             queued: BTreeMap::new(),
             in_flight: BTreeMap::new(),
+            rejected: BTreeMap::new(),
+            deferred_statuses: BTreeMap::new(),
+            unpublished: Vec::new(),
             done_tx,
             holding: true,
             validated: true,
@@ -3508,8 +3703,375 @@ mod tests {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn completion_writes_one_status_for_each_merged_request() {
+        let fixture = Fixture::new();
+        let validator = ScriptedValidator::new(true);
+        let (_tx, mut rx) = mpsc::unbounded_channel::<WatchEvent>();
+        let sink = RecordingSink::new();
+        let status = RecordingStatusSink::new();
+        let (done_tx, _done_rx) = mpsc::unbounded_channel();
+        let mut state = direct_loop(
+            &fixture,
+            &validator,
+            &mut rx,
+            sink,
+            Arc::clone(&status),
+            done_tx,
+        );
+        state.holding = true;
+
+        admit_named(&mut state, &fixture, "a.cmd", ARN_A);
+        admit_named(&mut state, &fixture, "b.cmd", ARN_B);
+        state.release_hold();
+        settle().await;
+        let id = fixture.plan.command_for(ARN_A).unwrap();
+        state.complete(id, ReloadResult::success());
+
+        let statuses = status.statuses.lock().unwrap().clone();
+        assert_eq!(statuses.len(), 2);
+        assert!(statuses.iter().all(|status| {
+            status.outcome == StatusOutcome::Success
+                && status.exit_code == Some(0)
+                && status.error_detail.is_none()
+        }));
+        assert_eq!(fixture.pending_entries(), 0);
+
+        admit_named(&mut state, &fixture, "unknown.cmd", ARN_UNKNOWN);
+        let statuses = status.statuses.lock().unwrap().clone();
+        assert_eq!(statuses.len(), 3);
+        assert_eq!(statuses[2].outcome, StatusOutcome::NotFound);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn completion_maps_failure_and_timeout_statuses() {
+        let fixture = Fixture::new();
+        let validator = ScriptedValidator::new(true);
+        let (_tx, mut rx) = mpsc::unbounded_channel::<WatchEvent>();
+        let sink = RecordingSink::new();
+        let status = RecordingStatusSink::new();
+        let (done_tx, _done_rx) = mpsc::unbounded_channel();
+        let mut state = direct_loop(
+            &fixture,
+            &validator,
+            &mut rx,
+            sink,
+            Arc::clone(&status),
+            done_tx,
+        );
+        state.holding = false;
+
+        admit_named(&mut state, &fixture, "failure.cmd", ARN_A);
+        settle().await;
+        let id = fixture.plan.command_for(ARN_A).unwrap();
+        let stderr = vec![b'e'; crate::status::MAX_ERROR_DETAIL_BYTES + 1];
+        state.complete(
+            id,
+            ReloadResult {
+                outcome: ReloadOutcome::Failure,
+                exit_code: Some(7),
+                error_detail: crate::status::cap_error_detail(&stderr),
+                started_at: "2025-10-20T17:06:41.123Z".to_string(),
+                completed_at: "2025-10-20T17:06:41.456Z".to_string(),
+            },
+        );
+
+        admit_named(&mut state, &fixture, "timeout.cmd", ARN_A);
+        settle().await;
+        state.complete(
+            id,
+            ReloadResult {
+                outcome: ReloadOutcome::Timeout,
+                exit_code: None,
+                error_detail: None,
+                started_at: "2025-10-20T17:07:41.123Z".to_string(),
+                completed_at: "2025-10-20T17:07:41.456Z".to_string(),
+            },
+        );
+
+        let statuses = status.statuses.lock().unwrap().clone();
+        assert_eq!(statuses.len(), 2);
+        assert_eq!(statuses[0].outcome, StatusOutcome::Failure);
+        assert_eq!(statuses[0].exit_code, Some(7));
+        assert_eq!(
+            statuses[0].error_detail.as_ref().unwrap().len(),
+            crate::status::MAX_ERROR_DETAIL_BYTES
+        );
+        assert_eq!(statuses[1].outcome, StatusOutcome::Timeout);
+        assert_eq!(statuses[1].exit_code, None);
+        assert_eq!(statuses[1].error_detail, None);
+    }
+
+    struct DeletionCheckingStatusSink {
+        pending: PathBuf,
+        deleted_before_write: Mutex<Vec<bool>>,
+    }
+
+    impl StatusSink for DeletionCheckingStatusSink {
+        fn write(&self, status: &StatusRecord) -> io::Result<()> {
+            let _ = status;
+            self.deleted_before_write
+                .lock()
+                .unwrap()
+                .push(!self.pending.exists());
+            Ok(())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn statuses_are_written_only_after_the_final_reused_name_is_deleted() {
+        let fixture = Fixture::new();
+        let validator = ScriptedValidator::new(true);
+        let (_tx, mut rx) = mpsc::unbounded_channel::<WatchEvent>();
+        let status = Arc::new(DeletionCheckingStatusSink {
+            pending: fixture.env.pending_dir().join("reused.cmd"),
+            deleted_before_write: Mutex::new(Vec::new()),
+        });
+        let sink = RecordingSink::new();
+        let (done_tx, _done_rx) = mpsc::unbounded_channel();
+        let mut state = direct_loop(
+            &fixture,
+            &validator,
+            &mut rx,
+            sink,
+            Arc::clone(&status),
+            done_tx,
+        );
+        state.holding = false;
+
+        admit_named(&mut state, &fixture, "reused.cmd", ARN_A);
+        settle().await;
+        admit_named(&mut state, &fixture, "reused.cmd", ARN_C);
+        settle().await;
+
+        let nginx = fixture.plan.command_for(ARN_A).unwrap();
+        let apache = fixture.plan.command_for(ARN_C).unwrap();
+        state.complete(nginx, ReloadResult::success());
+        assert!(fixture.env.pending_dir().join("reused.cmd").is_file());
+        assert!(status.deleted_before_write.lock().unwrap().is_empty());
+
+        state.complete(apache, ReloadResult::success());
+        assert!(!fixture.env.pending_dir().join("reused.cmd").exists());
+        assert_eq!(
+            status.deleted_before_write.lock().unwrap().as_slice(),
+            &[true, true]
+        );
+    }
+
+    /// Fails every write while `failing` is set, recording the ones that succeed.
+    struct FlakyStatusSink {
+        failing: std::sync::atomic::AtomicBool,
+        written: Mutex<Vec<StatusRecord>>,
+    }
+
+    impl StatusSink for FlakyStatusSink {
+        fn write(&self, status: &StatusRecord) -> io::Result<()> {
+            if self.failing.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(io::Error::new(io::ErrorKind::PermissionDenied, "outbox"));
+            }
+            self.written.lock().unwrap().push(status.clone());
+            Ok(())
+        }
+    }
+
+    /// A status whose write fails after its pending file is deleted is kept
+    /// and written on the next rescan, instead of being lost.
+    #[tokio::test(start_paused = true)]
+    async fn a_status_that_fails_to_write_is_retried() {
+        let fixture = Fixture::new();
+        let validator = ScriptedValidator::new(true);
+        let (_tx, mut rx) = mpsc::unbounded_channel::<WatchEvent>();
+        let status = Arc::new(FlakyStatusSink {
+            failing: std::sync::atomic::AtomicBool::new(true),
+            written: Mutex::new(Vec::new()),
+        });
+        let sink = RecordingSink::new();
+        let (done_tx, _done_rx) = mpsc::unbounded_channel();
+        let mut state = direct_loop(
+            &fixture,
+            &validator,
+            &mut rx,
+            sink,
+            Arc::clone(&status),
+            done_tx,
+        );
+        state.holding = false;
+
+        admit_named(&mut state, &fixture, "one.cmd", ARN_A);
+        settle().await;
+        state.complete(
+            fixture.plan.command_for(ARN_A).unwrap(),
+            ReloadResult::success(),
+        );
+        assert!(!fixture.env.pending_dir().join("one.cmd").exists());
+        assert_eq!(state.unpublished.len(), 1);
+
+        state.retry_pending_statuses();
+        assert_eq!(state.unpublished.len(), 1, "still failing, so still kept");
+
+        status
+            .failing
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        state.retry_pending_statuses();
+        assert!(state.unpublished.is_empty());
+        let written = status.written.lock().unwrap();
+        assert_eq!(written.len(), 1);
+        assert_eq!(written[0].cert_arn, ARN_A);
+        assert_eq!(written[0].outcome, StatusOutcome::Success);
+    }
+
+    /// A pending file whose deletion failed is deleted, and its status
+    /// written, on a later retry even though no other batch reuses its name.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_pending_deletion_is_retried() {
+        use std::os::unix::fs::PermissionsExt;
+        // Root bypasses directory permissions, so the delete can't be made to fail.
+        if rustix::process::geteuid().is_root() {
+            return;
+        }
+        let fixture = Fixture::new();
+        let validator = ScriptedValidator::new(true);
+        let (_tx, mut rx) = mpsc::unbounded_channel::<WatchEvent>();
+        let status = RecordingStatusSink::new();
+        let (done_tx, _done_rx) = mpsc::unbounded_channel();
+        let mut state = direct_loop(
+            &fixture,
+            &validator,
+            &mut rx,
+            RecordingSink::new(),
+            Arc::clone(&status),
+            done_tx,
+        );
+        state.holding = false;
+        let pending_dir = fixture.env.pending_dir();
+        let pending = pending_dir.join("one.cmd");
+        let mode = fs::metadata(&pending_dir).unwrap().permissions().mode();
+
+        admit_named(&mut state, &fixture, "one.cmd", ARN_A);
+        settle().await;
+        fs::set_permissions(&pending_dir, fs::Permissions::from_mode(0o500)).unwrap();
+        state.complete(
+            fixture.plan.command_for(ARN_A).unwrap(),
+            ReloadResult::success(),
+        );
+        assert!(pending.is_file(), "the deletion must have failed");
+        assert!(status.statuses.lock().unwrap().is_empty());
+
+        fs::set_permissions(&pending_dir, fs::Permissions::from_mode(mode)).unwrap();
+        state.retry_pending_statuses();
+
+        assert!(!pending.exists());
+        assert!(state.deferred_statuses.is_empty());
+        let statuses = status.statuses.lock().unwrap();
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].cert_arn, ARN_A);
+    }
+
+    /// Rejects every write as invalid, as `write_atomically` does a status
+    /// that fails `validate()`.
+    struct RejectingStatusSink;
+
+    impl StatusSink for RejectingStatusSink {
+        fn write(&self, _status: &StatusRecord) -> io::Result<()> {
+            Err(io::Error::new(io::ErrorKind::InvalidData, "invalid status"))
+        }
+    }
+
+    /// A status that fails validation can never be written, so it isn't kept
+    /// for a retry, where it would hide the first error of a later outage.
+    #[tokio::test(start_paused = true)]
+    async fn an_invalid_status_is_dropped_not_retried() {
+        let fixture = Fixture::new();
+        let validator = ScriptedValidator::new(true);
+        let (_tx, mut rx) = mpsc::unbounded_channel::<WatchEvent>();
+        let (done_tx, _done_rx) = mpsc::unbounded_channel();
+        let mut state = direct_loop(
+            &fixture,
+            &validator,
+            &mut rx,
+            RecordingSink::new(),
+            Arc::new(RejectingStatusSink),
+            done_tx,
+        );
+        state.holding = false;
+
+        admit_named(&mut state, &fixture, "one.cmd", ARN_A);
+        settle().await;
+        state.complete(
+            fixture.plan.command_for(ARN_A).unwrap(),
+            ReloadResult::success(),
+        );
+
+        assert!(!fixture.env.pending_dir().join("one.cmd").exists());
+        assert!(state.unpublished.is_empty());
+    }
+
+    /// Statuses kept for a retry are bounded: past the limit the oldest is dropped.
+    #[tokio::test(start_paused = true)]
+    async fn unpublished_statuses_are_bounded() {
+        let fixture = Fixture::new();
+        let validator = ScriptedValidator::new(true);
+        let (_tx, mut rx) = mpsc::unbounded_channel::<WatchEvent>();
+        let status = Arc::new(FlakyStatusSink {
+            failing: std::sync::atomic::AtomicBool::new(true),
+            written: Mutex::new(Vec::new()),
+        });
+        let (done_tx, _done_rx) = mpsc::unbounded_channel();
+        let mut state = direct_loop(
+            &fixture,
+            &validator,
+            &mut rx,
+            RecordingSink::new(),
+            status,
+            done_tx,
+        );
+        let record = |n: usize| StatusRecord {
+            command_id: format!("{n}"),
+            cert_arn: ARN_A.to_string(),
+            request_created_at: "2025-01-01T00:00:00Z".to_string(),
+            outcome: StatusOutcome::Success,
+            exit_code: Some(0),
+            started_at: None,
+            completed_at: None,
+            error_detail: None,
+        };
+
+        for n in 0..=MAX_UNPUBLISHED_STATUSES {
+            state.write_status(record(n));
+        }
+
+        assert_eq!(state.unpublished.len(), MAX_UNPUBLISHED_STATUSES);
+        assert_eq!(state.unpublished[0].command_id, "1");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn malformed_requests_do_not_produce_statuses() {
+        let fixture = Fixture::new();
+        let validator = ScriptedValidator::new(true);
+        let (_tx, mut rx) = mpsc::unbounded_channel::<WatchEvent>();
+        let sink = RecordingSink::new();
+        let status = RecordingStatusSink::new();
+        let (done_tx, _done_rx) = mpsc::unbounded_channel();
+        let mut state = direct_loop(
+            &fixture,
+            &validator,
+            &mut rx,
+            sink,
+            Arc::clone(&status),
+            done_tx,
+        );
+
+        let path = fixture.write_raw("malformed.cmd", "not json");
+        assert!(!state.admit(&path));
+        assert!(!path.exists());
+        assert!(status.statuses.lock().unwrap().is_empty());
+    }
+
     /// Every name a queued or running batch covers.
-    fn referenced_files<S: ReloadSink, W, V>(state: &Loop<'_, S, W, V>) -> BTreeSet<OsString> {
+    fn referenced_files<S: ReloadSink, T: StatusSink, W, V>(
+        state: &Loop<'_, S, T, W, V>,
+    ) -> BTreeSet<OsString> {
         state
             .queued
             .values()
@@ -3519,8 +4081,8 @@ mod tests {
     }
 
     /// Writes a request for `arn` into the inbox under `name` and admits it.
-    fn admit_named<S: ReloadSink, W: InboxWatcher, V: InboxValidator>(
-        state: &mut Loop<'_, S, W, V>,
+    fn admit_named<S: ReloadSink, T: StatusSink, W: InboxWatcher, V: InboxValidator>(
+        state: &mut Loop<'_, S, T, W, V>,
         fixture: &Fixture,
         name: &str,
         arn: &str,
@@ -3574,8 +4136,9 @@ mod tests {
         let validator = ScriptedValidator::new(true);
         let (_tx, mut rx) = mpsc::unbounded_channel::<WatchEvent>();
         let (sink, _gate) = RecordingSink::gated();
+        let status = RecordingStatusSink::new();
         let (done_tx, _done_rx) = mpsc::unbounded_channel();
-        let mut state = direct_loop(&fixture, &validator, &mut rx, sink, done_tx);
+        let mut state = direct_loop(&fixture, &validator, &mut rx, sink, status, done_tx);
 
         for (i, (step, expected)) in steps.iter().enumerate() {
             match *step {
@@ -3585,9 +4148,9 @@ mod tests {
                     let id = fixture.plan.command_for(arn).unwrap();
                     assert!(state.in_flight.contains_key(&id), "step {i}: not running");
                     let result = if ok {
-                        Ok(())
+                        ReloadResult::success()
                     } else {
-                        Err(io::Error::other("scripted reload failure"))
+                        ReloadResult::failure("scripted reload failure")
                     };
                     state.complete(id, result);
                 }
@@ -3607,8 +4170,16 @@ mod tests {
         let validator = ScriptedValidator::new(true);
         let (_tx, mut rx) = mpsc::unbounded_channel::<WatchEvent>();
         let (sink, _gate) = RecordingSink::gated();
+        let status = RecordingStatusSink::new();
         let (done_tx, _done_rx) = mpsc::unbounded_channel();
-        let mut state = direct_loop(&fixture, &validator, &mut rx, Arc::clone(&sink), done_tx);
+        let mut state = direct_loop(
+            &fixture,
+            &validator,
+            &mut rx,
+            Arc::clone(&sink),
+            status,
+            done_tx,
+        );
         state.holding = false;
 
         admit_named(&mut state, &fixture, "a.cmd", ARN_A);
@@ -3620,14 +4191,14 @@ mod tests {
         assert!(state.in_flight.contains_key(&nginx) && state.in_flight.contains_key(&apache));
         assert_eq!(sink.count(), 2, "both commands should be running at once");
 
-        state.complete(apache, Ok(()));
+        state.complete(apache, ReloadResult::success());
         assert_eq!(fixture.pending_names(), names(&["a.cmd", "b.cmd"]));
 
         // `b.cmd` was queued behind nginx's first reload, which now ends.
-        state.complete(nginx, Ok(()));
+        state.complete(nginx, ReloadResult::success());
         assert_eq!(fixture.pending_names(), names(&["b.cmd"]));
 
-        state.complete(nginx, Ok(()));
+        state.complete(nginx, ReloadResult::success());
         assert!(fixture.pending_names().is_empty());
     }
 

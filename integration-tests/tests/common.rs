@@ -959,6 +959,231 @@ pub fn is_pem_private_key(content: &str) -> bool {
         || content.contains("-----BEGIN EC PRIVATE KEY-----")
 }
 
+/// The DER of the first certificate in `pem`, base64 as telemetry carries it.
+#[allow(dead_code)]
+pub fn first_certificate_der_base64(pem: &str) -> String {
+    let body = pem
+        .split("-----BEGIN CERTIFICATE-----")
+        .nth(1)
+        .and_then(|rest| rest.split("-----END CERTIFICATE-----").next())
+        .unwrap_or_else(|| panic!("no PEM certificate in:\n{pem}"));
+    body.split_whitespace().collect()
+}
+
+/// A provider config with dry-run telemetry, built through typed TOML so no
+/// field is quoted by hand. Fields left at their default are omitted.
+#[allow(dead_code)]
+#[derive(Default)]
+pub struct TelemetryTestConfig {
+    /// `[telemetry] dry_run = true`: write requests instead of sending them.
+    pub dry_run: bool,
+    /// `[telemetry.acm] enabled`: the opt-in for automation telemetry.
+    pub automation_telemetry: bool,
+    pub watcher_config_dir: Option<String>,
+    pub watcher_requests_dir: Option<String>,
+    /// Ports discovery probes on loopback, with no SNI. Empty: no discovery.
+    pub discovery_ports: Vec<u16>,
+    pub certificates: Vec<TelemetryTestCertificate>,
+}
+
+/// One `[[capabilities.acm.certificates]]` entry of a [`TelemetryTestConfig`].
+#[allow(dead_code)]
+pub struct TelemetryTestCertificate {
+    pub certificate_arn: String,
+    pub role_arn: String,
+    pub certificate_path: String,
+    pub private_key_path: String,
+    pub chain_path: String,
+    pub watcher_id: Option<String>,
+    pub refresh_command: Option<String>,
+}
+
+#[allow(dead_code)]
+impl TelemetryTestCertificate {
+    /// A certificate written as `cert.pem`, `key.pem` and `chain.pem` in `dir`.
+    pub fn in_dir(certificate_arn: &str, role_arn: &str, dir: &str) -> Self {
+        Self {
+            certificate_arn: certificate_arn.to_string(),
+            role_arn: role_arn.to_string(),
+            certificate_path: format!("{dir}/cert.pem"),
+            private_key_path: format!("{dir}/key.pem"),
+            chain_path: format!("{dir}/chain.pem"),
+            watcher_id: None,
+            refresh_command: None,
+        }
+    }
+
+    /// Routes the certificate to `watcher_id`, whose watcher runs `refresh_command`.
+    pub fn for_watcher(mut self, watcher_id: &str, refresh_command: &str) -> Self {
+        self.watcher_id = Some(watcher_id.to_string());
+        self.refresh_command = Some(refresh_command.to_string());
+        self
+    }
+}
+
+#[allow(dead_code)]
+impl TelemetryTestConfig {
+    pub fn to_toml(&self) -> String {
+        use serde::Serialize;
+        use std::collections::BTreeMap;
+
+        #[derive(Serialize)]
+        struct Config<'a> {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            telemetry: Option<Telemetry>,
+            capabilities: Capabilities<'a>,
+        }
+
+        #[derive(Serialize)]
+        struct Telemetry {
+            dry_run: bool,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            acm: Option<Enabled>,
+        }
+
+        #[derive(Serialize)]
+        struct Enabled {
+            enabled: bool,
+        }
+
+        #[derive(Serialize)]
+        struct Capabilities<'a> {
+            acm: Acm<'a>,
+        }
+
+        #[derive(Serialize)]
+        struct Acm<'a> {
+            enabled: bool,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            watcher_config_dir: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            watcher_requests_dir: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            discovery: Option<Discovery>,
+            #[serde(skip_serializing_if = "Vec::is_empty")]
+            certificates: Vec<Certificate<'a>>,
+        }
+
+        #[derive(Serialize)]
+        struct Discovery {
+            enabled: bool,
+            discovery_targets: BTreeMap<String, Vec<String>>,
+        }
+
+        #[derive(Serialize)]
+        struct Certificate<'a> {
+            certificate_arn: &'a str,
+            role_arn: &'a str,
+            certificate_path: &'a str,
+            private_key_path: &'a str,
+            chain_path: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            watcher_id: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            refresh_command: Option<&'a str>,
+        }
+
+        let telemetry = (self.dry_run || self.automation_telemetry).then(|| Telemetry {
+            dry_run: self.dry_run,
+            acm: self
+                .automation_telemetry
+                .then_some(Enabled { enabled: true }),
+        });
+        let discovery = (!self.discovery_ports.is_empty()).then(|| Discovery {
+            enabled: true,
+            discovery_targets: self
+                .discovery_ports
+                .iter()
+                .map(|port| (port.to_string(), Vec::new()))
+                .collect(),
+        });
+        let config = Config {
+            telemetry,
+            capabilities: Capabilities {
+                acm: Acm {
+                    enabled: true,
+                    watcher_config_dir: self.watcher_config_dir.as_deref(),
+                    watcher_requests_dir: self.watcher_requests_dir.as_deref(),
+                    discovery,
+                    certificates: self
+                        .certificates
+                        .iter()
+                        .map(|c| Certificate {
+                            certificate_arn: &c.certificate_arn,
+                            role_arn: &c.role_arn,
+                            certificate_path: &c.certificate_path,
+                            private_key_path: &c.private_key_path,
+                            chain_path: &c.chain_path,
+                            watcher_id: c.watcher_id.as_deref(),
+                            refresh_command: c.refresh_command.as_deref(),
+                        })
+                        .collect(),
+                },
+            },
+        };
+        toml::to_string(&config).expect("failed to serialize test config")
+    }
+}
+
+/// The requests in a dry-run telemetry log, one JSON request per line.
+#[allow(dead_code)]
+pub fn dry_run_requests(log: &Path) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .map(|line| {
+            serde_json::from_str(line)
+                .unwrap_or_else(|e| panic!("dry-run line isn't JSON ({e}): {line}"))
+        })
+        .collect()
+}
+
+/// The dry-run requests carrying `kind` (`automation` or `discovery`) telemetry.
+#[allow(dead_code)]
+pub fn dry_run_requests_with(log: &Path, kind: &str) -> Vec<serde_json::Value> {
+    dry_run_requests(log)
+        .into_iter()
+        .filter(|r| r.pointer(&format!("/telemetry/{kind}")).is_some())
+        .collect()
+}
+
+/// The automation records in a dry-run log, each with the request carrying it.
+#[allow(dead_code)]
+pub fn dry_run_automation_records(log: &Path) -> Vec<(serde_json::Value, serde_json::Value)> {
+    dry_run_requests_with(log, "automation")
+        .into_iter()
+        .flat_map(|request| {
+            let records = request
+                .pointer("/telemetry/automation/records")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            records.into_iter().map(move |r| (request.clone(), r))
+        })
+        .collect()
+}
+
+/// The one observation of `port` with no SNI in a discovery request.
+#[allow(dead_code)]
+pub fn discovery_observation(request: &serde_json::Value, port: u16) -> serde_json::Value {
+    let matching: Vec<_> = request["telemetry"]["discovery"]["observations"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no observations array: {request:#}"))
+        .iter()
+        .filter(|o| {
+            o["port"].as_u64() == Some(u64::from(port))
+                && o.get("sni").is_none_or(serde_json::Value::is_null)
+        })
+        .cloned()
+        .collect();
+    assert_eq!(
+        matching.len(),
+        1,
+        "expected one observation of port {port}: {request:#}"
+    );
+    matching.into_iter().next().unwrap()
+}
+
 /// Locates the `aws-workload-credentials-provider` binary in a debug or release build
 /// directory, searching both the current directory and one level up so the
 /// helper works whether `cargo test` was invoked from the workspace root or
@@ -1243,21 +1468,68 @@ impl AcmProviderProcess {
     /// log for specific messages to confirm the provider completed a cycle.
     #[allow(dead_code)]
     pub async fn start(config_path: &Path, working_dir: &Path) -> AcmProviderProcess {
+        Self::start_with_env(config_path, working_dir, &[]).await
+    }
+
+    /// Spawns the provider with extra environment variables injected into the child process.
+    /// Use this to set `AWS_EC2_METADATA_SERVICE_ENDPOINT` for mock IMDS or any
+    /// other env var the child needs.
+    #[allow(dead_code)]
+    pub async fn start_with_env(
+        config_path: &Path,
+        working_dir: &Path,
+        extra_env: &[(&str, &str)],
+    ) -> AcmProviderProcess {
+        Self::start_with_env_overrides(config_path, working_dir, extra_env, &[]).await
+    }
+
+    /// Spawns the provider with environment variables added and removed from
+    /// the child process. Removal is needed when inherited container metadata
+    /// variables would take precedence over mock IMDS during identity detection.
+    #[allow(dead_code)]
+    pub async fn start_with_env_overrides(
+        config_path: &Path,
+        working_dir: &Path,
+        extra_env: &[(&str, &str)],
+        remove_env: &[&str],
+    ) -> AcmProviderProcess {
         let provider_path = locate_provider_binary()
             .canonicalize()
             .expect("could not resolve provider binary to absolute path");
 
-        let child = TokioCommand::new(&provider_path)
-            .arg("acm")
+        let mut cmd = TokioCommand::new(&provider_path);
+        cmd.arg("acm")
             .arg("start")
             .arg("--config")
             .arg(config_path)
             .current_dir(working_dir)
-            .kill_on_drop(true)
-            .spawn()
-            .expect("Failed to start provider");
+            .kill_on_drop(true);
+
+        for (key, val) in extra_env {
+            cmd.env(key, val);
+        }
+        for key in remove_env {
+            cmd.env_remove(key);
+        }
+
+        let child = cmd.spawn().expect("Failed to start provider");
 
         AcmProviderProcess { _child: child }
+    }
+
+    /// Kills the provider and waits up to `timeout` for it to exit, so its
+    /// open files are closed before the caller removes its directory.
+    /// `kill_on_drop` only sends the kill and doesn't wait.
+    #[allow(dead_code)]
+    pub fn stop_blocking(&mut self, timeout: Duration) {
+        let _ = self._child.start_kill();
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            match self._child.try_wait() {
+                Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+                Ok(Some(_)) | Err(_) => return,
+            }
+        }
     }
 
     /// Returns whether the provider child process is still running.

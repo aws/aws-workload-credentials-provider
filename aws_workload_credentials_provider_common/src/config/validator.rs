@@ -24,10 +24,11 @@ use super::field_validators::{
 };
 use super::types::{
     AcmConfig, AcmConfigInput, CapabilitiesConfig, CertificateConfig, CertificateConfigInput,
-    ConfigInput, FailoverConfig, FailoverConfigInput, LogLevel, LoggingConfig, LoggingConfigInput,
-    PrefetchConfig, PrefetchConfigInput, SecretPrefetchConfig, SecretsManagerConfig,
-    SecretsManagerConfigInput, TagFilter, ValidatedConfig, DEFAULT_WATCHER_CONFIG_DIR,
-    DEFAULT_WATCHER_REQUESTS_DIR,
+    ConfigInput, DiscoveryConfig, DiscoveryConfigInput, FailoverConfig, FailoverConfigInput,
+    LogLevel, LoggingConfig, LoggingConfigInput, PrefetchConfig, PrefetchConfigInput,
+    SecretPrefetchConfig, SecretsManagerConfig, SecretsManagerConfigInput, TagFilter,
+    TelemetryConfig, TelemetryConfigInput, ValidatedConfig, DEFAULT_DISCOVERY_PORTS,
+    DEFAULT_DISCOVERY_TIMEOUT_SECS, DEFAULT_WATCHER_CONFIG_DIR, DEFAULT_WATCHER_REQUESTS_DIR,
 };
 use super::watcher_config;
 use crate::filesystem::{FileSystem, RealFileSystem};
@@ -36,6 +37,15 @@ use crate::fs_permissions::PathPermission;
 
 /// Maximum number of certificates allowed in the configuration.
 const MAX_CERTIFICATES: usize = 50;
+
+/// Maximum number of ports in discovery_targets.
+const MAX_DISCOVERY_PORTS: usize = 32;
+
+/// Maximum number of SNI hostnames per port.
+const MAX_DISCOVERY_SNI_PER_PORT: usize = 32;
+
+/// Minimum timeout for a discovery cycle.
+const MIN_DISCOVERY_TIMEOUT_SECS: u64 = 60;
 
 /// Main configuration validator.
 ///
@@ -69,10 +79,8 @@ impl<F: FileSystem> ConfigValidator<F> {
             None => {
                 // No config file - use defaults
                 Ok(ValidatedConfig {
-                    logging: Default::default(),
-                    secrets_manager: SecretsManagerConfig::default(),
-                    acm: None,
                     warnings: Vec::new(),
+                    ..Default::default()
                 })
             }
             Some(path) => {
@@ -131,7 +139,8 @@ impl<F: FileSystem> ConfigValidator<F> {
                 log_to_file: raw_config.log_to_file,
             })
         };
-        let logging: LoggingConfig = self.validate_logging_config(logging_input, &mut collector);
+        let mut logging: LoggingConfig =
+            self.validate_logging_config(logging_input, &mut collector);
 
         let has_capabilities_secrets_manager: bool = capabilities.secrets_manager.is_some();
 
@@ -149,6 +158,11 @@ impl<F: FileSystem> ConfigValidator<F> {
         let acm: Option<AcmConfig> =
             self.validate_acm_config(capabilities.acm, &mut collector, &mut warnings);
 
+        // Validate telemetry config (top-level [telemetry] section)
+        let telemetry: TelemetryConfig =
+            self.validate_telemetry_config(raw_config.telemetry.take(), acm.as_ref());
+        logging.telemetry_dry_run = telemetry.dry_run;
+
         if !collector.is_empty() {
             Err(ValidationErrors::from_vec(collector.errors().to_vec()))
         } else {
@@ -156,6 +170,7 @@ impl<F: FileSystem> ConfigValidator<F> {
                 logging,
                 secrets_manager,
                 acm,
+                telemetry,
                 warnings,
             })
         }
@@ -272,6 +287,28 @@ impl<F: FileSystem> ConfigValidator<F> {
         }
 
         logging_config
+    }
+
+    /// Validate the `[telemetry]` section. Its switches are plain opt-in
+    /// booleans, so nothing is rejected. Discovery consent comes from the ACM
+    /// config: discovery on means its records may be sent.
+    fn validate_telemetry_config(
+        &self,
+        telemetry_config_input: Option<TelemetryConfigInput>,
+        acm: Option<&AcmConfig>,
+    ) -> TelemetryConfig {
+        let input = telemetry_config_input.unwrap_or_default();
+        TelemetryConfig {
+            secrets_manager_enabled: input
+                .secrets_manager
+                .and_then(|c| c.enabled)
+                .unwrap_or(false),
+            acm_enabled: input.acm.and_then(|c| c.enabled).unwrap_or(false),
+            acm_discovery_enabled: acm.is_some_and(|acm| {
+                acm.enabled && acm.discovery.as_ref().is_some_and(|d| d.enabled)
+            }),
+            dry_run: input.dry_run.unwrap_or(false),
+        }
     }
 
     /// Validate ASM configuration section.
@@ -868,11 +905,114 @@ impl<F: FileSystem> ConfigValidator<F> {
             collector.add(e);
         }
 
+        let discovery =
+            Self::validate_discovery_config(acm_config_input.discovery.as_ref(), collector);
+
         Some(AcmConfig {
             enabled: acm_enabled,
             certificates,
             watcher_config_dir,
             watcher_requests_dir,
+            discovery,
+        })
+    }
+
+    /// Validate the discovery configuration section.
+    fn validate_discovery_config(
+        input: Option<&DiscoveryConfigInput>,
+        collector: &mut ErrorCollector,
+    ) -> Option<DiscoveryConfig> {
+        let input = input?;
+        let mut has_discovery_errors = false;
+        let enabled = input.enabled.unwrap_or(false);
+        let field_prefix = "capabilities.acm.discovery";
+
+        let timeout_secs = input
+            .timeout_secs_override
+            .unwrap_or(DEFAULT_DISCOVERY_TIMEOUT_SECS);
+        if timeout_secs < MIN_DISCOVERY_TIMEOUT_SECS {
+            has_discovery_errors = true;
+            collector.add(ValidationError::new(
+                format!("{}.timeout_secs_override", field_prefix),
+                ValidationErrorCode::ValueOutOfRange,
+                format!(
+                    "Timeout must be at least {} seconds, got {}",
+                    MIN_DISCOVERY_TIMEOUT_SECS, timeout_secs
+                ),
+            ));
+        }
+
+        let discovery_targets = match &input.discovery_targets {
+            Some(targets) => {
+                if targets.len() > MAX_DISCOVERY_PORTS {
+                    has_discovery_errors = true;
+                    collector.add(ValidationError::new(
+                        format!("{}.discovery_targets", field_prefix),
+                        ValidationErrorCode::ValueOutOfRange,
+                        format!(
+                            "Too many ports: {} exceeds maximum of {}",
+                            targets.len(),
+                            MAX_DISCOVERY_PORTS
+                        ),
+                    ));
+                }
+
+                let mut validated: HashMap<u16, Vec<String>> = HashMap::new();
+                for (&port, hostnames) in targets {
+                    if port == 0 {
+                        has_discovery_errors = true;
+                        collector.add(ValidationError::new(
+                            format!("{}.discovery_targets[{}]", field_prefix, port),
+                            ValidationErrorCode::InvalidValue,
+                            "Port 0 is not valid".to_string(),
+                        ));
+                        continue;
+                    }
+
+                    let valid: Vec<String> = hostnames
+                        .iter()
+                        .filter(|h| !h.is_empty())
+                        .cloned()
+                        .collect::<std::collections::HashSet<_>>()
+                        .into_iter()
+                        .collect();
+
+                    if valid.len() > MAX_DISCOVERY_SNI_PER_PORT {
+                        has_discovery_errors = true;
+                        collector.add(ValidationError::new(
+                            format!("{}.discovery_targets[{}]", field_prefix, port),
+                            ValidationErrorCode::ValueOutOfRange,
+                            format!(
+                                "Too many SNI hostnames: {} exceeds maximum of {}",
+                                valid.len(),
+                                MAX_DISCOVERY_SNI_PER_PORT
+                            ),
+                        ));
+                        continue;
+                    }
+
+                    validated.insert(port, valid);
+                }
+
+                if validated.is_empty() && !has_discovery_errors {
+                    DEFAULT_DISCOVERY_PORTS
+                        .iter()
+                        .map(|&p| (p, Vec::new()))
+                        .collect()
+                } else {
+                    validated
+                }
+            }
+            None => DEFAULT_DISCOVERY_PORTS
+                .iter()
+                .map(|&p| (p, Vec::new()))
+                .collect(),
+        };
+
+        Some(DiscoveryConfig {
+            enabled,
+            timeout_secs,
+            discovery_targets,
         })
     }
 
@@ -3103,6 +3243,459 @@ mod tests {
             assert!(result.is_err());
             let errors = result.unwrap_err();
             assert_eq!(errors.len(), 3);
+        }
+    }
+
+    mod telemetry {
+        use super::*;
+
+        #[test]
+        fn test_telemetry_section_parsed() {
+            let validator = ConfigValidator::with_filesystem(mock_fs());
+            let toml = r#"
+                [telemetry]
+                dry_run = true
+
+                [telemetry.secrets_manager]
+                enabled = true
+
+                [telemetry.acm]
+                enabled = true
+
+                [capabilities.secrets_manager]
+                enabled = true
+            "#;
+            let config = validator.validate_toml_config_str(toml).unwrap();
+            assert!(config.telemetry.secrets_manager_enabled);
+            assert!(config.telemetry.acm_enabled);
+            assert!(config.telemetry.dry_run);
+            assert!(config.logging.telemetry_dry_run);
+        }
+
+        #[test]
+        fn test_telemetry_partial_section_defaults_rest() {
+            let validator = ConfigValidator::with_filesystem(mock_fs());
+            let toml = r#"
+                [telemetry.secrets_manager]
+                enabled = true
+            "#;
+            let config = validator.validate_toml_config_str(toml).unwrap();
+            assert!(config.telemetry.secrets_manager_enabled);
+            assert!(!config.telemetry.acm_enabled);
+            assert!(!config.telemetry.dry_run);
+            assert!(!config.logging.telemetry_dry_run);
+        }
+
+        #[test]
+        fn test_telemetry_absent_defaults_all_false() {
+            let validator = ConfigValidator::with_filesystem(mock_fs());
+            let toml = r#"
+                [capabilities.secrets_manager]
+                enabled = true
+            "#;
+            let config = validator.validate_toml_config_str(toml).unwrap();
+            assert_eq!(
+                config.telemetry,
+                crate::config::types::TelemetryConfig::default()
+            );
+        }
+
+        #[test]
+        fn test_telemetry_unknown_key_rejected() {
+            let validator = ConfigValidator::with_filesystem(mock_fs());
+            let toml = r#"
+                [telemetry]
+                bogus_key = true
+            "#;
+            let result = validator.validate_toml_config_str(toml);
+            let errors = result.unwrap_err();
+            // Exactly one error, so it is the unknown key and not an unrelated one.
+            assert_eq!(errors.len(), 1);
+            assert_eq!(errors.errors[0].code, ValidationErrorCode::TomlSyntaxError);
+        }
+
+        #[test]
+        fn test_telemetry_unknown_nested_key_rejected() {
+            let validator = ConfigValidator::with_filesystem(mock_fs());
+            let toml = r#"
+                [telemetry.secrets_manager]
+                enabled = true
+                sampling_rate = 0.5
+            "#;
+            let result = validator.validate_toml_config_str(toml);
+            let errors = result.unwrap_err();
+            assert_eq!(errors.errors[0].code, ValidationErrorCode::TomlSyntaxError);
+        }
+
+        #[test]
+        fn test_telemetry_wrong_typed_value_rejected() {
+            let validator = ConfigValidator::with_filesystem(mock_fs());
+            let toml = r#"
+                [telemetry.secrets_manager]
+                enabled = "yes"
+            "#;
+            let result = validator.validate_toml_config_str(toml);
+            let errors = result.unwrap_err();
+            assert_eq!(errors.errors[0].code, ValidationErrorCode::TomlSyntaxError);
+        }
+
+        #[test]
+        fn test_telemetry_coexists_with_legacy_flat_keys() {
+            // `[telemetry]` is a top-level section, so it must not trip the nested-vs-flat
+            // detection that rejects legacy root-level Secrets Manager keys.
+            let validator = ConfigValidator::with_filesystem(mock_fs());
+            let toml = r#"
+                http_port = 2775
+
+                [telemetry.secrets_manager]
+                enabled = true
+            "#;
+            let config = validator.validate_toml_config_str(toml).unwrap();
+            assert_eq!(config.secrets_manager.http_port, 2775);
+            assert!(config.telemetry.secrets_manager_enabled);
+        }
+
+        #[test]
+        fn test_turning_discovery_on_consents_to_its_records() {
+            let validator = ConfigValidator::with_filesystem(mock_fs());
+            let toml = r#"
+                [capabilities.acm]
+                enabled = true
+
+                [capabilities.acm.discovery]
+                enabled = true
+
+                [telemetry.acm]
+                enabled = false
+            "#;
+            let config = validator.validate_toml_config_str(toml).unwrap();
+            assert!(config.telemetry.acm_discovery_enabled);
+            assert!(!config.telemetry.acm_enabled);
+        }
+
+        #[test]
+        fn test_no_discovery_consent_unless_acm_and_discovery_are_on() {
+            let validator = ConfigValidator::with_filesystem(mock_fs());
+            let acm_off = r#"
+                [capabilities.acm]
+                enabled = false
+
+                [capabilities.acm.discovery]
+                enabled = true
+            "#;
+            let discovery_off = r#"
+                [capabilities.acm]
+                enabled = true
+
+                [capabilities.acm.discovery]
+                enabled = false
+
+                [telemetry.acm]
+                enabled = true
+            "#;
+            let no_discovery = r#"
+                [capabilities.acm]
+                enabled = true
+            "#;
+            for toml in [acm_off, discovery_off, no_discovery] {
+                let config = validator.validate_toml_config_str(toml).unwrap();
+                assert!(!config.telemetry.acm_discovery_enabled, "{toml}");
+            }
+        }
+    }
+
+    mod discovery {
+        use super::*;
+
+        /// Enabling discovery applies the default timeout and ports.
+        #[test]
+        fn test_discovery_defaults_when_enabled() {
+            let validator = ConfigValidator::with_filesystem(mock_fs());
+            let toml = r#"
+                [capabilities.acm]
+                enabled = true
+
+                [capabilities.acm.discovery]
+                enabled = true
+            "#;
+            let result = validator.validate_toml_config_str(toml);
+            assert!(result.is_ok(), "Errors: {}", result.unwrap_err());
+            let acm = result.unwrap().acm.unwrap();
+            let discovery = acm.discovery.unwrap();
+            assert!(discovery.enabled);
+            assert_eq!(discovery.timeout_secs, 300);
+            assert_eq!(discovery.discovery_targets.len(), 3);
+            assert!(discovery.discovery_targets.contains_key(&443));
+            assert!(discovery.discovery_targets.contains_key(&8443));
+            assert!(discovery.discovery_targets.contains_key(&4443));
+        }
+
+        /// An empty target map gets the default ports even with an unrelated error collected.
+        #[test]
+        fn test_discovery_empty_targets_use_defaults_with_unrelated_errors() {
+            let input = crate::config::types::DiscoveryConfigInput {
+                discovery_targets: Some(std::collections::HashMap::new()),
+                ..Default::default()
+            };
+            let mut collector = crate::config::error::ErrorCollector::new();
+            collector.add(crate::config::error::ValidationError::new(
+                "unrelated",
+                ValidationErrorCode::InvalidValue,
+                "unrelated validation error",
+            ));
+
+            let discovery = ConfigValidator::<MockFileSystem>::validate_discovery_config(
+                Some(&input),
+                &mut collector,
+            )
+            .expect("discovery config is present");
+
+            assert_eq!(discovery.discovery_targets.len(), 3);
+            assert!(discovery.discovery_targets.contains_key(&443));
+            assert!(discovery.discovery_targets.contains_key(&8443));
+            assert!(discovery.discovery_targets.contains_key(&4443));
+        }
+
+        /// An empty discovery section leaves discovery disabled.
+        #[test]
+        fn test_discovery_disabled_by_default() {
+            let validator = ConfigValidator::with_filesystem(mock_fs());
+            let toml = r#"
+                [capabilities.acm]
+                enabled = true
+
+                [capabilities.acm.discovery]
+            "#;
+            let result = validator.validate_toml_config_str(toml);
+            assert!(result.is_ok(), "Errors: {}", result.unwrap_err());
+            let discovery = result.unwrap().acm.unwrap().discovery.unwrap();
+            assert!(!discovery.enabled);
+        }
+
+        /// No discovery section leaves discovery unset.
+        #[test]
+        fn test_no_discovery_section() {
+            let validator = ConfigValidator::with_filesystem(mock_fs());
+            let toml = r#"
+                [capabilities.acm]
+                enabled = true
+            "#;
+            let result = validator.validate_toml_config_str(toml);
+            assert!(result.is_ok());
+            assert!(result.unwrap().acm.unwrap().discovery.is_none());
+        }
+
+        /// Custom ports and SNI hostnames are kept.
+        #[test]
+        fn test_discovery_custom_targets() {
+            let validator = ConfigValidator::with_filesystem(mock_fs());
+            let toml = r#"
+                [capabilities.acm]
+                enabled = true
+
+                [capabilities.acm.discovery]
+                enabled = true
+
+                [capabilities.acm.discovery.discovery_targets]
+                443 = ["api.example.com", "web.example.com"]
+                8443 = []
+            "#;
+            let result = validator.validate_toml_config_str(toml);
+            assert!(result.is_ok(), "Errors: {}", result.unwrap_err());
+            let discovery = result.unwrap().acm.unwrap().discovery.unwrap();
+            assert_eq!(discovery.discovery_targets.len(), 2);
+            assert_eq!(discovery.discovery_targets[&443].len(), 2);
+            assert_eq!(discovery.discovery_targets[&8443].len(), 0);
+        }
+
+        /// A configured timeout replaces the default.
+        #[test]
+        fn test_discovery_timeout_override() {
+            let validator = ConfigValidator::with_filesystem(mock_fs());
+            let toml = r#"
+                [capabilities.acm]
+                enabled = true
+
+                [capabilities.acm.discovery]
+                enabled = true
+                timeout_secs_override = 900
+            "#;
+            let result = validator.validate_toml_config_str(toml);
+            assert!(result.is_ok(), "Errors: {}", result.unwrap_err());
+            assert_eq!(
+                result.unwrap().acm.unwrap().discovery.unwrap().timeout_secs,
+                900
+            );
+        }
+
+        /// A timeout below the minimum is a range error on the timeout field.
+        #[test]
+        fn test_discovery_timeout_below_minimum() {
+            let validator = ConfigValidator::with_filesystem(mock_fs());
+            let toml = r#"
+                [capabilities.acm]
+                enabled = true
+
+                [capabilities.acm.discovery]
+                timeout_secs_override = 10
+            "#;
+            let result = validator.validate_toml_config_str(toml);
+            assert!(result.is_err());
+            let errors = result.unwrap_err();
+            assert!(errors
+                .errors
+                .iter()
+                .any(|e| e.code == ValidationErrorCode::ValueOutOfRange
+                    && e.field.contains("timeout")));
+        }
+
+        /// More ports than allowed is a validation error.
+        #[test]
+        fn test_discovery_too_many_ports() {
+            let validator = ConfigValidator::with_filesystem(mock_fs());
+            let ports: Vec<String> = (1..=50).map(|i| format!("{} = []", 1000 + i)).collect();
+            let toml = format!(
+                r#"
+                [capabilities.acm]
+                enabled = true
+
+                [capabilities.acm.discovery]
+                enabled = true
+
+                [capabilities.acm.discovery.discovery_targets]
+                {}
+            "#,
+                ports.join("\n                ")
+            );
+            let result = validator.validate_toml_config_str(&toml);
+            assert!(result.is_err());
+            let errors = result.unwrap_err();
+            assert!(errors
+                .errors
+                .iter()
+                .any(|e| e.message.contains("Too many ports")));
+        }
+
+        /// Port 0 is rejected even alongside a valid port.
+        #[test]
+        fn test_discovery_port_zero_rejected() {
+            let validator = ConfigValidator::with_filesystem(mock_fs());
+            let toml = r#"
+                [capabilities.acm]
+                enabled = true
+
+                [capabilities.acm.discovery]
+                enabled = true
+
+                [capabilities.acm.discovery.discovery_targets]
+                0 = []
+                443 = []
+            "#;
+            let result = validator.validate_toml_config_str(toml);
+            assert!(result.is_err());
+            let errors = result.unwrap_err();
+            assert!(errors.errors.iter().any(|e| e.message.contains("Port 0")));
+        }
+
+        /// Empty SNI hostnames are dropped and valid ones kept.
+        #[test]
+        fn test_discovery_empty_sni_hostnames_filtered() {
+            let validator = ConfigValidator::with_filesystem(mock_fs());
+            let toml = r#"
+                [capabilities.acm]
+                enabled = true
+
+                [capabilities.acm.discovery.discovery_targets]
+                443 = ["", "api.example.com", ""]
+            "#;
+
+            let config = validator
+                .validate_toml_config_str(toml)
+                .expect("empty SNI hostnames should be filtered");
+            let discovery = config.acm.unwrap().discovery.unwrap();
+
+            assert_eq!(
+                discovery.discovery_targets[&443],
+                vec!["api.example.com".to_string()]
+            );
+        }
+
+        /// 33 SNI hostnames on port 443 is a range error naming 33 and the limit, 32.
+        #[test]
+        fn test_discovery_too_many_sni_rejected() {
+            let validator = ConfigValidator::with_filesystem(mock_fs());
+            let hostnames = (0..33)
+                .map(|i| format!(r#""api-{i}.example.com""#))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let toml = format!(
+                r#"
+                [capabilities.acm]
+                enabled = true
+
+                [capabilities.acm.discovery.discovery_targets]
+                443 = [{hostnames}]
+            "#
+            );
+
+            let errors = validator
+                .validate_toml_config_str(&toml)
+                .expect_err("33 distinct SNI hostnames should exceed the per-port cap");
+            let error = errors
+                .errors
+                .iter()
+                .find(|error| error.field == "capabilities.acm.discovery.discovery_targets[443]")
+                .expect("SNI cap error should identify port 443");
+
+            assert_eq!(error.code, ValidationErrorCode::ValueOutOfRange);
+            assert!(error.message.contains("33"));
+            assert!(error.message.contains("32"));
+        }
+
+        /// Unknown discovery fields are ignored, for forward compatibility.
+        #[test]
+        fn test_discovery_unknown_field_tolerated() {
+            let validator = ConfigValidator::with_filesystem(mock_fs());
+            let toml = r#"
+                [capabilities.acm]
+                enabled = true
+
+                [capabilities.acm.discovery]
+                enabled = true
+                bogus_field = "should be ignored"
+            "#;
+            let result = validator.validate_toml_config_str(toml);
+            assert!(result.is_ok(), "Errors: {}", result.unwrap_err());
+            assert!(result.unwrap().acm.unwrap().discovery.unwrap().enabled);
+        }
+
+        /// Enabling discovery doesn't stop an ACM certificate config from validating.
+        #[test]
+        fn test_discovery_does_not_break_existing_acm() {
+            let validator = ConfigValidator::with_filesystem(mock_fs());
+            let (cert, key, chain) = test_paths("");
+            let toml = format!(
+                r#"
+                [capabilities.acm]
+                enabled = true
+
+                [[capabilities.acm.certificates]]
+                certificate_arn = "arn:aws:acm:us-east-1:123456789012:certificate/12345678-1234-1234-1234-123456789012"
+                role_arn = "arn:aws:iam::123456789012:role/MyRole"
+                certificate_path = '{cert}'
+                private_key_path = '{key}'
+                chain_path = '{chain}'
+
+                [capabilities.acm.discovery]
+                enabled = true
+            "#
+            );
+            let result = validator.validate_toml_config_str(&toml);
+            assert!(result.is_ok(), "Errors: {}", result.unwrap_err());
+            let acm = result.unwrap().acm.unwrap();
+            assert!(acm.enabled);
+            assert_eq!(acm.certificates.len(), 1);
+            assert!(acm.discovery.unwrap().enabled);
         }
     }
 }

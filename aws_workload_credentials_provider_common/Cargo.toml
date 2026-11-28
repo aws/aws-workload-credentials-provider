@@ -5,30 +5,48 @@ edition = "2021"
 license = "Apache-2.0"
 description = "Common library for AWS Workload Credentials Provider configuration validation and shared utilities."
 
+[features]
+fips = ["aws-smithy-http-client/rustls-aws-lc-fips"]
+
 [dependencies]
+aws-config = "1"
+aws-credential-types = "1"
+aws-sigv4 = "1"
+aws-smithy-http-client = { version = "1", features = ["rustls-aws-lc"] }
+aws-smithy-runtime-api = { version = "1", features = ["client", "http-1x"] }
+aws-smithy-types = "1"
+base64ct = { version = "1", features = ["alloc"] }
+bytes = "1"
 aws-lc-rs = "1"
 chrono = "0.4"
+ciborium = "0.2"
 dunce = "1.0"
+http = "1"
 log = "0.4"
 log4rs = { version = "1.2.0", features = ["gzip"] }
+rand = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
+tokio-util = "0.7.18"
 toml = "1.1.2"
 regex = "1.12.3"
+uuid = { version = "1", features = ["v4"] }
 
+[dev-dependencies]
+# IMDS tests replay scripted HTTP exchanges through the SDK's test client.
+aws-smithy-http-client = { version = "1", features = ["test-util"] }
 
 [target.'cfg(unix)'.dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "process", "time"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "time"] }
 rustix = { version = "=1.1.4", features = ["fs"] }
 
 [target.'cfg(unix)'.dev-dependencies]
-tokio = { version = "1", features = ["test-util"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "test-util"] }
 rustix = { version = "=1.1.4", features = ["process"] }
 
 [target.'cfg(windows)'.dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "process", "time"] }
-tokio-util = "0.7.18"
+tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 windows = { version = "0.62", features = [
     "Win32_Security",
     "Win32_Security_Authorization",

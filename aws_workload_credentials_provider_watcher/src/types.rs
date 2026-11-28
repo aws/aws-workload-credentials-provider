@@ -1,20 +1,8 @@
-//! The argv executor `aws_workload_credentials_provider_common` doesn't
-//! provide yet, and test fixtures for the request protocol.
+//! Test fixtures for the request protocol.
 //!
 //! The request type, the inbox layout and the ACM provider's writer are
 //! `common::watcher_request`; the watcher configuration file is
 //! `common::config::watcher_config`.
-//!
-//! TODO: delete this module once `common` has `execute_argv`.
-
-use std::future::Future;
-use std::io;
-
-use tokio::process::Command;
-
-use aws_workload_credentials_provider_common::refresh_executor::{
-    execute_child_cmd, DirectRefreshExecutor,
-};
 
 /// Suffix of the ACM provider's mid-write request files in `inbox/`.
 ///
@@ -26,35 +14,6 @@ use aws_workload_credentials_provider_common::refresh_executor::{
 /// are ignored.
 #[cfg(test)]
 pub const REQUEST_TEMP_SUFFIX: &str = ".tmp";
-
-/// Runs an already-split argv array in this container.
-///
-/// Used on non-Windows targets only; the Windows path is in
-/// `reload::DirectReloadSink`.
-///
-/// TODO: delete once `common`'s `DirectRefreshExecutor::execute_argv` lands;
-/// the inherent method then takes precedence over this trait at every call
-/// site.
-#[cfg_attr(windows, allow(dead_code))]
-pub trait DirectRefreshExecutorArgv {
-    fn execute_argv(
-        &self,
-        command: &[String],
-        certificate_arn: &str,
-    ) -> impl Future<Output = Result<(), io::Error>> + Send;
-}
-
-impl DirectRefreshExecutorArgv for DirectRefreshExecutor {
-    async fn execute_argv(&self, command: &[String], _certificate_arn: &str) -> io::Result<()> {
-        let (program, args) = command.split_first().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "refresh command is empty")
-        })?;
-        let mut cmd = Command::new(program);
-        cmd.args(args);
-        // Bounded by `REFRESH_COMMAND_TIMEOUT` inside `execute_child_cmd`.
-        execute_child_cmd(cmd).await
-    }
-}
 
 /// Fixed examples of what the ACM provider writes, for tests. Tests that need
 /// a real write call `common::watcher_request::enqueue` itself.

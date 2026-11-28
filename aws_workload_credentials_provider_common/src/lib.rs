@@ -4,7 +4,9 @@ pub mod filesystem;
 pub mod fs_permissions;
 pub mod logging;
 pub mod refresh_executor;
+pub mod telemetry;
 pub mod watcher_request;
+pub mod watcher_status;
 
 #[cfg(windows)]
 pub mod win_service;
