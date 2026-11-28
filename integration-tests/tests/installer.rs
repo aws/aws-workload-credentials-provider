@@ -1491,6 +1491,17 @@ mod windows {
         wait_until("ACM service to run", || {
             service_status(ACM_SERVICE) == "Running"
         });
+        // The old grants were removed before the config was replaced, so the
+        // failed reload left none behind, and a rerun completes the new ones.
+        assert_no_cert_grants(PLACEHOLDER_CERT_ARN, &old_certs);
+
+        run_script(
+            "acmReloadConfig.ps1",
+            &format!("-Config '{}'", new_config.display()),
+        );
+
+        assert_no_cert_grants(PLACEHOLDER_CERT_ARN, &old_certs);
+        assert_cert_grants(OTHER_PLACEHOLDER_CERT_ARN, &new_certs);
     }
 
     /// With services running, the installer exits 0 and makes no changes, as

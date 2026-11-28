@@ -162,6 +162,13 @@ if ($Config) {
     $validatedConfig = Confirm-Config -Config $Config -ProviderBinary $providerBinary
     $secretsManagerEnabled = $validatedConfig.enabledCapabilities -contains "secrets-manager"
     $acmEnabled = $validatedConfig.enabledCapabilities -contains "acm"
+    # Remove the old config's grants and tasks while it is still on disk: if
+    # this fails, the config is not replaced, so a rerun finds the same grants
+    # and tasks. A failure later in the install is fixed by rerunning, which
+    # re-applies the new config. Until then its certificates may have no grants.
+    if (-not $oldConfigProblem) {
+        Remove-CertificateTasksPermissions $oldConfig
+    }
     Copy-ConfigIntoPlace -Source $Config -Destination $defaultConfigPath -ReplaceUntrusted:([bool]$oldConfigProblem)
     if ($oldConfigProblem) {
         Write-Warning "Replaced the old ${defaultConfigPath}, which administrators didn't control: $oldConfigProblem. Renewal tasks from it (AWSWorkloadCredentialsProvider-Reload-*) and the permissions it granted on certificate files were not removed. The tasks run as SYSTEM, so remove the ones the new config doesn't need."
@@ -177,6 +184,11 @@ if ($Config) {
         $validatedConfig = Confirm-Config -Config $defaultConfigPath -ProviderBinary $providerBinary
         $secretsManagerEnabled = $validatedConfig.enabledCapabilities -contains "secrets-manager"
         $acmEnabled = $validatedConfig.enabledCapabilities -contains "acm"
+        # The config stays in place, so a rerun after a later failure finds
+        # these grants and tasks again.
+        if (-not $oldConfigProblem) {
+            Remove-CertificateTasksPermissions $oldConfig
+        }
     }
 }
 
@@ -322,12 +334,6 @@ if (Test-Path $defaultConfigPath) {
     Write-Host "  Locked down ACLs on $defaultConfigPath"
 } else {
     Write-Host "  Config file doesn't exist - skipping config file permission setup"
-}
-
-# Remove the trusted previous config's certificate grants and tasks only after
-# the steps above, so a failure in them leaves the old grants in place.
-if (-not $oldConfigProblem) {
-    Remove-CertificateTasksPermissions $oldConfig
 }
 
 if ($acmEnabled) {

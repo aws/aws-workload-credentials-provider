@@ -4,10 +4,10 @@
 
 .DESCRIPTION
     Reverses install.ps1:
-    1. Stop services
+    1. Stop services; if any service does not stop, exit without removing anything
     2. Remove certificate ACLs from the previous config when it can be parsed; always remove reload scheduled tasks and warn when certificate cleanup may be needed
-    3. Remove services via sc.exe, skipping any service that did not stop
-    4. Remove the install directory when all service stops succeeded
+    3. Remove services via sc.exe
+    4. Remove the install directory when every service was deleted
     5. Preserve provider data directory (config and logs) by default
 
 .PARAMETER RemoveAll
@@ -51,24 +51,32 @@ if ((Test-Path $configPath) -and (Test-Path $providerBin) -and (Test-AdminContro
 
 Write-Step "Stop services"
 
-$stopSucceeded = @{}
 $serviceDeleteSkipped = $false
+$stoppedServices = @()
+$runningServices = @()
 foreach ($svc in @($ACM_SERVICE, $ASM_SERVICE)) {
     try {
         if (-not (Stop-ProviderService -Name $svc)) {
-            $stopSucceeded[$svc] = $true
             Write-Host "  Service not found: $svc (skipped)"
         } elseif ((Get-Service -Name $svc -ErrorAction SilentlyContinue).Status -eq 'Stopped') {
-            $stopSucceeded[$svc] = $true
+            $stoppedServices += $svc
             Write-Host "  Stopped service: $svc"
         } else {
-            $stopSucceeded[$svc] = $false
-            Write-Warning "Service $svc did not stop; it will not be deleted."
+            $runningServices += $svc
+            Write-Warning "Service $svc did not stop."
         }
     } catch {
-        $stopSucceeded[$svc] = $false
-        Write-Warning "Failed to stop service ${svc}: $_. The service will not be deleted."
+        $runningServices += $svc
+        Write-Warning "Failed to stop service ${svc}: $_"
     }
+}
+
+# Removing permissions, tasks or the token file from under a running service
+# would leave it broken, so remove nothing until every service has stopped.
+# The binary and config stay in place for the rerun.
+if ($runningServices) {
+    $stoppedNote = if ($stoppedServices) { " $($stoppedServices -join ', ') stopped and was left stopped." } else { "" }
+    Write-Error "$($runningServices -join ', ') did not stop, so nothing was removed.$stoppedNote Stop the service and rerun uninstall."
 }
 
 if ($jsonOutput) {
@@ -98,11 +106,6 @@ foreach ($svc in @($ACM_SERVICE, $ASM_SERVICE)) {
     try {
         if (-not (Get-Service -Name $svc -ErrorAction SilentlyContinue)) {
             Write-Host "  Service not found: $svc (skipped)"
-            continue
-        }
-        if (-not $stopSucceeded[$svc]) {
-            $serviceDeleteSkipped = $true
-            Write-Warning "Skipping deletion of $svc because it was not stopped."
             continue
         }
         sc.exe delete $svc | Out-Null
@@ -153,7 +156,7 @@ if (Test-Path $SSRF_TOKEN_FILE) {
 Write-Step "Remove install directory"
 
 if ($serviceDeleteSkipped) {
-    Write-Warning "Skipping removal of $INSTALL_DIR because a service could not be stopped or deleted. Fix the service and rerun uninstall."
+    Write-Warning "Skipping removal of $INSTALL_DIR because a service could not be deleted. Fix the service and rerun uninstall."
 } elseif (Test-Path $INSTALL_DIR) {
     Remove-Item -Path $INSTALL_DIR -Recurse -Force
     Write-Host "  Removed $INSTALL_DIR"
@@ -167,7 +170,7 @@ if (-not (Test-Path $PROVIDER_DIR)) {
     Write-Host "  Not found: $PROVIDER_DIR (skipped)"
 } elseif ($RemoveAll -and $serviceDeleteSkipped) {
     # A rerun needs the config to remove the certificate permissions it granted.
-    Write-Warning "Skipping removal of $PROVIDER_DIR because a service could not be stopped or deleted. Fix the service and rerun uninstall -RemoveAll."
+    Write-Warning "Skipping removal of $PROVIDER_DIR because a service could not be deleted. Fix the service and rerun uninstall -RemoveAll."
 } elseif ($RemoveAll) {
     Remove-Item -Path $PROVIDER_DIR -Recurse -Force
     Write-Host "  Removed $PROVIDER_DIR"

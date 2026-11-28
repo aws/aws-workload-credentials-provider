@@ -6,12 +6,12 @@
     Performs a reload of the ACM certificate config without a full reinstall
     Leaves binary and Windows service in place:
     1. Validate the new or existing config and verify ACM is enabled
-    2. Replace the config with the validated copy when -Config is provided
-    3. Stop the ACM provider service
-    4. Remove old certificate tasks and permissions
+    2. Stop the ACM provider service
+    3. Remove old certificate tasks and permissions while the old config is on disk
+    4. Replace the config with the validated copy when -Config is provided
     5. Apply config file ACLs
     6. Grant ACM service account permissions and register scheduled tasks
-    7. Restart the ACM provider service, also when steps 4-6 fail
+    7. Restart the ACM provider service, also when steps 3-6 fail
 
 .PARAMETER Config
     Path to the new config.toml file. If omitted, re-validates and re-applies
@@ -73,18 +73,7 @@ if ($newConfig.enabledCapabilities -notcontains "acm") {
 # running service and its permissions untouched.
 $oldConfig = if ($oldConfigProblem) { $null } else { Get-Config -Config $configPath -ProviderBinary $providerBin }
 
-# --- Step 2: Replace config with validated copy when requested ---
-
-if ($Config) {
-    Copy-ConfigIntoPlace -Source $Config -Destination $configPath -ReplaceUntrusted:([bool]$oldConfigProblem)
-    Write-Host "  New config copied to $configPath"
-    if ($oldConfigProblem) {
-        # Cleanup was intentionally skipped because the previous config was untrusted.
-        Write-Warning "Replaced the old ${configPath}, which administrators didn't control: $oldConfigProblem. Renewal tasks from it (AWSWorkloadCredentialsProvider-Reload-*) and the permissions it granted on certificate files were not removed. The tasks run as SYSTEM, so remove the ones the new config doesn't need."
-    }
-}
-
-# --- Step 3: Stop ACM service ---
+# --- Step 2: Stop ACM service ---
 
 Write-Step "Stop ACM service"
 
@@ -94,16 +83,31 @@ if (Stop-ProviderService -Name $ACM_SERVICE) {
     Write-Host "  Service $ACM_SERVICE not found (skipped)"
 }
 
-# --- Steps 4-6: Replace certificate tasks and permissions ---
+# --- Steps 3-6: Replace the config, certificate tasks and permissions ---
 
-# The validated config is already in place, so a failure here still restarts
-# ACM below rather than leaving certificate serving down.
+# A failure in these steps still restarts ACM below rather than leaving
+# certificate serving down.
 $applyError = $null
 try {
-    # --- Step 4: Remove old certificate tasks and permissions ---
+    # --- Step 3: Remove old certificate tasks and permissions ---
 
+    # Remove them while the old config is still on disk: if this fails, the
+    # config is not replaced, so a rerun finds the same grants and tasks. A
+    # failure after the replacement is fixed by rerunning, which re-applies the
+    # new config. Until then the new config's certificates may have no grants.
     if (-not $oldConfigProblem) {
         Remove-CertificateTasksPermissions $oldConfig
+    }
+
+    # --- Step 4: Replace config with validated copy when requested ---
+
+    if ($Config) {
+        Copy-ConfigIntoPlace -Source $Config -Destination $configPath -ReplaceUntrusted:([bool]$oldConfigProblem)
+        Write-Host "  New config copied to $configPath"
+        if ($oldConfigProblem) {
+            # Cleanup was intentionally skipped because the previous config was untrusted.
+            Write-Warning "Replaced the old ${configPath}, which administrators didn't control: $oldConfigProblem. Renewal tasks from it (AWSWorkloadCredentialsProvider-Reload-*) and the permissions it granted on certificate files were not removed. The tasks run as SYSTEM, so remove the ones the new config doesn't need."
+        }
     }
 
     # --- Step 5: Apply config file ACLs ---
@@ -139,7 +143,7 @@ Write-Step "Start ACM service"
 if ($LASTEXITCODE -ne 0) {
     $startError = "sc.exe start failed for $ACM_SERVICE (exit $LASTEXITCODE); $ACM_SERVICE is stopped."
     if ($applyError) {
-        Write-Error "Applying the new config's permissions failed: $applyError. $startError Fix the errors and rerun this script."
+        Write-Error "Applying the new config failed: $applyError. $startError Fix the errors and rerun this script."
     }
     Write-Error $startError
 }
@@ -151,7 +155,7 @@ if ($oldConfigProblem -and (Get-Service -Name $ASM_SERVICE -ErrorAction Silently
 }
 
 if ($applyError) {
-    Write-Error "Restarted $ACM_SERVICE, but applying the new config's permissions failed: $applyError. Certificate permissions or scheduled tasks may be incomplete; fix the error and rerun this script."
+    Write-Error "Restarted $ACM_SERVICE, but applying the new config failed: $applyError. The config, certificate permissions or scheduled tasks may be incomplete; fix the error and rerun this script."
 }
 
 Write-Host "`n ACM certificate config reload complete." -ForegroundColor Green
