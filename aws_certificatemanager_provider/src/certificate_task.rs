@@ -1037,6 +1037,9 @@ mod tests {
         error_detail: Option<String>,
     ) -> StatusRecord {
         let inbox = root.join("nginx").join("inbox");
+        // Real time, so a request that never arrives fails the test instead
+        // of spinning until CI cancels the job.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         let request_path = loop {
             if let Some(entry) = std::fs::read_dir(&inbox)
                 .unwrap()
@@ -1046,6 +1049,11 @@ mod tests {
             {
                 break entry.path();
             }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no request reached {}",
+                inbox.display()
+            );
             tokio::task::yield_now().await;
         };
         let request: RefreshRequest =
@@ -1079,7 +1087,7 @@ mod tests {
 
     #[tokio::test]
     async fn watcher_cert_queues_a_request_instead_of_running_the_command() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_dirs::tempdir();
         let inbox = create_watcher_dirs(root.path());
         let executor = Arc::new(MockExecutor::new(false));
         let tracker = WatcherStatusTracker::new(root.path().to_path_buf(), ["nginx".into()]);
@@ -1103,7 +1111,7 @@ mod tests {
 
     #[tokio::test]
     async fn watcher_cert_without_a_command_still_queues_a_request() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_dirs::tempdir();
         let inbox = create_watcher_dirs(root.path());
         let mut config = watcher_config();
         config.refresh_command = None;
@@ -1127,7 +1135,7 @@ mod tests {
 
     #[tokio::test]
     async fn unchanged_watcher_cert_queues_nothing() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_dirs::tempdir();
         let inbox = root.path().join("nginx").join("inbox");
         std::fs::create_dir_all(&inbox).unwrap();
         let store = Arc::new(MockStore::new(false));
@@ -1147,7 +1155,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_request_fails_the_refresh_and_is_queued_next_cycle() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_dirs::tempdir();
         let watcher_dir = root.path().join("nginx");
         let inbox = watcher_dir.join("inbox");
         let store = Arc::new(MockStore::new(false));
@@ -1199,7 +1207,7 @@ mod tests {
     /// returns at once instead of waiting out `WATCHER_RESPONSE_TIMEOUT`.
     #[tokio::test(start_paused = true)]
     async fn pre_status_watcher_is_written_not_reloaded_without_waiting() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_dirs::tempdir();
         let inbox = root.path().join("nginx").join("inbox");
         std::fs::create_dir_all(&inbox).unwrap();
         let tracker = WatcherStatusTracker::new(root.path().to_path_buf(), ["nginx".into()]);
@@ -1232,7 +1240,7 @@ mod tests {
     async fn pre_status_watcher_warning_is_logged_once() {
         capture_logs();
         let log_count = logged_on_this_thread().len();
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_dirs::tempdir();
         let inbox = root.path().join("nginx").join("inbox");
         std::fs::create_dir_all(&inbox).unwrap();
         let tracker = WatcherStatusTracker::new(root.path().to_path_buf(), ["nginx".into()]);
@@ -1264,7 +1272,7 @@ mod tests {
     /// The first-cycle request to a pre-status watcher writes nothing, so it's unchanged.
     #[tokio::test(start_paused = true)]
     async fn pre_status_watcher_with_unchanged_files_is_unchanged() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_dirs::tempdir();
         std::fs::create_dir_all(root.path().join("nginx").join("inbox")).unwrap();
         let tracker = WatcherStatusTracker::new(root.path().to_path_buf(), ["nginx".into()]);
         let store = Arc::new(MockStore::new(false));
@@ -1294,7 +1302,7 @@ mod tests {
             eprintln!("skipping: running as root, permission checks are bypassed");
             return;
         }
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_dirs::tempdir();
         let inbox = create_watcher_dirs(root.path());
         let outbox = root.path().join("nginx").join("outbox");
         std::fs::set_permissions(&outbox, std::fs::Permissions::from_mode(0o000)).unwrap();
@@ -1320,7 +1328,7 @@ mod tests {
 
     #[tokio::test]
     async fn request_failure_is_a_request_error() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_dirs::tempdir();
         let mut task = test_task(
             watcher_config(),
             Arc::new(MockAcmExporter::new(false)),
@@ -1341,7 +1349,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn symlinked_watcher_directory_fails_the_refresh() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_dirs::tempdir();
         let requests = root.path().join("requests");
         let elsewhere = root.path().join("elsewhere");
         std::fs::create_dir(&requests).unwrap();
@@ -1390,7 +1398,7 @@ mod tests {
                 StatusOutcome::Superseded,
                 StatusOutcome::Timeout,
             ] {
-                let root = tempfile::tempdir().unwrap();
+                let root = crate::test_dirs::tempdir();
                 create_watcher_dirs(root.path());
                 let store = Arc::new(MockStore::new(false));
                 store.report_changed.store(changed, Ordering::SeqCst);
@@ -1457,7 +1465,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn provider_deadline_is_no_status_for_changed_and_unchanged_files() {
         for changed in [true, false] {
-            let root = tempfile::tempdir().unwrap();
+            let root = crate::test_dirs::tempdir();
             create_watcher_dirs(root.path());
             let store = Arc::new(MockStore::new(false));
             store.report_changed.store(changed, Ordering::SeqCst);
@@ -1493,7 +1501,7 @@ mod tests {
 
     #[tokio::test]
     async fn watcher_failure_retries_unchanged_files_and_success_clears_failure_count() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_dirs::tempdir();
         create_watcher_dirs(root.path());
         let store = Arc::new(MockStore::new(false));
         let tracker = WatcherStatusTracker::new(root.path().to_path_buf(), ["nginx".into()]);
@@ -1526,7 +1534,7 @@ mod tests {
     async fn cancellation_during_watcher_wait_records_nothing_and_unregisters() {
         capture_logs();
         let log_count = logged_on_this_thread().len();
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_dirs::tempdir();
         create_watcher_dirs(root.path());
         let tracker = WatcherStatusTracker::new(root.path().to_path_buf(), ["nginx".into()]);
         let scanner_cancel = CancellationToken::new();
@@ -1659,7 +1667,7 @@ mod tests {
     async fn watcher_telemetry_waits_for_status_and_omits_protocol_details() {
         capture_logs();
         let log_count = logged_on_this_thread().len();
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_dirs::tempdir();
         create_watcher_dirs(root.path());
         let tracker = WatcherStatusTracker::new(root.path().to_path_buf(), ["nginx".into()]);
         let (telemetry, sink) = test_telemetry();

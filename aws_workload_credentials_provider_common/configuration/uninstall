@@ -34,11 +34,13 @@ systemctl disable "${TOKEN_SCRIPT}"
 rm -f "${SYSTEMD_FILES}/${TOKEN_SCRIPT}.service"
 rm -f "${SYSTEMD_FILES}/${SM_SERVICE}.service"
 rm -f "${SYSTEMD_FILES}/${ACM_SERVICE}.service"
+rm -f "${ACM_DROPIN_DIR}/cert-paths.conf"
+rmdir "${ACM_DROPIN_DIR}" 2>/dev/null || true
 
 systemctl daemon-reload
 
 rm -rf "${PROVIDER_DIR}"
-rm -f "/etc/sudoers.d/${PROVIDER_BIN}"
+rm -f "${SUDOERS_FILE}"
 
 #
 # Remove user and group

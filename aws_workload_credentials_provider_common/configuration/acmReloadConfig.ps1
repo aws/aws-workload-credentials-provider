@@ -5,14 +5,14 @@
 .DESCRIPTION
     Performs a reload of the ACM certificate config without a full reinstall
     Leaves binary and Windows service in place:
-    1. Parse the old config to identify existing certificate tasks and permissions
-    2. Validate and load the new config
+    1. Validate the new or existing config and verify ACM is enabled
+    2. Replace an untrusted old config with the validated copy, before stopping ACM
     3. Stop the ACM provider service
-    4. Unregister old certificate scheduled tasks
-    5. Remove ACM service account permissions from old certificate files
-    6. Grant ACM service account permissions on new certificate files
-    7. Register new certificate scheduled tasks
-    8. Restart the ACM provider service
+    4. Remove old certificate tasks and permissions while the old config is on disk
+    5. Replace a trusted old config with the validated copy when -Config is provided
+    6. Apply config file ACLs
+    7. Grant ACM service account permissions and register scheduled tasks
+    8. Restart the ACM provider service, also when steps 4-7 fail
 
 .PARAMETER Config
     Path to the new config.toml file. If omitted, re-validates and re-applies
@@ -54,28 +54,10 @@ if (Test-ExistingConfig) {
     }
 }
 
-# --- Step 1: Parse old config to capture existing certificate state ---
-
-Write-Step "Parse current config"
-
-$oldConfig = if ($oldConfigProblem) { $null } else { Get-Config -Config $configPath -ProviderBinary $providerBin }
-
-# --- Step 2: Validate and load new config ---
-
-Write-Step "Parse new config"
+# --- Step 1: Validate and load config ---
 
 if ($Config) {
     $newConfig = Confirm-Config -Config $Config -ProviderBinary $providerBin
-    # Verify ACM is enabled in the new config
-    if ($newConfig.enabledCapabilities -notcontains "acm") {
-        Write-Error "ACM is not enabled in the new config. This script only reloads ACM certificate configuration."
-    }
-    Copy-ConfigIntoPlace -Source $Config -Destination $configPath -ReplaceUntrusted:([bool]$oldConfigProblem)
-    Write-Host "  New config copied to $configPath"
-    if ($oldConfigProblem) {
-        # Step 5 warns about its tasks
-        Write-Warning "Replaced the old ${configPath}, which administrators didn't control: $oldConfigProblem."
-    }
 } else {
     if (-not (Test-Path $configPath)) {
         Write-Error "No config found at $configPath. Pass -Config to provide one."
@@ -83,27 +65,27 @@ if ($Config) {
     $newConfig = Confirm-Config -Config $configPath -ProviderBinary $providerBin
 }
 
-
-# --- Step 3: Apply config file ACLs ---
-
-Write-Step "Configure config file permissions"
-
-# Apply config file ACLs so an edited-by-hand config gets re-locked on reinstall
-# A new config is owned by whoever ran this, who may be an administrator only
-# through a domain group, which a later trust check would refuse
-icacls $configPath /setowner "*S-1-5-32-544" /Q | Out-Null
-if ($LASTEXITCODE -ne 0) { Write-Error "Failed to make Administrators the owner of $configPath" }
-icacls $configPath /inheritance:r /Q | Out-Null
-icacls $configPath /grant "SYSTEM:F" /Q | Out-Null
-icacls $configPath /grant "BUILTIN\Administrators:F" /Q | Out-Null
-icacls $configPath /grant "${ACM_SERVICE_ACCOUNT}:R" /Q | Out-Null
-# Also grant SM service account read if secrets-manager is enabled
-if ($newConfig.enabledCapabilities -contains "secrets-manager") {
-    icacls $configPath /grant "${ASM_SERVICE_ACCOUNT}:R" /Q | Out-Null
+# Verify ACM is enabled in the config before stopping the running ACM service.
+if ($newConfig.enabledCapabilities -notcontains "acm") {
+    Write-Error "ACM is not enabled in the new config. This script only reloads ACM certificate configuration."
 }
-Write-Host "  Locked down ACLs on $configPath"
 
-# --- Step 4: Stop ACM service ---
+# Parse the trusted old config after validation so failed new configs leave the
+# running service and its permissions untouched.
+$oldConfig = if ($oldConfigProblem) { $null } else { Get-Config -Config $configPath -ProviderBinary $providerBin }
+
+# --- Step 2: Replace an untrusted config before stopping ACM ---
+
+# Replacing an untrusted config exits the script on failure, so it runs while
+# ACM is still up. Its grants and tasks are not cleaned up, so the order does
+# not affect a rerun.
+if ($Config -and $oldConfigProblem) {
+    Copy-ConfigIntoPlace -Source $Config -Destination $configPath -ReplaceUntrusted
+    Write-Host "  New config copied to $configPath"
+    Write-Warning "Replaced the old ${configPath}, which administrators didn't control: $oldConfigProblem. Renewal tasks from it (AWSWorkloadCredentialsProvider-Reload-*) and the permissions it granted on certificate files were not removed. The tasks run as SYSTEM, so remove the ones the new config doesn't need."
+}
+
+# --- Step 3: Stop ACM service ---
 
 Write-Step "Stop ACM service"
 
@@ -113,30 +95,77 @@ if (Stop-ProviderService -Name $ACM_SERVICE) {
     Write-Host "  Service $ACM_SERVICE not found (skipped)"
 }
 
-# --- Step 5: Remove old certificate scheduled tasks and permissions ---
+# --- Steps 4-7: Replace the config, certificate tasks and permissions ---
 
-Remove-CertificateTasksPermissions $oldConfig
-if ($oldConfigProblem) {
-    Write-Warning "Renewal tasks from the old config (AWSWorkloadCredentialsProvider-Reload-*) and the permissions it granted on certificate files were not removed. The tasks run as SYSTEM, so remove the ones the new config doesn't need."
+# A failure in these steps still restarts ACM below rather than leaving
+# certificate serving down.
+$applyError = $null
+try {
+    # --- Step 4: Remove old certificate tasks and permissions ---
+
+    # Remove them while the old config is still on disk: if this fails, the
+    # config is not replaced, so a rerun finds the same grants and tasks. A
+    # failure after the replacement is fixed by rerunning, which re-applies the
+    # new config. Until then the new config's certificates may have no grants.
+    if (-not $oldConfigProblem) {
+        Remove-CertificateTasksPermissions $oldConfig
+    }
+
+    # --- Step 5: Replace a trusted config with the validated copy ---
+
+    # Replacing a trusted config only throws on failure, so the restart below
+    # still runs.
+    if ($Config -and -not $oldConfigProblem) {
+        Copy-ConfigIntoPlace -Source $Config -Destination $configPath
+        Write-Host "  New config copied to $configPath"
+    }
+
+    # --- Step 6: Apply config file ACLs ---
+
+    Write-Step "Configure config file permissions"
+
+    # Apply config file ACLs so an edited-by-hand config gets re-locked on reinstall
+    # A new config is owned by whoever ran this, who may be an administrator only
+    # through a domain group, which a later trust check would refuse
+    Invoke-Icacls $configPath /setowner "*S-1-5-32-544" /Q
+    Invoke-Icacls $configPath /inheritance:r /Q
+    Invoke-Icacls $configPath /grant "SYSTEM:F" /Q
+    Invoke-Icacls $configPath /grant "BUILTIN\Administrators:F" /Q
+    Invoke-Icacls $configPath /grant "${ACM_SERVICE_ACCOUNT}:R" /Q
+    # Also grant SM service account read if secrets-manager is enabled
+    if ($newConfig.enabledCapabilities -contains "secrets-manager") {
+        Invoke-Icacls $configPath /grant "${ASM_SERVICE_ACCOUNT}:R" /Q
+    }
+    Write-Host "  Locked down ACLs on $configPath"
+
+    # --- Step 7: Grant new certificate permissions and register scheduled tasks ---
+
+    Add-CertificateTasksPermissions $newConfig
+} catch {
+    $applyError = $_
 }
 
-# --- Step 6: Add new certificate permissions and scheduled tasks ---
-
-Add-CertificateTasksPermissions $newConfig
-
-# --- Step 7: Restart ACM service ---
+# --- Step 8: Restart ACM service ---
 
 Write-Step "Start ACM service"
 
 & sc.exe start $ACM_SERVICE | Out-Null
 if ($LASTEXITCODE -ne 0) {
-    Write-Error "sc.exe start failed for $ACM_SERVICE (exit $LASTEXITCODE)"
+    $startError = "sc.exe start failed for $ACM_SERVICE (exit $LASTEXITCODE); $ACM_SERVICE is stopped."
+    if ($applyError) {
+        Write-Error "Applying the new config failed: $applyError. $startError Fix the errors and rerun this script."
+    }
+    Write-Error $startError
 }
 Write-Host "  Started $ACM_SERVICE"
 
 # This script only restarts ACM, so Secrets Manager may still run with the old settings
 if ($oldConfigProblem -and (Get-Service -Name $ASM_SERVICE -ErrorAction SilentlyContinue | Where-Object Status -ne 'Stopped')) {
     Write-Warning "$ASM_SERVICE may still use settings from the old config. Restart it."
+}
+
+if ($applyError) {
+    Write-Error "Restarted $ACM_SERVICE, but applying the new config failed: $applyError. The config, certificate permissions or scheduled tasks may be incomplete; fix the error and rerun this script."
 }
 
 Write-Host "`n ACM certificate config reload complete." -ForegroundColor Green

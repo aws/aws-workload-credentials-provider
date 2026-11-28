@@ -258,6 +258,12 @@ fn setup_config_based_permissions(
     let acm_config = match validated.acm {
         Some(acm) if acm.enabled => acm,
         _ => {
+            // Remove what an earlier config with ACM enabled generated, so a
+            // disabled ACM leaves no sudo rule or write access behind after
+            // the ACM service is restarted. The installer intentionally leaves
+            // running services untouched.
+            sudoers::remove()?;
+            systemd::remove()?;
             println!("No ACM configuration found or ACM is disabled, skipping permissions setup");
             return Ok(());
         }
@@ -268,7 +274,8 @@ fn setup_config_based_permissions(
         sudoers::generate_and_install(&acm_config, config_path.as_deref())?;
         println!("Sudoers file written to {}", SUDOERS_PATH);
     } else {
-        println!("Skipping sudoers file generation");
+        sudoers::remove()?;
+        println!("Skipping sudoers file generation and removed any existing sudoers file");
     }
 
     // Generate systemd drop-in override with ReadWriteDirectories for cert paths

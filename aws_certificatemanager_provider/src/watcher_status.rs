@@ -819,6 +819,15 @@ fn nt_open_relative(parent: &File, name: &OsStr, directory: bool) -> io::Result<
             0,
         )
     };
+    // `RtlNtStatusToDosError` maps this to `ERROR_ACCESS_DENIED`, which can't
+    // be told apart from a real permission failure.
+    const STATUS_FILE_IS_A_DIRECTORY: i32 = 0xC000_00BA_u32 as i32;
+    if status == STATUS_FILE_IS_A_DIRECTORY {
+        return Err(io::Error::new(
+            io::ErrorKind::IsADirectory,
+            "the name is a directory",
+        ));
+    }
     if status < 0 {
         let error = unsafe { RtlNtStatusToDosError(status) };
         return Err(io::Error::from_raw_os_error(error as i32));
@@ -887,7 +896,13 @@ fn open_outbox(requests_dir: &Path, watcher_id: &str) -> io::Result<OpenOutbox> 
 
 #[cfg(windows)]
 fn open_status(directory: &File, name: &OsStr, _path: &Path) -> Result<File, StatusReadError> {
-    let file = open_relative_status(directory, name).map_err(StatusReadError::Io)?;
+    let file = open_relative_status(directory, name).map_err(|error| {
+        if error.kind() == io::ErrorKind::IsADirectory {
+            StatusReadError::Directory
+        } else {
+            StatusReadError::Io(error)
+        }
+    })?;
     let directory_path = final_path(directory).map_err(StatusReadError::Io)?;
     let file_path = final_path(&file).map_err(StatusReadError::Io)?;
     // A link out of the outbox: never readable, so not retried.
@@ -1137,7 +1152,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn failed_publication_unregisters_without_notifying_scanner() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_dirs::tempdir();
         fs::create_dir(root.path().join("one")).unwrap();
         let requests = RequestsRoot::open(root.path()).unwrap();
         let tracker = WatcherStatusTracker::new(root.path().to_path_buf(), ["one".to_string()]);
@@ -1158,7 +1173,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn successful_publication_notifies_scanner() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_dirs::tempdir();
         fs::create_dir_all(root.path().join("one").join("inbox")).unwrap();
         let requests = RequestsRoot::open(root.path()).unwrap();
         let tracker = WatcherStatusTracker::new(root.path().to_path_buf(), ["one".to_string()]);
@@ -1172,7 +1187,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn periodic_rescan_completes_a_status_without_notification() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_dirs::tempdir();
         let outbox = root.path().join("one").join(OUTBOX_DIR);
         fs::create_dir_all(&outbox).unwrap();
         let tracker = WatcherStatusTracker::new(root.path().to_path_buf(), ["one".to_string()]);
@@ -1197,7 +1212,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn pending_request_is_rescanned_every_second() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_dirs::tempdir();
         let outbox = root.path().join("one").join(OUTBOX_DIR);
         fs::create_dir_all(&outbox).unwrap();
         let tracker = WatcherStatusTracker::new(root.path().to_path_buf(), ["one".to_string()]);
@@ -1227,7 +1242,7 @@ mod tests {
         if rustix::process::geteuid().is_root() {
             return;
         }
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_dirs::tempdir();
         let outbox = root.path().join("one").join(OUTBOX_DIR);
         fs::create_dir_all(&outbox).unwrap();
         let tracker = WatcherStatusTracker::new(root.path().to_path_buf(), ["one".to_string()]);
@@ -1258,7 +1273,7 @@ mod tests {
         if rustix::process::geteuid().is_root() {
             return;
         }
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_dirs::tempdir();
         let outbox = root.path().join("one").join(OUTBOX_DIR);
         fs::create_dir_all(&outbox).unwrap();
         let tracker = WatcherStatusTracker::new(root.path().to_path_buf(), ["one".to_string()]);
@@ -1307,7 +1322,7 @@ mod tests {
         }
         capture_logs();
         let log_count = logged_on_this_thread().len();
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_dirs::tempdir();
         let outbox = root.path().join("one").join(OUTBOX_DIR);
         fs::create_dir_all(&outbox).unwrap();
         let tracker = WatcherStatusTracker::new(root.path().to_path_buf(), ["one".to_string()]);
@@ -1346,7 +1361,7 @@ mod tests {
         }
         capture_logs();
         let log_count = logged_on_this_thread().len();
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_dirs::tempdir();
         let outbox = root.path().join("one").join(OUTBOX_DIR);
         fs::create_dir_all(&outbox).unwrap();
         let tracker = WatcherStatusTracker::new(root.path().to_path_buf(), ["one".to_string()]);
@@ -1385,7 +1400,7 @@ mod tests {
     fn a_directory_with_a_status_name_is_skipped() {
         capture_logs();
         let log_count = logged_on_this_thread().len();
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_dirs::tempdir();
         let outbox = root.path().join("one").join(OUTBOX_DIR);
         let path = outbox.join(status_filename(COMMAND_ID));
         fs::create_dir_all(&path).unwrap();
@@ -1465,7 +1480,7 @@ mod tests {
 
     #[test]
     fn mismatched_watcher_arn_and_timestamp_do_not_complete_live_request() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_dirs::tempdir();
         let first = root.path().join("one").join(OUTBOX_DIR);
         let second = root.path().join("two").join(OUTBOX_DIR);
         fs::create_dir_all(&first).unwrap();
@@ -1514,7 +1529,7 @@ mod tests {
 
     #[test]
     fn rejects_status_when_filename_and_body_command_ids_differ() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_dirs::tempdir();
         let outbox = root.path().join("one").join(OUTBOX_DIR);
         fs::create_dir_all(&outbox).unwrap();
         let tracker = WatcherStatusTracker::new(root.path().to_path_buf(), ["one".to_string()]);
@@ -1536,7 +1551,7 @@ mod tests {
 
     #[test]
     fn ignores_temp_and_dot_prefixed_status_names() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_dirs::tempdir();
         let outbox = root.path().join("one").join(OUTBOX_DIR);
         fs::create_dir_all(&outbox).unwrap();
         let tracker = WatcherStatusTracker::new(root.path().to_path_buf(), ["one".to_string()]);
@@ -1566,7 +1581,7 @@ mod tests {
 
     #[test]
     fn consumes_only_a_valid_command_id_status_filename() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_dirs::tempdir();
         let outbox = root.path().join("one").join(OUTBOX_DIR);
         fs::create_dir_all(&outbox).unwrap();
         let tracker = WatcherStatusTracker::new(root.path().to_path_buf(), ["one".to_string()]);
@@ -1590,7 +1605,7 @@ mod tests {
 
     #[test]
     fn consumes_multiple_outboxes_and_deletes_accepted_statuses() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_dirs::tempdir();
         let first = root.path().join("one").join(OUTBOX_DIR);
         let second = root.path().join("two").join(OUTBOX_DIR);
         fs::create_dir_all(&first).unwrap();
@@ -1629,7 +1644,7 @@ mod tests {
 
     #[test]
     fn deletes_unknown_and_stale_statuses() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_dirs::tempdir();
         let outbox = root.path().join("one").join(OUTBOX_DIR);
         fs::create_dir_all(&outbox).unwrap();
         let tracker = WatcherStatusTracker::new(root.path().to_path_buf(), ["one".to_string()]);
@@ -1652,7 +1667,7 @@ mod tests {
 
     #[test]
     fn deletes_malformed_and_oversized_statuses() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_dirs::tempdir();
         let outbox = root.path().join("one").join(OUTBOX_DIR);
         fs::create_dir_all(&outbox).unwrap();
         let tracker = WatcherStatusTracker::new(root.path().to_path_buf(), ["one".to_string()]);
@@ -1668,7 +1683,7 @@ mod tests {
     }
     #[tokio::test]
     async fn status_ready_at_publication_handoff_is_correlated_after_registration() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_dirs::tempdir();
         let inbox = root.path().join("one").join("inbox");
         let outbox = root.path().join("one").join(OUTBOX_DIR);
         fs::create_dir_all(&inbox).unwrap();
@@ -1712,7 +1727,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn intermediate_directory_replacement_does_not_redirect_status_access() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_dirs::tempdir();
         let watcher = root.path().join("one");
         let moved_watcher = root.path().join("one-moved");
         let outside = root.path().join("outside");
@@ -1775,7 +1790,7 @@ mod tests {
             eprintln!("skipping: running as root, permission checks are bypassed");
             return;
         }
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_dirs::tempdir();
         let watcher = root.path().join("one");
         let outbox = watcher.join(OUTBOX_DIR);
         fs::create_dir_all(watcher.join("inbox")).unwrap();
@@ -1811,7 +1826,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn rejects_symlink_status_without_following_it() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_dirs::tempdir();
         let outbox = root.path().join("one").join(OUTBOX_DIR);
         let target = root.path().join("target");
         fs::create_dir_all(&outbox).unwrap();

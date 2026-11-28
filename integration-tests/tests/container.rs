@@ -3,9 +3,9 @@
 //! non-root user, with no `sudo`, writing to mounted volumes.
 //!
 //! The containers run the binaries `cargo build` produced on the host, mounted
-//! read-only into `public.ecr.aws/docker/library/ubuntu:24.04`. That image has
-//! the glibc of `ubuntu-latest`, where CI builds them. It has no CA bundle, so
-//! the host's bundle is mounted in and named by `SSL_CERT_FILE`.
+//! read-only into `ubuntu:24.04` from Docker Hub. That image has the glibc of
+//! `ubuntu-latest`, where CI builds them. It has no CA bundle, so the host's
+//! bundle is mounted in and named by `SSL_CERT_FILE`.
 //!
 //! When Docker isn't available the tests print `SKIPPED: <reason>` and pass,
 //! unless `WCP_CONTAINER_TESTS_REQUIRED=1` makes them fail.
@@ -42,7 +42,7 @@ use common::{
 };
 use serde_json::Value;
 
-const IMAGE: &str = "public.ecr.aws/docker/library/ubuntu:24.04";
+const IMAGE: &str = "ubuntu:24.04";
 
 /// The non-root user the ACM sidecar image (`Dockerfile.acm`) runs as.
 const CONTAINER_USER: &str = "65532:65532";
@@ -97,19 +97,19 @@ const PLACEHOLDER_ROLE_ARN: &str = "arn:aws:iam::123456789012:role/PlaceholderRo
 
 /// Owns an ECS task's network namespace and serves the task metadata
 /// endpoint at the ECS agent's address, as `ip` and `httpd` from busybox.
-const TASK_NETWORK_IMAGE: &str = "public.ecr.aws/docker/library/busybox:stable";
+const TASK_NETWORK_IMAGE: &str = "busybox:stable";
 
 /// The official nginx image, Debian-based as the README recommends for the
 /// watcher's TLS container. Its glibc is newer than `ubuntu-latest`'s, so the
 /// host-built watcher runs in it.
-const NGINX_IMAGE: &str = "public.ecr.aws/docker/library/nginx:stable";
+const NGINX_IMAGE: &str = "nginx:stable";
 
 /// nginx's config inside its container.
 const NGINX_CONF: &str = "/etc/wcp-test/nginx.conf";
 
 /// Serves TLS with `openssl s_server`. The httpd image is the Docker
 /// official image with the `openssl` CLI.
-const TLS_IMAGE: &str = "public.ecr.aws/docker/library/httpd:2.4";
+const TLS_IMAGE: &str = "httpd:2.4";
 
 /// The ECS agent's task metadata address, fixed by the provider.
 const ECS_AGENT_IP: &str = "169.254.170.2";

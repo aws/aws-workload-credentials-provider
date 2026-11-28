@@ -9,6 +9,19 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 source "${SCRIPT_DIR}/common.sh"
 
+# Directory holding the built provider binary. Defaults to the cargo release
+# output of this checkout; set WCP_PROVIDER_SOURCE_DIR for any other layout.
+# Only the installer reads it, so only the installer checks it.
+if [ -n "${WCP_PROVIDER_SOURCE_DIR:-}" ]; then
+    if [ ! -d "${WCP_PROVIDER_SOURCE_DIR}" ]; then
+        echo "WCP_PROVIDER_SOURCE_DIR is not a directory: ${WCP_PROVIDER_SOURCE_DIR}" >&2
+        exit 1
+    fi
+    PROVIDER_SOURCE_DIR="$(realpath -e "${WCP_PROVIDER_SOURCE_DIR}")"
+else
+    PROVIDER_SOURCE_DIR="../../target/release"
+fi
+
 #
 # Usage and argument parsing
 #
@@ -52,9 +65,13 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
-if [ -n "${CONFIG_FILE}" ] && [ ! -f "${CONFIG_FILE}" ]; then
-    echo "Cannot find config file: ${CONFIG_FILE}" >&2
-    exit 1
+if [ -n "${CONFIG_FILE}" ]; then
+    if [ ! -f "${CONFIG_FILE}" ]; then
+        echo "Cannot find config file: ${CONFIG_FILE}" >&2
+        exit 1
+    fi
+    # Resolve before the cd below, which would break a relative path.
+    CONFIG_FILE="$(realpath -e "${CONFIG_FILE}")"
 fi
 
 #
@@ -111,28 +128,84 @@ fi
 mkdir -p "${CONFIG_DIR}"
 chmod 755 "${CONFIG_DIR}"
 
+PERMISSION_ARGS=(setup-config-based-permissions)
+if [ "${SKIP_SUDOERS}" = true ]; then
+    PERMISSION_ARGS+=(--no-sudoers)
+fi
+
+# The files a config install changes, restored together if any step fails.
+RESTORED_FILES=("${CONFIG_DIR}/config.toml" "${SUDOERS_FILE}" "${ACM_DROPIN_DIR}/cert-paths.conf")
+
+# Copies each restored file that exists into $1.
+backup_restored_files() {
+    local file
+    for file in "${RESTORED_FILES[@]}"; do
+        if [ -f "${file}" ]; then
+            cp -p "${file}" "$1/$(basename "${file}")"
+        fi
+    done
+}
+
+# Returns each restored file to its state in backup directory $1, removing
+# files that did not exist when the backup was taken.
+restore_files() {
+    local file backup
+    for file in "${RESTORED_FILES[@]}"; do
+        backup="$1/$(basename "${file}")"
+        if [ -f "${backup}" ]; then
+            if cmp -s "${backup}" "${file}"; then
+                continue
+            fi
+            # sudo ignores sudoers.d entries containing a dot, so the
+            # temporary copy is never read as a rule.
+            if ! { cp -p "${backup}" "${file}.restore" && mv -f "${file}.restore" "${file}"; }; then
+                echo "WARNING: Could not restore ${file}; rerun the installer with the previous config." >&2
+            fi
+        elif ! rm -f "${file}"; then
+            echo "WARNING: Could not remove ${file}; rerun the installer with the previous config." >&2
+        fi
+    done
+}
+
 if [ -n "${CONFIG_FILE}" ]; then
-    install -T -m 440 -o "root" -g "${PROVIDER_GROUP}" "${CONFIG_FILE}" "${CONFIG_DIR}/config.toml"
+    CONFIG_STAGED_FILE="$(mktemp "${CONFIG_DIR}/.config.toml.XXXXXX")"
+    BACKUP_DIR="$(mktemp -d)"
+    trap 'rm -f "${CONFIG_STAGED_FILE:-}"; rm -rf "${BACKUP_DIR:-}"' EXIT
+    install -T -m 440 -o "root" -g "${PROVIDER_GROUP}" "${CONFIG_FILE}" "${CONFIG_STAGED_FILE}"
+    backup_restored_files "${BACKUP_DIR}"
+
+    # Validate the staged config, which also generates permissions from it,
+    # before it replaces the live config. Generate again from the live path so
+    # the sudoers file names it. If any step fails, the previous config and
+    # generated permissions are restored.
+    if ! { "${PROVIDER_DIR}/bin/${PROVIDER_BIN}" "${PERMISSION_ARGS[@]}" --config "${CONFIG_STAGED_FILE}" &&
+           mv -f "${CONFIG_STAGED_FILE}" "${CONFIG_DIR}/config.toml" &&
+           "${PROVIDER_DIR}/bin/${PROVIDER_BIN}" "${PERMISSION_ARGS[@]}"; }; then
+        restore_files "${BACKUP_DIR}"
+        echo "Config from ${CONFIG_FILE} was not installed; the previous config and generated permissions were kept." >&2
+        exit 1
+    fi
+    CONFIG_STAGED_FILE=""
     echo "Config installed from ${CONFIG_FILE}"
-elif [ -f "${CONFIG_DIR}/config.toml" ]; then
-    echo "Using existing config at ${CONFIG_DIR}/config.toml"
+else
+    if [ -f "${CONFIG_DIR}/config.toml" ]; then
+        echo "Using existing config at ${CONFIG_DIR}/config.toml"
+    fi
+    "${PROVIDER_DIR}/bin/${PROVIDER_BIN}" "${PERMISSION_ARGS[@]}"
 fi
 
 #
-# Permissions setup
+# Permissions check
 #
 
-if [ "${SKIP_SUDOERS}" = false ]; then
-    "${PROVIDER_DIR}/bin/${PROVIDER_BIN}" setup-config-based-permissions
-
-    # Verify /etc/sudoers includes /etc/sudoers.d
-    if ! grep -qE '^@includedir\s+/etc/sudoers\.d|^#includedir\s+/etc/sudoers\.d' /etc/sudoers 2>/dev/null; then
-        echo "WARNING: /etc/sudoers does not include /etc/sudoers.d" >&2
-        echo "  The generated sudoers file at /etc/sudoers.d/${PROVIDER_BIN} will not take effect." >&2
-        echo "  Use 'visudo' to add an includedir directive for /etc/sudoers.d" >&2
-    fi
-else
-    "${PROVIDER_DIR}/bin/${PROVIDER_BIN}" setup-config-based-permissions --no-sudoers
+# Verify /etc/sudoers includes /etc/sudoers.d
+if [ "${SKIP_SUDOERS}" = false ] &&
+   ! grep -qE '^@includedir\s+/etc/sudoers\.d|^#includedir\s+/etc/sudoers\.d' /etc/sudoers 2>/dev/null; then
+    echo "WARNING: /etc/sudoers does not include /etc/sudoers.d" >&2
+    echo "  Refresh commands that require sudo will fail until this is fixed." >&2
+    echo "  Add '@includedir /etc/sudoers.d' to /etc/sudoers using 'visudo'." >&2
+    echo "  Then run 'visudo -c' to verify the sudoers configuration." >&2
+    echo "  Once included, the generated sudoers file at ${SUDOERS_FILE} will take effect on the next sudo invocation." >&2
 fi
 
 #

@@ -36,7 +36,13 @@ $SCRIPT_DIR = Split-Path -Parent $MyInvocation.MyCommand.Path
 
 . "$SCRIPT_DIR\common.ps1"
 
-$PROVIDER_SOURCE_DIR = Join-Path $SCRIPT_DIR "..\..\target\release"
+# Directory holding the built provider binary. Defaults to the cargo release
+# output of this checkout; set WCP_PROVIDER_SOURCE_DIR for any other layout.
+$PROVIDER_SOURCE_DIR = if ($env:WCP_PROVIDER_SOURCE_DIR) {
+    $env:WCP_PROVIDER_SOURCE_DIR
+} else {
+    Join-Path $SCRIPT_DIR "..\..\target\release"
+}
 
 function Test-ServicesRunning {
     $running = @($ACM_SERVICE, $ASM_SERVICE) | Where-Object {
@@ -135,12 +141,34 @@ Assert-AdminControlledProviderDir
 # in place by the previous install.
 # On fresh install without -Config, start the SecretsManager provider with no config, don't start ACM provider
 $defaultConfigPath = "$PROVIDER_DIR\$CONFIG_FILE_NAME"
+
+# Check the previous config's trust boundary before parsing it. An untrusted
+# config is never parsed or used to identify cleanup targets.
+$oldConfigProblem = if (Test-ExistingConfig) {
+    Get-ExistingConfigProblem -Path $defaultConfigPath
+} else {
+    $null
+}
+$oldConfig = if ($oldConfigProblem) {
+    $null
+} elseif (Test-ExistingConfig) {
+    Get-Config -Config $defaultConfigPath -ProviderBinary $providerBinary
+} else {
+    $null
+}
+
 if ($Config) {
     # Validate the provided config before overwriting the existing one
     $validatedConfig = Confirm-Config -Config $Config -ProviderBinary $providerBinary
     $secretsManagerEnabled = $validatedConfig.enabledCapabilities -contains "secrets-manager"
     $acmEnabled = $validatedConfig.enabledCapabilities -contains "acm"
-    $oldConfigProblem = if (Test-ExistingConfig) { Get-ExistingConfigProblem -Path $defaultConfigPath } else { $null }
+    # Remove the old config's grants and tasks while it is still on disk: if
+    # this fails, the config is not replaced, so a rerun finds the same grants
+    # and tasks. A failure later in the install is fixed by rerunning, which
+    # re-applies the new config. Until then its certificates may have no grants.
+    if (-not $oldConfigProblem) {
+        Remove-CertificateTasksPermissions $oldConfig
+    }
     Copy-ConfigIntoPlace -Source $Config -Destination $defaultConfigPath -ReplaceUntrusted:([bool]$oldConfigProblem)
     if ($oldConfigProblem) {
         Write-Warning "Replaced the old ${defaultConfigPath}, which administrators didn't control: $oldConfigProblem. Renewal tasks from it (AWSWorkloadCredentialsProvider-Reload-*) and the permissions it granted on certificate files were not removed. The tasks run as SYSTEM, so remove the ones the new config doesn't need."
@@ -156,6 +184,11 @@ if ($Config) {
         $validatedConfig = Confirm-Config -Config $defaultConfigPath -ProviderBinary $providerBinary
         $secretsManagerEnabled = $validatedConfig.enabledCapabilities -contains "secrets-manager"
         $acmEnabled = $validatedConfig.enabledCapabilities -contains "acm"
+        # The config stays in place, so a rerun after a later failure finds
+        # these grants and tasks again.
+        if (-not $oldConfigProblem) {
+            Remove-CertificateTasksPermissions $oldConfig
+        }
     }
 }
 
@@ -281,10 +314,10 @@ if ($secretsManagerEnabled) {
 $LOGS_DIR = "$PROVIDER_DIR\logs"
 New-Item -ItemType Directory -Path $LOGS_DIR -Force | Out-Null
 
-icacls $LOGS_DIR /grant "${ASM_SERVICE_ACCOUNT}:(OI)(CI)M" /T /Q | Out-Null
+Invoke-Icacls $LOGS_DIR /grant "${ASM_SERVICE_ACCOUNT}:(OI)(CI)M" /T /Q
 Write-Host "  Granted Modify ACL to $ASM_SERVICE_ACCOUNT on $LOGS_DIR"
 
-icacls $LOGS_DIR /grant "${ACM_SERVICE_ACCOUNT}:(OI)(CI)M" /T /Q | Out-Null
+Invoke-Icacls $LOGS_DIR /grant "${ACM_SERVICE_ACCOUNT}:(OI)(CI)M" /T /Q
 Write-Host "  Granted Modify ACL to $ACM_SERVICE_ACCOUNT on $LOGS_DIR"
 
 
@@ -292,13 +325,11 @@ Write-Step "Configure file permissions"
 
 if (Test-Path $defaultConfigPath) {
     # Apply config file ACLs so an edited-by-hand config gets re-locked on reinstall
-    icacls $defaultConfigPath /inheritance:r /Q | Out-Null
-    icacls $defaultConfigPath /grant "SYSTEM:F" /Q | Out-Null
-    icacls $defaultConfigPath /grant "BUILTIN\Administrators:F" /Q | Out-Null
-
-    icacls $defaultConfigPath /grant "${ASM_SERVICE_ACCOUNT}:R" /Q | Out-Null
-
-    icacls $defaultConfigPath /grant "${ACM_SERVICE_ACCOUNT}:R" /Q | Out-Null
+    Invoke-Icacls $defaultConfigPath /inheritance:r /Q
+    Invoke-Icacls $defaultConfigPath /grant "SYSTEM:F" /Q
+    Invoke-Icacls $defaultConfigPath /grant "BUILTIN\Administrators:F" /Q
+    Invoke-Icacls $defaultConfigPath /grant "${ASM_SERVICE_ACCOUNT}:R" /Q
+    Invoke-Icacls $defaultConfigPath /grant "${ACM_SERVICE_ACCOUNT}:R" /Q
 
     Write-Host "  Locked down ACLs on $defaultConfigPath"
 } else {

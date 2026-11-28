@@ -105,6 +105,14 @@ fn escape_unit_path(path: &Path) -> io::Result<String> {
     Ok(out)
 }
 
+/// Removes the generated drop-in override, if present.
+pub fn remove() -> io::Result<()> {
+    match std::fs::remove_file(override_path()) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
+}
+
 /// Returns the full path to the generated override file.
 pub fn override_path() -> PathBuf {
     Path::new(ACM_SERVICE_OVERRIDE_DIR).join(ACM_SERVICE_OVERRIDE_FILE)
