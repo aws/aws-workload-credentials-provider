@@ -30,6 +30,8 @@ The Certificate Management capability requires elevated permissions for the prov
 
 You can provide a custom configuration by passing `--config /path/to/config.toml` on startup or on reload while the provider is running\. On Windows, use `-Config C:\path\to\config.toml` when invoking the PowerShell scripts and `--Config C:\path\to\config.toml` when executing the binary command\. The reload re\-applies permissions and restarts the ACM service\.
 
+On Linux, installing a configuration with ACM disabled removes the generated sudoers rule and systemd write-access drop-in\. The installer intentionally does not stop a running ACM service, so that process keeps its existing certificate write access until it is restarted\. Restart the ACM service after disabling ACM to revoke that access\.
+
 For full configuration details, see [Configure the Workload Credentials Provider](#workload-credentials-provider-config)\.
 
 The Certificate Management capability also includes optional certificate discovery and telemetry\. For details, see [Step 5: Turn on certificate discovery and telemetry](#workload-credentials-provider-discovery)\.
@@ -252,7 +254,13 @@ Based on the type of compute, you have several options for installing the Worklo
 
    The script generates a random SSRF token on startup and stores it in the file `/var/run/awssmatoken`\. The token is readable by the `aws-wcp-token` group that the install script creates\.
 
-   **Upgrading:** the install script starts services that aren't running and leaves running ones as they are, so after an upgrade restart the services, or the host, to run the new version\. Restarting the token service creates a new token and also restarts the Secrets Manager service, which requires it; applications that keep the token must then read the file again\.
+   The script looks for the provider binary in `target/release` of this checkout\. To install a binary built elsewhere, set `WCP_PROVIDER_SOURCE_DIR` to the directory that contains it\.
+
+   If the config does not enable Certificate Management, the script removes the sudoers file and the systemd drop-in that an earlier install generated\. `--no-sudoers` also removes an earlier generated sudoers file while retaining the systemd certificate-path drop-in\. If `/etc/sudoers` does not include `/etc/sudoers.d`, refresh commands that require sudo will fail; add `@includedir /etc/sudoers.d` with `visudo`, then run `visudo -c`\. Once included, the generated rule takes effect on the next `sudo` invocation\.
+
+   **Refresh commands:** the ACM service runs with `ProtectSystem=full`, `ProtectHome=true` and `PrivateTmp=true`, and each `refresh_command` inherits that sandbox\. A refresh command cannot write under `/usr`, `/boot`, `/etc` or `/home`, except in the certificate directories, and files it creates in `/tmp` are not visible outside the service\. Commands that signal or ask another service to reload, such as `nginx -s reload` or `systemctl reload <service>`, are not affected\.
+
+   **Upgrading:** the install script starts services that aren't running and leaves running ones as they are, so after an upgrade restart the services, or the host, to run the new version\. A running `aws-wcp` process also gains repaired `awscreds` and `aws-wcp-token` membership only after it restarts\. Restarting the token service creates a new token and also restarts the Secrets Manager service, which requires it; applications that keep the token must then read the file again\.
 
    ```sh
    sudo systemctl restart aws-workload-credentials-provider-token aws-workload-credentials-provider-acm
@@ -284,7 +292,7 @@ Based on the type of compute, you have several options for installing the Worklo
 
    The script generates a random SSRF token on startup and stores it in the file `C:\ProgramData\AWS\WorkloadCredentialsProvider\awssmatoken`\. The token is readable by the Secrets Manager service account (`NT SERVICE\AWSWorkloadCredentialsProvider-SecretsManager`) that the install script configures\.
 
-   **Upgrading:** the install script makes no changes while either provider service is running, so stop both services first, then run it again\. It replaces the token file, so then grant your application read access again, as in the next step\.
+   **Upgrading:** the install script makes no changes while either provider service is running, so stop both services first, then run it again\. A new `-Config` replaces the certificate file permissions and scheduled tasks of the previous config\. It replaces the token file, so then grant your application read access again, as in the next step\.
 
    ```powershell
    Stop-Service AWSWorkloadCredentialsProvider-SecretsManager, AWSWorkloadCredentialsProvider-ACM
@@ -1743,6 +1751,8 @@ Certificate discovery connects only to loopback addresses and reads only what an
 ## Running Integration Tests Locally<a name="integration-tests-local"></a>
 
 The AWS Workload Credentials Provider includes a comprehensive integration test suite that validates functionality against real AWS Secrets Manager. These tests cover caching behavior, security features, configuration options, version management, and error handling scenarios.
+
+The installer tests in `integration-tests/tests/installer.rs` create users, groups, services, scheduled tasks, and sudoers or ACL entries on the host. Do not run them on a development machine. To confirm they compile without changing the host, run `cargo test --manifest-path integration-tests/Cargo.toml --test installer --no-run`. The `installer-tests.yml` workflow runs them with `WCP_INSTALLER_TESTS=1` on disposable Linux and Windows runners; it also supports `workflow_dispatch` for an explicit run.
 
 ### Prerequisites
 

@@ -1,0 +1,136 @@
+name: Installer Tests
+
+# Runs the host installers (install / uninstall on Linux, install.ps1 /
+# acmReloadConfig.ps1 / uninstall.ps1 on Windows) on disposable runners and
+# checks what they set up. integration-tests/tests/installer.rs holds the
+# tests; they modify the host, so they run only with WCP_INSTALLER_TESTS=1.
+
+on:
+  workflow_dispatch:
+  workflow_call:
+  push:
+    branches: ["main", "feature/acm-telemetry"]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "aws_*/**"
+      - "integration-tests/tests/common.rs"
+      - "integration-tests/Cargo.toml"
+      - "integration-tests/tests/installer.rs"
+      - ".github/workflows/installer-tests.yml"
+  pull_request:
+    branches: ["main", "feature/acm-telemetry"]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "aws_*/**"
+      - "integration-tests/tests/common.rs"
+      - "integration-tests/Cargo.toml"
+      - "integration-tests/tests/installer.rs"
+      - ".github/workflows/installer-tests.yml"
+
+env:
+  CARGO_TERM_COLOR: always
+  WCP_INSTALLER_TESTS_REQUIRED: "1"
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@v2.19.4
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build provider and tests
+        run: |
+          cargo build
+          cargo test --manifest-path integration-tests/Cargo.toml --test installer --no-run
+
+      # The tests install systemd units, a sudoers file and a system user, so
+      # they run as root. PATH is passed because sudo resets it.
+      - name: Run installer tests
+        run: |
+          cd integration-tests
+          sudo -E env "PATH=$PATH" WCP_INSTALLER_TESTS=1 \
+            cargo test --test installer -- --test-threads=1
+
+      - name: Service logs on failure
+        if: failure()
+        run: |
+          sudo journalctl --no-pager -n 200 \
+            -u aws-workload-credentials-provider-acm \
+            -u aws-workload-credentials-provider-sm \
+            -u aws-workload-credentials-provider-token
+
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@v2.19.4
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # Keep Ninja: the package builds aws-lc-rs through its native CMake
+      # toolchain, and the existing Windows Rust workflow provisions it too.
+      - name: Install ninja-build
+        uses: seanmiddleditch/gha-setup-ninja@v6
+
+      - name: Install NASM
+        uses: ilammy/setup-nasm@v1
+
+      - name: Build provider
+        run: cargo build
+
+      # Hosted Windows runners run as an Administrator, which the installer
+      # requires.
+      - name: Run installer tests
+        env:
+          WCP_INSTALLER_TESTS: "1"
+        run: |
+          cd integration-tests
+          cargo test --test installer -- --test-threads=1
+
+      - name: Windows diagnostics on failure
+        if: failure()
+        shell: pwsh
+        run: |
+          $diagnosticsDir = Join-Path $env:RUNNER_TEMP 'wcp-installer-diagnostics'
+          if (Test-Path $diagnosticsDir) {
+            Get-ChildItem $diagnosticsDir -File -Recurse | ForEach-Object {
+              Write-Host "=== $($_.FullName) ==="
+              Get-Content $_.FullName -Tail 200
+            }
+          }
+          Get-Service AWSWorkloadCredentialsProvider-* -ErrorAction SilentlyContinue |
+            Format-List Name,Status,StartType
+          $logDir = "$env:ProgramData\AWS\WorkloadCredentialsProvider\logs"
+          if (Test-Path $logDir) {
+            Get-ChildItem $logDir -File -Recurse | ForEach-Object {
+              Write-Host "=== $($_.FullName) ==="
+              Get-Content $_.FullName -Tail 200
+            }
+          }
+          Get-WinEvent -LogName System -MaxEvents 100 -ErrorAction SilentlyContinue |
+            Where-Object ProviderName -eq 'Service Control Manager' |
+            Format-List TimeCreated,ProviderName,Id,LevelDisplayName,Message
+          Get-WinEvent -LogName Application -MaxEvents 100 -ErrorAction SilentlyContinue |
+            Where-Object ProviderName -eq 'Application Error' |
+            Format-List TimeCreated,ProviderName,Id,LevelDisplayName,Message
