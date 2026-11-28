@@ -1001,9 +1001,19 @@ mod windows {
             .join(r"AWS\WorkloadCredentialsProvider")
     }
 
+    /// Windows PowerShell 5.1, as the installer docs run it. A parent pwsh 7
+    /// process puts its own module folders in PSModulePath, which makes 5.1
+    /// load the 7.x Microsoft.PowerShell.Security module and fail in Get-Acl,
+    /// so 5.1 starts with its default module path instead.
+    fn windows_powershell() -> Command {
+        let mut command = Command::new("powershell.exe");
+        command.env_remove("PSModulePath");
+        command
+    }
+
     /// Runs a PowerShell command and returns (success, output).
     fn ps(command: &str) -> (bool, String) {
-        let out = Command::new("powershell.exe")
+        let out = windows_powershell()
             .args([
                 "-NoProfile",
                 "-NonInteractive",
@@ -1027,7 +1037,7 @@ mod windows {
     /// code and output.
     fn script(name: &str, args: &str) -> (i32, String) {
         let path = configuration_dir().join(name);
-        let out = Command::new("powershell.exe")
+        let out = windows_powershell()
             .args([
                 "-NoProfile",
                 "-NonInteractive",

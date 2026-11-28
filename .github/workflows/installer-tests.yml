@@ -58,11 +58,18 @@ jobs:
           cargo test --manifest-path integration-tests/Cargo.toml --test installer --no-run
 
       # The tests install systemd units, a sudoers file and a system user, so
-      # they run as root. PATH is passed because sudo resets it.
+      # they run as root. sudo resets the environment and the runner's sudo
+      # ignores -E, so the toolchain paths and test settings are passed
+      # explicitly.
       - name: Run installer tests
         run: |
           cd integration-tests
-          sudo -E env "PATH=$PATH" WCP_INSTALLER_TESTS=1 \
+          sudo env "PATH=$PATH" \
+            "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
+            "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" \
+            "CARGO_TERM_COLOR=$CARGO_TERM_COLOR" \
+            WCP_INSTALLER_TESTS=1 \
+            "WCP_INSTALLER_TESTS_REQUIRED=$WCP_INSTALLER_TESTS_REQUIRED" \
             cargo test --test installer -- --test-threads=1
 
       - name: Service logs on failure
