@@ -705,8 +705,8 @@ mod linux {
         );
     }
 
-    /// Fails while sourcing common.sh, before the installer changes anything,
-    /// so this test does not need the host opt-in.
+    /// The installer checks the variable before it changes anything, so this
+    /// test does not need the host opt-in.
     #[test]
     fn install_rejects_missing_provider_source_dir() {
         let missing = "/nonexistent/wcp-installer-tests/provider";
@@ -721,6 +721,36 @@ mod linux {
                 "WCP_PROVIDER_SOURCE_DIR is not a directory: {missing}"
             )),
             "missing WCP_PROVIDER_SOURCE_DIR error: {stderr}"
+        );
+    }
+
+    /// Uninstall never reads the provider source, so a stale value must not
+    /// stop it.
+    #[test]
+    fn uninstall_ignores_missing_provider_source_dir() {
+        let Some(host) = Host::new("uninstall-stale-source-dir") else {
+            return;
+        };
+        host.install(&["--no-start"]);
+
+        let missing = "/nonexistent/wcp-installer-tests/provider";
+        let out = Command::new(configuration_dir().join("uninstall"))
+            .env("WCP_PROVIDER_SOURCE_DIR", missing)
+            .output()
+            .expect("could not run uninstall");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.status.success(), "uninstall failed:\n{text}");
+        assert!(
+            !text.contains("WCP_PROVIDER_SOURCE_DIR"),
+            "uninstall checked WCP_PROVIDER_SOURCE_DIR:\n{text}"
+        );
+        assert!(
+            !Path::new(&format!("{SYSTEMD_DIR}/{ACM_SERVICE}.service")).exists(),
+            "uninstall left the ACM unit"
         );
     }
 
