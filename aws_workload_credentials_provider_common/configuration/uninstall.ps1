@@ -158,8 +158,13 @@ foreach ($task in $reloadTasks) {
 Write-Step "Remove SSRF token"
 
 if (Test-Path $SSRF_TOKEN_FILE) {
-    Remove-Item -Path $SSRF_TOKEN_FILE -Force
-    Write-Host "  Removed SSRF token file: $SSRF_TOKEN_FILE"
+    try {
+        Remove-Item -Path $SSRF_TOKEN_FILE -Force
+        Write-Host "  Removed SSRF token file: $SSRF_TOKEN_FILE"
+    } catch {
+        $cleanupFailures += "SSRF token file $SSRF_TOKEN_FILE"
+        Write-Warning "Failed to remove SSRF token file ${SSRF_TOKEN_FILE}: $_"
+    }
 } else {
     Write-Host "  Not found: $SSRF_TOKEN_FILE (skipped)"
 }
