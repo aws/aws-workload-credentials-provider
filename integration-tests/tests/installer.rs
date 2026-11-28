@@ -57,9 +57,9 @@ fn enabled() -> bool {
 /// The directory holding the installer scripts.
 fn configuration_dir() -> PathBuf {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    manifest
-        .join("../aws_workload_credentials_provider_common/configuration")
-        .canonicalize()
+    // dunce, because std's canonicalize returns a \\?\ path on Windows, and
+    // PowerShell's Join-Path fails on a script run from one.
+    dunce::canonicalize(manifest.join("../aws_workload_credentials_provider_common/configuration"))
         .expect("could not find the installer scripts")
 }
 
@@ -1194,6 +1194,8 @@ mod windows {
 
         fn clean(&self) {
             let _ = script("uninstall.ps1", "-RemoveAll");
+            // uninstall -RemoveAll keeps an unparseable config for review.
+            let _ = std::fs::remove_dir_all(program_data_dir());
             let _ = std::fs::remove_dir_all(&self.root);
         }
     }
@@ -1340,7 +1342,7 @@ mod windows {
 
         std::fs::write(program_data_dir().join("config.toml"), "not valid = [\n").unwrap();
 
-        let output = run_script("uninstall.ps1", "");
+        let output = run_script("uninstall.ps1", "-RemoveAll");
 
         assert!(
             output.contains("Certificate permissions may remain"),
@@ -1350,6 +1352,11 @@ mod windows {
         assert!(
             remaining_tasks.is_empty(),
             "reload tasks left behind: {remaining_tasks:?}"
+        );
+        // The config is kept for the manual cleanup it points to.
+        assert!(
+            program_data_dir().join("config.toml").exists(),
+            "-RemoveAll deleted the config needed for manual cleanup"
         );
     }
 
@@ -1470,25 +1477,15 @@ mod windows {
             &format!("-Config '{}'", old_config.display()),
         );
 
-        // Administrators can't change permissions on a folder they don't own
-        // when denied WRITE_DAC, so the reload's icacls /grant fails.
-        let dir = new_certs.display();
-        let (ok, text) = ps(&format!(
-            "icacls '{dir}' /setowner '*S-1-5-18' /Q; if ($LASTEXITCODE) {{ exit 1 }}; \
-             icacls '{dir}' /deny '*S-1-5-32-544:(WDAC)' /Q; exit $LASTEXITCODE"
-        ));
-        assert!(ok, "could not block permission changes: {text}");
+        // The reload's icacls /grant on the new folder fails.
+        block_permission_changes(&new_certs);
 
         let (code, output) = script(
             "acmReloadConfig.ps1",
             &format!("-Config '{}'", new_config.display()),
         );
 
-        let (ok, text) = ps(&format!(
-            "icacls '{dir}' /setowner '*S-1-5-32-544' /Q; if ($LASTEXITCODE) {{ exit 1 }}; \
-             icacls '{dir}' /remove:d '*S-1-5-32-544' /Q; exit $LASTEXITCODE"
-        ));
-        assert!(ok, "could not unblock permission changes: {text}");
+        unblock_permission_changes(&new_certs);
 
         assert_ne!(
             code, 0,
@@ -1684,6 +1681,74 @@ mod windows {
         wait_until("Secrets Manager service to run", || {
             service_status(SM_SERVICE) == "Running"
         });
+    }
+
+    /// Administrators can't change permissions on a folder they don't own
+    /// when denied WRITE_DAC, so icacls /grant and /remove on it fail.
+    fn block_permission_changes(dir: &Path) {
+        let dir = dir.display();
+        let (ok, text) = ps(&format!(
+            "icacls '{dir}' /setowner '*S-1-5-18' /Q; if ($LASTEXITCODE) {{ exit 1 }}; \
+             icacls '{dir}' /deny '*S-1-5-32-544:(WDAC)' /Q; exit $LASTEXITCODE"
+        ));
+        assert!(ok, "could not block permission changes: {text}");
+    }
+
+    fn unblock_permission_changes(dir: &Path) {
+        let dir = dir.display();
+        let (ok, text) = ps(&format!(
+            "icacls '{dir}' /setowner '*S-1-5-32-544' /Q; if ($LASTEXITCODE) {{ exit 1 }}; \
+             icacls '{dir}' /remove:d '*S-1-5-32-544' /Q; exit $LASTEXITCODE"
+        ));
+        assert!(ok, "could not unblock permission changes: {text}");
+    }
+
+    /// A failed certificate cleanup keeps the files a rerun needs, reports
+    /// the uninstall as incomplete, and a rerun finishes it.
+    #[test]
+    fn uninstall_keeps_files_when_certificate_cleanup_fails() {
+        let Some(host) = Host::new("uninstall-cleanup-failure") else {
+            return;
+        };
+        let certs = host.cert_dir("certs");
+        let other_certs = host.cert_dir("other");
+        let config = host.write_config(
+            "config.toml",
+            &config_toml(&[
+                placeholder_cert(PLACEHOLDER_CERT_ARN, &certs),
+                placeholder_cert(OTHER_PLACEHOLDER_CERT_ARN, &other_certs),
+            ]),
+        );
+        run_script(
+            "install.ps1",
+            &format!("-Config '{}' -NoStart", config.display()),
+        );
+
+        block_permission_changes(&certs);
+        let (code, output) = script("uninstall.ps1", "-RemoveAll");
+        unblock_permission_changes(&certs);
+
+        assert_ne!(code, 0, "uninstall reported success:\n{output}");
+        assert!(
+            output.contains("Uninstall incomplete"),
+            "missing incomplete message: {output}"
+        );
+        assert!(install_dir().exists(), "install directory was removed");
+        assert!(
+            program_data_dir().join("config.toml").exists(),
+            "config was removed"
+        );
+        // Cleanup of the other certificate still ran.
+        assert_no_cert_grants(OTHER_PLACEHOLDER_CERT_ARN, &other_certs);
+
+        run_script("uninstall.ps1", "-RemoveAll");
+
+        assert_no_cert_grants(PLACEHOLDER_CERT_ARN, &certs);
+        assert!(!install_dir().exists(), "install directory left behind");
+        assert!(
+            !program_data_dir().exists(),
+            "provider directory left behind"
+        );
     }
 
     #[test]

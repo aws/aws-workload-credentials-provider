@@ -6,8 +6,10 @@
     Reverses install.ps1:
     1. Stop services; if any service does not stop, exit without removing anything
     2. Remove certificate ACLs from the previous config when it can be parsed; always remove reload scheduled tasks and warn when certificate cleanup may be needed
-    3. Remove services via sc.exe
-    4. Remove the install directory when every service was deleted
+    3. Remove services via sc.exe, and scheduled tasks and the SSRF token file
+    4. Remove the install directory, and with -RemoveAll the provider directory,
+       only when every cleanup step succeeded; otherwise keep both for a rerun
+       and exit with an "Uninstall incomplete" error
     5. Preserve provider data directory (config and logs) by default
 
 .PARAMETER RemoveAll
@@ -51,7 +53,10 @@ if ((Test-Path $configPath) -and (Test-Path $providerBin) -and (Test-AdminContro
 
 Write-Step "Stop services"
 
-$serviceDeleteSkipped = $false
+# Steps that failed. Any failure keeps the install and provider directories,
+# which a rerun needs to finish the cleanup, and makes uninstall exit nonzero.
+$cleanupFailures = @()
+$keepConfigForReview = $false
 $stoppedServices = @()
 $runningServices = @()
 foreach ($svc in @($ACM_SERVICE, $ASM_SERVICE)) {
@@ -87,6 +92,7 @@ if ($jsonOutput) {
         try {
             Remove-CertificatePermissions $cert
         } catch {
+            $cleanupFailures += "permissions for $($cert.certificateArn)"
             Write-Warning "Failed to clean up permissions for $($cert.certificateArn): $_"
         }
     }
@@ -97,6 +103,9 @@ if ($jsonOutput) {
     # binary usually means an earlier uninstall already ran it.
     Write-Host "  Provider binary not found at $providerBin - skipping ACM permission cleanup"
 } else {
+    # The config is the only record of which certificate files were granted
+    # access, so -RemoveAll keeps it for the manual cleanup.
+    $keepConfigForReview = $true
     Write-Warning "ACM cleanup was skipped because the previous config is untrusted or could not be parsed. Certificate permissions may remain; review and remove them manually."
 }
 
@@ -114,7 +123,7 @@ foreach ($svc in @($ACM_SERVICE, $ASM_SERVICE)) {
         }
         Write-Host "  Removed service: $svc"
     } catch {
-        $serviceDeleteSkipped = $true
+        $cleanupFailures += "service $svc"
         Write-Warning "Failed to remove service ${svc}: $_"
     }
 }
@@ -126,6 +135,7 @@ if (Get-ScheduledTask -TaskName $SEED_TOKEN_TASK -ErrorAction SilentlyContinue) 
         Unregister-ScheduledTask -TaskName $SEED_TOKEN_TASK -Confirm:$false
         Write-Host "  Removed scheduled task: $SEED_TOKEN_TASK"
     } catch {
+        $cleanupFailures += "scheduled task $SEED_TOKEN_TASK"
         Write-Warning "Failed to remove scheduled task ${SEED_TOKEN_TASK}: $_"
     }
 } else {
@@ -140,6 +150,7 @@ foreach ($task in $reloadTasks) {
         Unregister-ScheduledTask -TaskName $task.TaskName -Confirm:$false
         Write-Host "  Removed scheduled task: $($task.TaskName)"
     } catch {
+        $cleanupFailures += "scheduled task $($task.TaskName)"
         Write-Warning "Failed to remove scheduled task $($task.TaskName): $_"
     }
 }
@@ -155,8 +166,8 @@ if (Test-Path $SSRF_TOKEN_FILE) {
 
 Write-Step "Remove install directory"
 
-if ($serviceDeleteSkipped) {
-    Write-Warning "Skipping removal of $INSTALL_DIR because a service could not be deleted. Fix the service and rerun uninstall."
+if ($cleanupFailures) {
+    Write-Warning "Keeping $INSTALL_DIR because cleanup did not finish; a rerun needs it."
 } elseif (Test-Path $INSTALL_DIR) {
     Remove-Item -Path $INSTALL_DIR -Recurse -Force
     Write-Host "  Removed $INSTALL_DIR"
@@ -168,15 +179,21 @@ Write-Step "Remove provider directory"
 
 if (-not (Test-Path $PROVIDER_DIR)) {
     Write-Host "  Not found: $PROVIDER_DIR (skipped)"
-} elseif ($RemoveAll -and $serviceDeleteSkipped) {
+} elseif ($RemoveAll -and $cleanupFailures) {
     # A rerun needs the config to remove the certificate permissions it granted.
-    Write-Warning "Skipping removal of $PROVIDER_DIR because a service could not be deleted. Fix the service and rerun uninstall -RemoveAll."
+    Write-Warning "Keeping $PROVIDER_DIR because cleanup did not finish; a rerun needs its config."
+} elseif ($RemoveAll -and $keepConfigForReview) {
+    Write-Warning "Keeping $PROVIDER_DIR because its config lists the certificate files that may still grant access. Remove those permissions, then delete the folder."
 } elseif ($RemoveAll) {
     Remove-Item -Path $PROVIDER_DIR -Recurse -Force
     Write-Host "  Removed $PROVIDER_DIR"
 } else {
     Write-Host "  Kept $PROVIDER_DIR (config and logs preserved)"
     Write-Host "  Use -RemoveAll to delete"
+}
+
+if ($cleanupFailures) {
+    Write-Error "Uninstall incomplete: could not remove $($cleanupFailures -join '; '). Fix the cause shown above and rerun uninstall."
 }
 
 Write-Host ""
