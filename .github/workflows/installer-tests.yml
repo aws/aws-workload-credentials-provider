@@ -49,8 +49,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
+      # Hosted runners ship rustup, so no third-party toolchain action is needed;
+      # the public repository's action allowlist would refuse one.
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
 
       - name: Build provider and tests
         run: |
@@ -92,8 +96,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
+      # Hosted runners ship rustup, so no third-party toolchain action is needed;
+      # the public repository's action allowlist would refuse one.
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
 
       # Keep Ninja: the package builds aws-lc-rs through its native CMake
       # toolchain, and the existing Windows Rust workflow provisions it too.
