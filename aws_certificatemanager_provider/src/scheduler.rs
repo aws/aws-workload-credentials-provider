@@ -490,7 +490,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn watcher_cert_requests_go_to_its_inbox() {
-        let requests = tempfile::tempdir().unwrap();
+        let requests = crate::test_dirs::tempdir();
         std::fs::create_dir_all(requests.path().join("nginx").join("inbox")).unwrap();
         let config = test_acm_config(
             vec![CertificateConfig {
@@ -543,7 +543,7 @@ mod tests {
     async fn watcher_and_direct_certs_refresh_their_own_way() {
         const WATCHED: &str = "arn:aws:acm:us-east-1:123456789012:certificate/watched";
         const DIRECT: &str = "arn:aws:acm:us-east-1:123456789012:certificate/direct";
-        let requests = tempfile::tempdir().unwrap();
+        let requests = crate::test_dirs::tempdir();
         let inbox = requests.path().join("nginx").join("inbox");
         std::fs::create_dir_all(&inbox).unwrap();
         let config = test_acm_config(
